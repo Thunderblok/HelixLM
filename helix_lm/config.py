@@ -202,7 +202,11 @@ class HelixConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.device = device
         if isinstance(dtype, str):
-            self.dtype = getattr(torch, dtype.replace("torch.", ""))
+            dtype_str = dtype.replace("torch.", "")
+            if dtype_str in ("None", "none"):
+                self.dtype = None
+            else:
+                self.dtype = getattr(torch, dtype_str)
         else:
             self.dtype = dtype
 

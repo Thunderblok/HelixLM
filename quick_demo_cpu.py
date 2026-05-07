@@ -61,6 +61,7 @@ def main():
     cfg.bos_token_id = tokenizer.bos_token_id
   
     model = HelixForCausalLM(cfg)
+    model = torch.compile(model, mode="reduce-overhead")
     print(f"Parameters: {model.count_parameters()['total']:,}")
 
     # Data

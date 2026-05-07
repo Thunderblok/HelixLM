@@ -140,6 +140,7 @@ def test_long_stride_equivalence(texts, tokenizer):
     # Run A: no overlap
     print("\n>>> Run A: stride=32 (no overlap)", flush=True)
     model_a = HelixForCausalLM(cfg_a)
+    model_a = torch.compile(model_a, mode="reduce-overhead")
     loss_a, _, ppl_a = run_trainer(
         model_a, cfg_a, tokenizer, train, val,
         stride=32, min_tail_len=SEQ_LEN // 4, label="longA"
@@ -151,6 +152,7 @@ def test_long_stride_equivalence(texts, tokenizer):
     # Run B: 50 % overlap
     print("\n>>> Run B: stride=16 (50% overlap)", flush=True)
     model_b = HelixForCausalLM(cfg_b)
+    model_b = torch.compile(model_b, mode="reduce-overhead")
     loss_b, _, ppl_b = run_trainer(
         model_b, cfg_b, tokenizer, train, val,
         stride=16, min_tail_len=SEQ_LEN // 4, label="longB"
@@ -188,6 +190,7 @@ def test_short_equivalence(texts, tokenizer):
     )
 
     model_a = HelixForCausalLM(cfg)
+    model_a = torch.compile(model_a, mode="reduce-overhead")
     trainer_a = Trainer(
         model=model_a, cfg=cfg,
         train_loader=train_loader_a, val_loader=val_loader_a,
@@ -204,6 +207,7 @@ def test_short_equivalence(texts, tokenizer):
     # Path B: raw list (Trainer internally creates DocumentAwareDataset)
     print("\n>>> Path B: Raw text list (Trainer internal dataset creation)", flush=True)
     model_b = HelixForCausalLM(copy.deepcopy(cfg))
+    model_b = torch.compile(model_b, mode="reduce-overhead")
     trainer_b = Trainer(
         model=model_b, cfg=copy.deepcopy(cfg),
         train_texts=train, val_texts=val,
