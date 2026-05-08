@@ -10,6 +10,7 @@ Key features:
   - Modern torch.amp API (not deprecated torch.cuda.amp)
   - Live tqdm progress bars with loss, PPL, LR, and throughput metrics
   - Optional train/val DataLoader injection for custom dataset pipelines
+  - generate_sample() uses standard model.generate() with tokenizer passthrough
 """
 import os
 import math
@@ -382,7 +383,7 @@ class Trainer:
     def generate_sample(
         self, prompt: str, max_new_tokens: Optional[int] = None
     ) -> str:
-        """Generate text from a prompt."""
+        """Generate text from a prompt using standard model.generate()."""
         if self.tokenizer is None:
             return ""
         self.model.eval()
@@ -390,14 +391,26 @@ class Trainer:
             [self.tokenizer.encode(prompt)], dtype=torch.long
         ).to(self.device)
         max_tokens = max_new_tokens or self.cfg.max_new_tokens
-        generated = self.model.generate_ext(
+
+        # Use standard GenerationMixin.generate() with stop-string support
+        from .hf_model import StopStringCriteria, StoppingCriteriaList
+        stop_strings = getattr(self.cfg, "stop_strings", None)
+        stopping_criteria = None
+        if stop_strings:
+            stopping_criteria = StoppingCriteriaList([
+                StopStringCriteria(self.tokenizer, stop_strings, batch_size=1)
+            ])
+
+        generated = self.model.generate(
             input_ids,
             max_new_tokens=max_tokens,
+            do_sample=True,
             temperature=self.cfg.temperature,
             top_k=self.cfg.top_k,
             top_p=self.cfg.top_p,
+            stopping_criteria=stopping_criteria,
         )
-        new_tokens = generated[0][input_ids.shape[1] :]
+        new_tokens = generated[0][input_ids.shape[1]:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def save_checkpoint(self, epoch: int, filename: Optional[str] = None):
@@ -484,4 +497,3 @@ class Trainer:
         if self.verbose:
             print(f"\nTraining complete!")
         return self.history
-

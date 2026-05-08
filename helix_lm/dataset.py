@@ -544,4 +544,65 @@ def create_document_loader(
         num_workers=num_workers,
         drop_last=drop_last,
     )
-  
+
+
+# ============================================================================
+# HelixDataCollator — preserves -100 overlap masks for HF Trainer
+# ============================================================================
+
+from dataclasses import dataclass
+
+@dataclass
+class HelixDataCollator:
+    """
+    Collator that preserves labels exactly (including -100 overlap masks).
+
+    Unlike DataCollatorForLanguageModeling, this collator does NOT regenerate
+    labels. It only pads existing labels, preserving any -100 values that were
+    set by DocumentAwareDataset for overlap masking and padding tails.
+
+    This is essential for HelixLM training because the dataset's overlap
+    masking (labels[:overlap_mask] = -100) must survive the collation step.
+    """
+    pad_token_id: int = 0
+    padding: bool = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # features is a list of dicts with "input_ids", "attention_mask", "labels"
+        input_ids = [f["input_ids"] for f in features]
+        attention_mask = [f["attention_mask"] for f in features]
+        labels = [f["labels"] for f in features]
+
+        # Handle optional is_natural_stop if present
+        has_natural_stop = "is_natural_stop" in features[0]
+        natural_stops = [f["is_natural_stop"] for f in features] if has_natural_stop else None
+
+        def _pad_tensor(tensor_list, pad_value, max_len=None):
+            lengths = [t.shape[0] for t in tensor_list]
+            max_len = max_len or max(lengths)
+            out = []
+            for t, length in zip(tensor_list, lengths):
+                if length < max_len:
+                    pad_len = max_len - length
+                    pad_tensor = torch.full((pad_len,), pad_value, dtype=t.dtype, device=t.device)
+                    out.append(torch.cat([t, pad_tensor]))
+                else:
+                    out.append(t[:max_len])
+            return torch.stack(out)
+
+        input_ids = _pad_tensor(input_ids, self.pad_token_id, self.max_length)
+        attention_mask = _pad_tensor(attention_mask, 0, self.max_length)
+        labels = _pad_tensor(labels, -100, self.max_length)  # preserve -100 overlap
+
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        if has_natural_stop and natural_stops is not None:
+            result["is_natural_stop"] = torch.stack(natural_stops)
+
+        return result
+

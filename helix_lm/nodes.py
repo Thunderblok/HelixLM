@@ -2,7 +2,7 @@
 Heterogeneous neural nodes for HelixLM.
 
 REFACTOR NOTES (v2-optimized):
-  - SSMNode: chunked sequential scan (16× fewer Python-loop iterations)
+  - SSMNode: chunked sequential scan (16x fewer Python-loop iterations)
   - TitansMemoryNode: pre-computed projections, chunked loop body
   - All other nodes unchanged (attention variants, SwiGLU, Dense, Gate)
 """
@@ -168,11 +168,16 @@ class SwiGLUNode(HeteroNode):
 
 
 # ============================================================================
-# SSMNode — chunked sequential scan (16× fewer iterations)
+# SSMNode -- chunked sequential scan (16x fewer iterations)
 # ============================================================================
 
 def _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
-    """Chunked sequential scan: 16× fewer Python-loop iterations."""
+    """Chunked sequential scan: 16x fewer Python-loop iterations.
+
+    IMPORTANT: This function computes the FULL SSM output including the
+    skip-connection D * x_t at each timestep. The caller (SSMNode.forward)
+    does NOT add D again.
+    """
     B, T, d_inner, d_state = A_bar.shape
     pad_len = (chunk_size - T % chunk_size) % chunk_size
     if pad_len:
@@ -200,7 +205,7 @@ def _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
 class SSMNode(HeteroNode):
     """
     Simplified SSM node with chunked sequential scan.
-    16× fewer Python-loop iterations than the original.
+    16x fewer Python-loop iterations than the original.
     """
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2, dropout: float = 0.0):
         super().__init__(d_model)
@@ -244,7 +249,8 @@ class SSMNode(HeteroNode):
         A_bar = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
         B_bar = dt.unsqueeze(-1) * B.unsqueeze(2)
 
-        # Chunked scan (16× fewer iterations)
+        # Chunked scan (16x fewer iterations).
+        # _ssm_chunked_scan already includes D * x in its output.
         out = _ssm_chunked_scan(A_bar, B_bar, x_conv, C, self.D, chunk_size=16)
 
         out = self.dropout(self.out_proj(out.to(x.dtype)))
@@ -292,7 +298,7 @@ class GateNode(HeteroNode):
 
 
 # ============================================================================
-# TitansMemoryNode — pre-computed projections, chunked loop
+# TitansMemoryNode -- pre-computed projections, chunked loop
 # ============================================================================
 
 class TitansMemoryNode(HeteroNode):

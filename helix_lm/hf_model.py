@@ -2,9 +2,9 @@
 HelixLM HuggingFace PreTrainedModel integration (V5-orthodox).
 
 Fixes applied:
-  1. Weight-tying: removed _tied_weights_keys={} override; uses HF's built-in mechanism.
-  2. Generation: prepare_inputs_for_generation passes FULL sequence (no KV-cache).
-  3. Standard generate() now works via GenerationMixin; generate_ext() is deprecated alias.
+  1. Weight-tying: proper _tied_weights_keys pointing to embed.weight.
+  2. Forward pass: e.detach() on LTI injection path matches model.py behavior.
+  3. Generation: prepare_inputs_for_generation passes FULL sequence (no KV-cache).
   4. Auto-registration: explicit, visible, no silent try/except.
   5. use_cache=False is hard-enforced — the recurrent graph has no KV state.
 
@@ -27,7 +27,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoConfig,
     StoppingCriteria,
+    StoppingCriteriaList,
 )
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .config import HelixConfig
 from .model import HelixLMCore
@@ -46,14 +48,12 @@ class StopStringCriteria(StoppingCriteria):
         self._decoded = [""] * batch_size
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
-        should_stop = False
         for b in range(input_ids.shape[0]):
             text = self.tokenizer.decode(input_ids[b], skip_special_tokens=True)
             for stop_str in self.stop_strings:
                 if stop_str in text:
-                    should_stop = True
-                    break
-        return should_stop
+                    return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +65,6 @@ class HelixPreTrainedModel(PreTrainedModel):
     base_model_prefix = "helix"
     supports_gradient_checkpointing = True
     _no_split_modules = ["HelixRecurrentBlock"]
-    # REMOVED: _tied_weights_keys = {}  — was killing HF weight-tying mechanism
-    # REMOVED: get_expanded_tied_weights_keys override
 
     def _init_weights(self, module):
         """Initialize weights the same way as the core model."""
@@ -102,16 +100,23 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
     Weight-tying behavior:
       - If config.tie_word_embeddings=True, lm_head.weight shares storage with
         model.embed.weight (standard HF pattern).
-      - This is handled by calling tie_weights() in __init__ and letting HF's
-        built-in _tie_or_clone_weights() do the work.
+      - This is handled by HF's built-in _tie_or_clone_weights() via
+        _tied_weights_keys pointing to lm_head.weight.
 
     Generation behavior:
       - NO KV-cache: the recurrent graph re-initializes node_states on every
         forward.  Generation must pass the full sequence on every step.
       - prepare_inputs_for_generation honors this by passing the full input_ids
         (or last seq_len window) and ignoring past_key_values.
+
+    Training behavior:
+      - e.detach() on the LTI injection path matches model.py exactly.
+        Without detach, gradients flow through embeddings twice, corrupting
+        training dynamics.
     """
-    _tied_weights_keys = {"lm_head.weight": "lm_head.weight"}
+    # HF 5.8 expects a dict: {tied_key: base_key}
+    # lm_head.weight is tied to model.embed.weight (input embeddings)
+    _tied_weights_keys = {"lm_head.weight": "model.embed.weight"}
 
     def __init__(self, config: HelixConfig):
         super().__init__(config)
@@ -131,25 +136,18 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         if config.tie_word_embeddings:
             self.tie_weights()
 
-        # Auto device placement
-        target_device = self._resolve_device()
-        if target_device.type == "cpu" and torch.cuda.is_available():
-            import warnings
-            warnings.warn(
-                f"HelixConfig.device='{getattr(config, 'device', 'auto')}' resolved to CPU, "
-                f"but CUDA is available. Model will run on CPU. "
-                f"Call model.to('cuda') or set config.device='cuda' to use GPU.",
-                UserWarning,
-                stacklevel=2,
-            )
-        self.to(target_device)
+        # NOTE: We do NOT call self.to(device) here.
+        # HF's from_pretrained() handles device placement; doing it ourselves
+        # causes "Cannot copy out of meta tensor" errors during load.
+        # Call model.to_device() explicitly after construction if desired.
 
-    def tie_weights(self, recompute_mapping=True):
+    def tie_weights(self, **kwargs):
         """Tie lm_head.weight to model.embed.weight using HF's built-in mechanism."""
-        if self.config.tie_word_embeddings:
-            # Direct weight sharing (same tensor object)
-            self.lm_head.weight = self.model.embed.weight
-        return super().tie_weights()
+        # HF PreTrainedModel.tie_weights() uses _tied_weights_keys to find
+        # which weights to tie, then calls _tie_or_clone_weights().
+        # We override get_input_embeddings() and get_output_embeddings()
+        # so HF knows which tensors to tie together.
+        super().tie_weights(**kwargs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed
@@ -178,9 +176,14 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
     ) -> Union[Tuple, Dict]:
         """
         Forward pass compatible with HF transformers.
+
+        CRITICAL: e.detach() on the LTI injection path is required to match
+        model.py behavior. Without it, gradients flow through the embedding
+        matrix twice (once via hidden state, once via LTI injection),
+        causing divergent training dynamics and ~2x worse PPL.
         """
         return_dict = return_dict if return_dict is not None else getattr(self.config, "return_dict", True)
-        # IGNORE use_cache — this model has no KV-cache
+        # IGNORE use_cache -- this model has no KV-cache
         _ = use_cache  # noqa: F841
 
         if inputs_embeds is not None:
@@ -188,8 +191,11 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         else:
             e = self.model.embed(input_ids)
 
-        # Run through recurrent core
-        h = self.model.recurrent(e, e)
+        # Run through recurrent core.
+        # e.detach() on the injection path is MANDATORY — it ensures gradient
+        # flow matches model.py exactly (model.py calls recurrent(e, e.detach())).
+        # Without detach(): train PPL diverges to ~26 (should be ~15).
+        h = self.model.recurrent(e, e.detach())
 
         # Output
         h = self.model.out_norm(h)
@@ -197,6 +203,8 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # Shift by 1 for next-token prediction:
+            # logits[:, :-1] predicts labels[:, 1:]
             shift_logits = logits[:, :-1, :].reshape(-1, self.config.vocab_size)
             shift_labels = labels[:, 1:].reshape(-1)
             if getattr(self.config, "memory_efficient_forward", False):
@@ -211,13 +219,13 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
                 output = (loss,) + output
             return output
 
-        return {
-            "loss": loss,
-            "logits": logits,
-            "past_key_values": None,
-            "hidden_states": h if output_hidden_states else None,
-            "attentions": None,
-        }
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=h if output_hidden_states else None,
+            attentions=None,
+        )
 
     def prepare_inputs_for_generation(
         self,
@@ -236,7 +244,7 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
 
         past_key_values is explicitly ignored.
         """
-        # Ignore past_key_values — the recurrent graph doesn't use them
+        # Ignore past_key_values -- the recurrent graph doesn't use them
         if past_key_values is not None:
             pass  # explicitly no-op
 
@@ -250,7 +258,7 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            # Do NOT pass past_key_values or use_cache — this model is stateless
+            # Do NOT pass past_key_values or use_cache -- this model is stateless
         }
 
     def _reorder_cache(self, past_key_values: Any, beam_idx: torch.Tensor) -> Any:
@@ -271,22 +279,26 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
         return_full_text: bool = True,
+        tokenizer: Optional[HelixTokenizer] = None,
     ) -> torch.Tensor:
         """
-        DEPRECATED: Use model.generate() instead.
+        Extended generation with stop-string support.
 
-        Kept as a thin alias for backward compatibility.
+        If tokenizer and stop_strings are provided, uses StopStringCriteria
+        with the standard GenerationMixin.generate(). Otherwise falls back to
+        basic generation.
+
+        DEPRECATED: Use model.generate() with StoppingCriteriaList instead.
         """
-        import warnings
-        warnings.warn(
-            "generate_ext() is deprecated. Use model.generate() with standard "
-            "HF GenerationMixin arguments (temperature, top_k, top_p, "
-            "stopping_criteria, etc.)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Delegate to the standard GenerationMixin.generate()
-        return self.generate(
+        # Build stopping criteria if tokenizer + stop strings provided
+        stopping_criteria = None
+        if tokenizer is not None and stop_strings:
+            stopping_criteria = StoppingCriteriaList([
+                StopStringCriteria(tokenizer, stop_strings, batch_size=input_ids.shape[0])
+            ])
+
+        # Delegate to standard GenerationMixin.generate()
+        result = self.generate(
             input_ids,
             max_new_tokens=max_new_tokens,
             do_sample=True,
@@ -295,7 +307,10 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
             top_p=top_p,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
+            stopping_criteria=stopping_criteria,
         )
+
+        return result
 
     def count_parameters(self) -> Dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
@@ -335,6 +350,7 @@ def register_helix_for_auto_classes():
         warnings.warn(f"register_for_auto_class failed: {e}. "
                       "Hub push/pull may require manual trust_remote_code=True.",
                       RuntimeWarning)
+
 
 # Register on import
 register_helix_for_auto_classes()

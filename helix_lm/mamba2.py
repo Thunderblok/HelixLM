@@ -2,7 +2,7 @@
 Mamba-2 SSD (State Space Duality) implementation with chunked sequential scan.
 
 This refactored version replaces the 256-iteration Python loop with a chunked
-sequential scan (chunk_size=16), reducing Python-loop iterations by 16×.
+sequential scan (chunk_size=16), reducing Python-loop iterations by 16x.
 For seq_len=256, this is 16 iterations instead of 256.
 
 Backward pass is stable and fast — no torch.compile (which had catastrophic
@@ -21,10 +21,14 @@ import torch.nn.functional as F
 
 def _ssd_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
     """
-    Chunked sequential scan — 16× fewer Python-loop iterations.
+    Chunked sequential scan — 16x fewer Python-loop iterations.
 
-    For seq_len=256, chunk_size=16 → 16 iterations (was 256).
+    For seq_len=256, chunk_size=16 -> 16 iterations (was 256).
     Mathematically identical to the original sequential scan.
+
+    IMPORTANT: This function computes the FULL SSM output including the
+    skip-connection term D * x_t at each timestep. The caller must NOT
+    add D * x again.
     """
     B, T, d_inner, d_state = A_bar.shape
     pad_len = (chunk_size - T % chunk_size) % chunk_size
@@ -133,9 +137,10 @@ class Mamba2SSD(nn.Module):
         A_bar = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
         B_bar = dt.unsqueeze(-1) * B.unsqueeze(2)
 
-        # Chunked scan: 16× fewer Python-loop iterations
+        # Chunked scan: 16x fewer Python-loop iterations.
+        # _ssd_chunked_scan already includes D * x in its output.
         y = _ssd_chunked_scan(A_bar, B_bar, x_conv, C, self.D, chunk_size=16)
 
-        y = y + self.D * x_conv
+        # NO additional D * x here — the scan function already added it.
         out = self.out_proj(y.to(x.dtype))
         return out, None
