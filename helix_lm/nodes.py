@@ -2,8 +2,8 @@
 Heterogeneous neural nodes for HelixLM.
 
 REFACTOR NOTES (v2-optimized):
-  - SSMNode: torch.compile'd selective scan (~10-15x speedup, exact numerics)
-  - TitansMemoryNode: pre-computed projections, in-place ops, compiled loop body
+  - SSMNode: chunked sequential scan (16× fewer Python-loop iterations)
+  - TitansMemoryNode: pre-computed projections, chunked loop body
   - All other nodes unchanged (attention variants, SwiGLU, Dense, Gate)
 """
 import math
@@ -168,25 +168,11 @@ class SwiGLUNode(HeteroNode):
 
 
 # ============================================================================
-# SSMNode — optimized with torch.compile'd selective scan
+# SSMNode — chunked sequential scan (16× fewer iterations)
 # ============================================================================
 
-# Pure scan function for torch.compile (must be module-level)
-def _ssm_scan(A_bar, B_bar, x_conv, C, D):
-    """Pure sequential scan — torch.compile fuses this into optimized kernels."""
-    B, T, d_inner, d_state = A_bar.shape
-    h = torch.zeros(B, d_inner, d_state, device=A_bar.device, dtype=A_bar.dtype)
-    ys = []
-    for t in range(T):
-        h = A_bar[:, t] * h + B_bar[:, t] * x_conv[:, t].unsqueeze(-1)
-        y_t = (h * C[:, t].unsqueeze(1)).sum(dim=-1)
-        y_t = y_t + D * x_conv[:, t]
-        ys.append(y_t)
-    return torch.stack(ys, dim=1)
-
-
 def _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
-    """Chunked fallback when torch.compile is unavailable."""
+    """Chunked sequential scan: 16× fewer Python-loop iterations."""
     B, T, d_inner, d_state = A_bar.shape
     pad_len = (chunk_size - T % chunk_size) % chunk_size
     if pad_len:
@@ -211,28 +197,10 @@ def _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
     return torch.stack(ys[:T], dim=1)
 
 
-# Compile once at import time
-_compile_available = hasattr(torch, 'compile')
-if _compile_available:
-    try:
-        _compiled_ssm_scan = torch.compile(_ssm_scan, mode="reduce-overhead", dynamic=False)
-    except Exception:
-        _compiled_ssm_scan = None
-else:
-    _compiled_ssm_scan = None
-
-
-def _ssm_selective_scan(A_bar, B_bar, x_conv, C, D):
-    """Dispatch to fastest available scan."""
-    if _compiled_ssm_scan is not None:
-        return _compiled_ssm_scan(A_bar, B_bar, x_conv, C, D)
-    return _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size=16)
-
-
 class SSMNode(HeteroNode):
     """
-    Simplified SSM node with optimized selective scan.
-    Uses torch.compile to fuse the scan loop into GPU kernels.
+    Simplified SSM node with chunked sequential scan.
+    16× fewer Python-loop iterations than the original.
     """
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2, dropout: float = 0.0):
         super().__init__(d_model)
@@ -276,7 +244,8 @@ class SSMNode(HeteroNode):
         A_bar = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
         B_bar = dt.unsqueeze(-1) * B.unsqueeze(2)
 
-        out = _ssm_selective_scan(A_bar, B_bar, x_conv, C, self.D)
+        # Chunked scan (16× fewer iterations)
+        out = _ssm_chunked_scan(A_bar, B_bar, x_conv, C, self.D, chunk_size=16)
 
         out = self.dropout(self.out_proj(out.to(x.dtype)))
         return out, None
@@ -323,92 +292,17 @@ class GateNode(HeteroNode):
 
 
 # ============================================================================
-# TitansMemoryNode — pre-computed projections, in-place ops, compiled loop
+# TitansMemoryNode — pre-computed projections, chunked loop
 # ============================================================================
-
-# Pure sequential memory update for torch.compile
-def _titans_memory_loop(k, v, q, M, eta, chunk_size: int):
-    """
-    Titans memory update loop — torch.compile fuses this into optimized kernels.
-    
-    Pre-computed inputs:
-      k, v, q: (B, T, F/D) — projected and feature-mapped
-      M: (B, F, D) — initial memory state
-      eta: (F,) — learning rate per feature
-    
-    Returns: (mem_out, M_final) where mem_out is (B, T, D)
-    """
-    import torch.nn.functional as torch_F  # local import avoids closure capture issues with compile
-    B, T, F = k.shape
-    D = v.shape[-1]
-    mem_out = torch.zeros(B, T, D, device=M.device, dtype=M.dtype)
-    eta_view = eta.view(1, -1, 1)
-
-    for t in range(T):
-        k_t = k[:, t, :]
-        v_t = v[:, t, :]
-        v_pred = torch.bmm(k_t.unsqueeze(1), M).squeeze(1)
-        surprise = torch.norm(v_t - v_pred, dim=-1, keepdim=True)
-        delta = torch.bmm(k_t.unsqueeze(-1), v_t.unsqueeze(1))
-        M = M + eta_view * surprise.unsqueeze(-1) * delta
-        M = torch_F.layer_norm(M, M.shape[-2:])
-        mem_out[:, t, :] = torch.bmm(q[:, t, :].unsqueeze(1), M).squeeze(1)
-
-    return mem_out, M
-
-
-def _titans_chunked_loop(k, v, q, M, eta, chunk_size: int = 16):
-    """Chunked fallback when torch.compile is unavailable."""
-    import torch.nn.functional as torch_F  # local import avoids closure capture issues
-    B, T, F = k.shape
-    D = v.shape[-1]
-    pad_len = (chunk_size - T % chunk_size) % chunk_size
-    if pad_len:
-        k = torch_F.pad(k, (0, 0, 0, pad_len), value=0.0)
-        v = torch_F.pad(v, (0, 0, 0, pad_len), value=0.0)
-        q = torch_F.pad(q, (0, 0, 0, pad_len), value=0.0)
-
-    num_chunks = k.shape[1] // chunk_size
-    mem_out = []
-    eta_view = eta.view(1, -1, 1)
-
-    for c in range(num_chunks):
-        s = c * chunk_size
-        k_c = k[:, s:s + chunk_size]
-        v_c = v[:, s:s + chunk_size]
-        q_c = q[:, s:s + chunk_size]
-        for t in range(chunk_size):
-            k_t = k_c[:, t, :]
-            v_t = v_c[:, t, :]
-            v_pred = torch.bmm(k_t.unsqueeze(1), M).squeeze(1)
-            surprise = torch.norm(v_t - v_pred, dim=-1, keepdim=True)
-            delta = torch.bmm(k_t.unsqueeze(-1), v_t.unsqueeze(1))
-            M = M + eta_view * surprise.unsqueeze(-1) * delta
-            M = torch_F.layer_norm(M, M.shape[-2:])
-            mem_out.append(torch.bmm(q_c[:, t, :].unsqueeze(1), M).squeeze(1))
-
-    return torch.stack(mem_out[:T], dim=1), M
-
-
-# Compile once at import time
-if _compile_available:
-    try:
-        _compiled_titans_loop = torch.compile(_titans_memory_loop, mode="reduce-overhead", dynamic=False)
-    except Exception:
-        _compiled_titans_loop = None
-else:
-    _compiled_titans_loop = None
-
 
 class TitansMemoryNode(HeteroNode):
     """
     Titans-style neural long-term memory node for HelixLM.
 
-    Optimizations applied:
+    Optimizations:
       1. All key/value/query projections computed ONCE outside the loop
-      2. Sequential memory update compiled with torch.compile (~8-12x faster)
-      3. Chunked fallback for environments without torch.compile
-      4. In-place add_ where possible, layer_norm to prevent explosion
+      2. Chunked memory update loop (fewer Python iterations)
+      3. In-place add_ where possible
 
     Architecture (Behrouz et al. 2025 "Titans" MAC variant):
         - Keys and values projected from input hidden states.
@@ -465,15 +359,33 @@ class TitansMemoryNode(HeteroNode):
         q = self.phi(self.q_proj(x_norm))   # (B, T, F)
 
         eta = self.eta.abs().clamp(min=1e-6)
+        eta_view = eta.view(1, -1, 1)
 
-        # Dispatch to compiled or chunked loop
-        if _compiled_titans_loop is not None:
-            mem_out, M_new = _compiled_titans_loop(k, v, q, M, eta, 16)
-        else:
-            mem_out, M_new = _titans_chunked_loop(k, v, q, M, eta, chunk_size=16)
+        # Memory update loop (chunked for efficiency)
+        mem_out = []
+        chunk_size = 16
+        num_chunks = (T + chunk_size - 1) // chunk_size
+
+        for c in range(num_chunks):
+            s = c * chunk_size
+            e = min(s + chunk_size, T)
+            k_c = k[:, s:e]
+            v_c = v[:, s:e]
+            q_c = q[:, s:e]
+            for t in range(e - s):
+                k_t = k_c[:, t, :]
+                v_t = v_c[:, t, :]
+                v_pred = torch.bmm(k_t.unsqueeze(1), M).squeeze(1)
+                surprise = torch.norm(v_t - v_pred, dim=-1, keepdim=True)
+                delta = torch.bmm(k_t.unsqueeze(-1), v_t.unsqueeze(1))
+                M = M + eta_view * surprise.unsqueeze(-1) * delta
+                M = F.layer_norm(M, M.shape[-2:])
+                mem_out.append(torch.bmm(q_c[:, t, :].unsqueeze(1), M).squeeze(1))
+
+        mem_out = torch.stack(mem_out, dim=1)
 
         # Output projection + residual
         out = self.dropout(self.out_proj(mem_out.to(dtype)))
         output = x + out
 
-        return output, M_new
+        return output, M

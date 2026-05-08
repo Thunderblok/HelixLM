@@ -254,6 +254,11 @@ class HelixConfig(PretrainedConfig):
 
         # --- HF compat ---
         self.use_cache = kwargs.get("use_cache", True)
+        # num_hidden_layers is required by HF GenerationMixin for cache shape inference
+        # For HelixLM, this is the effective depth: n_columns * n_loops
+        self.num_hidden_layers = kwargs.get("num_hidden_layers", self.n_columns * self.n_loops)
+        # Required by HF for encoder-decoder detection
+        self.is_encoder_decoder = kwargs.get("is_encoder_decoder", False)
 
         super().__init__(
             pad_token_id=self.pad_token_id,
@@ -266,6 +271,11 @@ class HelixConfig(PretrainedConfig):
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
+
+    @property
+    def hidden_size(self) -> int:
+        """HF alias for d_model."""
+        return self.d_model
 
     @property
     def loop_dim(self) -> int:
