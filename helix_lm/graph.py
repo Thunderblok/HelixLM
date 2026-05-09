@@ -20,7 +20,7 @@ from .nodes import (
 class HelixGraph(nn.Module):
     """
     Randomly wired heterogeneous graph of neural nodes.
-    
+
     - Topology: Biological-style neural columns with vertical and lateral connections
     - Aggregation: learned per-node merge (Linear bottleneck) or Gate
     - Stateful nodes (SSM/Mamba-2) expose state read/write across loops
@@ -86,9 +86,21 @@ class HelixGraph(nn.Module):
         self.sink_nodes = [k for k, v in self.node_meta.items() if v[0] == last_col]
 
     def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
+        """Build node specification per column, respecting cfg.nodes_per_column.
+
+        The ``nodes_per_column`` tuple controls the number of COMPUTE nodes
+        (non-gate) in each column.  The base pattern is [attention, swiglu];
+        optional SSM/Titans consume additional slots; remaining slots are
+        filled by repeating the attention+swiglu pattern.  A gate node is
+        appended for aggregation when there are multiple compute nodes or
+        when the column is not the first.
+        """
         cfg = self.cfg
         spec = []
         for ci in range(cfg.n_columns):
+            target = cfg.nodes_per_column[ci] if ci < len(cfg.nodes_per_column) else cfg.nodes_per_column[-1]
+            target = max(2, target)  # at least attention + swiglu
+
             column = []
             use_full_attn = False
             if cfg.attention_mode == "full":
@@ -96,24 +108,23 @@ class HelixGraph(nn.Module):
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
 
+            # 1. Attention (always present)
             if use_full_attn:
-                column.append(("full_attn", {
-                    "d_model": cfg.d_model, "n_heads": cfg.n_heads,
-                    "dropout": cfg.dropout, "use_rope": cfg.use_rope,
-                }))
+                attn_cfg = {"d_model": cfg.d_model, "n_heads": cfg.n_heads,
+                            "dropout": cfg.dropout, "use_rope": cfg.use_rope}
+                column.append(("full_attn", attn_cfg))
             else:
-                column.append(("linear_attn", {
-                    "d_model": cfg.d_model, "n_heads": cfg.n_heads,
-                    "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout,
-                }))
+                attn_cfg = {"d_model": cfg.d_model, "n_heads": cfg.n_heads,
+                            "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout}
+                column.append(("linear_attn", attn_cfg))
 
-            column.append(("swiglu", {
-                "d_model": cfg.d_model, "expansion": cfg.ffn_expansion, "dropout": cfg.dropout,
-            }))
+            # 2. SwiGLU (always present)
+            swiglu_cfg = {"d_model": cfg.d_model, "expansion": cfg.ffn_expansion, "dropout": cfg.dropout}
+            column.append(("swiglu", swiglu_cfg))
 
-            if cfg.use_ssm:
+            # 3. SSM / Mamba-2 (optional, consumes one slot)
+            if cfg.use_ssm and len(column) < target:
                 if hasattr(cfg, 'ssm_d_state') and cfg.ssm_d_state >= 64:
-                    # Use Mamba-2 for larger state dimensions
                     column.append(("mamba2", {
                         "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand,
@@ -128,9 +139,14 @@ class HelixGraph(nn.Module):
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand, "dropout": cfg.dropout,
                     }))
 
-            # Optional Titans Neural Memory — guaranteed at least once if enabled
-            if cfg.use_titans_memory:
+            # 4. Titans Neural Memory (optional, consumes one slot)
+            if cfg.use_titans_memory and len(column) < target:
+                add_titans = False
                 if cfg.titans_always_select and ci == 0:
+                    add_titans = True
+                elif not cfg.titans_always_select:
+                    add_titans = True
+                if add_titans:
                     column.append(("titans", {
                         "d_model": cfg.d_model,
                         "feature_dim": cfg.titans_feature_dim,
@@ -139,6 +155,16 @@ class HelixGraph(nn.Module):
                         "dropout": cfg.titans_dropout,
                     }))
 
+            # 5. Scale / repeat base pattern to hit target compute-node count
+            pattern = [("linear_attn" if not use_full_attn else "full_attn", dict(attn_cfg)),
+                       ("swiglu", dict(swiglu_cfg))]
+            pat_idx = 0
+            while len(column) < target:
+                ntype, ncfg = pattern[pat_idx % 2]
+                column.append((ntype, dict(ncfg)))
+                pat_idx += 1
+
+            # 6. Gate for aggregation
             if len(column) > 1 or ci > 0:
                 column.append(("gate", {
                     "d_model": cfg.d_model, "n_preds": len(column), "dropout": cfg.dropout,
