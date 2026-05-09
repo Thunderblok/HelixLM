@@ -103,38 +103,10 @@ class HelixPreTrainedModel(PreTrainedModel):
         return torch.device(cfg_device)
 
 
+# helix_lm/hf_model.py  (inside HelixForCausalLM.__init__)
+
 class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
-    """
-    HelixLM causal language model with full HuggingFace compatibility.
-
-    Weight-tying behavior:
-      - Weights are NOT tied (tie_word_embeddings=False in config).
-      - The sacred baseline converges only when lm_head.weight and
-        model.embed.weight are separate tensors.
-      - The embedding layer already receives gradients from BOTH recurrent
-        paths (hidden-state + LTI injection).  Adding the lm_head gradient
-        via weight tying overwhelms the optimization landscape and causes
-        a ~2x PPL regression.
-
-    Generation behavior:
-      - NO KV-cache: the recurrent graph re-initializes node_states on every
-        forward.  Generation must pass the full sequence on every step.
-      - prepare_inputs_for_generation honors this by passing the full input_ids
-        (or last seq_len window) and ignoring past_key_values.
-
-    Training behavior:
-      - Full gradient flow: e is passed (NOT detached) to recurrent(). This
-        preserves gradient flow through BOTH the hidden-state path and the LTI
-        injection path, giving the embedding layer ~2x stronger gradients.
-        This is ESSENTIAL for convergence (PPL ~15 train / ~90 val).
-        Adding e.detach() causes ~2x PPL regression (train PPL ~29 vs ~15 baseline).
-    """
-    # Intentionally empty: this architecture does not tie word embeddings.
-    # Tying merges lm_head gradients into embed.weight, which already receives
-    # ~2x gradient signal from the recurrent dual-input (h + LTI injection).
-    # The sacred baseline converges only when they are separate parameters.
-    _tied_weights_keys = {}
-
+    ...
     def __init__(self, config: HelixConfig):
         super().__init__(config)
         self.config = config
@@ -146,8 +118,31 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         self.model = HelixLMCore(config, tie_weights=False, create_output_head=False)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # Initialize weights
-        self.post_init()
+        # SACRED BASELINE PRESERVATION:
+        # Do NOT call post_init(). The main branch did not call it, and doing so
+        # re-initializes all weights, shifting the RNG stream and changing lm_head's
+        # init from Kaiming-uniform to normal_(std=0.02). This causes a different
+        # local minimum with the same PPL but different generation style.
+        #
+        # We manually set the HF attributes that post_init() would have set,
+        # so from_pretrained / push_to_hub / save_pretrained still work.
+        self.all_tied_weights_keys = self.get_expanded_tied_weights_keys(all_submodels=False)
+        self._keep_in_fp32_modules = set(getattr(self, '_keep_in_fp32_modules', None) or [])
+        self._keep_in_fp32_modules_strict = set(getattr(self, '_keep_in_fp32_modules_strict', None) or [])
+        self._no_split_modules = set(getattr(self, '_no_split_modules', None) or [])
+
+        # Gather metadata from submodules (matches post_init logic without re-init)
+        for name, module in self.named_children():
+            if tied_keys := getattr(module, "all_tied_weights_keys", None):
+                self.all_tied_weights_keys.update(
+                    {f"{name}.{k}": f"{name}.{v}" for k, v in tied_keys.copy().items()}
+                )
+            if keep_fp32 := getattr(module, "_keep_in_fp32_modules", None):
+                self._keep_in_fp32_modules.update(keep_fp32)
+            if keep_fp32_strict := getattr(module, "_keep_in_fp32_modules_strict", None):
+                self._keep_in_fp32_modules_strict.update(keep_fp32_strict)
+            if no_split := getattr(module, "_no_split_modules", None):
+                self._no_split_modules.update(no_split)
 
         # NOTE: We do NOT call self.to(device) here.
         # HF's from_pretrained() handles device placement; doing it ourselves
