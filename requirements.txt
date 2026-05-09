@@ -7,3 +7,4 @@ tqdm>=4.65.0
 mlflow
 numpy
 optuna
+psutil
