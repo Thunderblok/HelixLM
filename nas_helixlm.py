@@ -8,8 +8,9 @@ DATA PATH (native):
   No custom collators, no foreign masking logic.
 
 SCREENING PHILOSOPHY:
-  - Force fp32 everywhere. Models are < 1 GB; AMP (fp16) causes immediate NaN
-    on d>=256 with LR=3e-3. No memory pressure justifies AMP at this scale.
+  - bfloat16 on GPU (fp32 on CPU). bf16 has the same exponent range as fp32,
+    so it avoids the NaN/underflow problems of fp16 on SSM scans and Titans
+    memory updates, while giving 16-bit speed/memory savings.
   - Viable-config table replaces blind TPE over interdependent params.
   - SSM + Titans combined config included (VRAM impact of Titans is ~0.3 MB).
 
@@ -22,9 +23,10 @@ FAILURE MODES CAUGHT:
 """
 SCRIPT_VERSION = "2.3.0-20260510"
 SCRIPT_REVISION_NOTE = (
-    "v2.3: force fp32 (no AMP), proper TrialPruned propagation, "
+    "v2.3: bf16 on GPU / fp32 on CPU, proper TrialPruned propagation, "
     "native DocumentAwareDataset via Trainer(train_texts), "
-    "SSM+Titans combo config, removed fake search params"
+    "SSM+Titans combo config, removed fake search params, "
+    "torch.compile enabled for all configs via @torch.compiler.disable"
 )
 
 import argparse
@@ -392,10 +394,14 @@ def build_helix_config(
     vocab_size: int,
     device: str,
 ) -> Tuple[Any, bool]:
-    # Force fp32 everywhere — AMP causes immediate NaN on d>=256 with LR=3e-3.
-    # Models are tiny; no memory pressure justifies fp16 at screening scale.
-    dtype_str = "float32"
-    use_amp = False
+    # bfloat16 on GPU gives 16-bit speed without fp16 dynamic-range problems.
+    # fp32 on CPU is the safe fallback (bfloat16 has limited CPU support).
+    if torch.cuda.is_available():
+        dtype_str = "bfloat16"
+        use_amp = True
+    else:
+        dtype_str = "float32"
+        use_amp = False
 
     effective_batch = params["batch_size"] * params["grad_accum"]
     steps_per_epoch = max(1, 20000 // effective_batch)
@@ -496,7 +502,7 @@ def _disable_watchdog():
 
 
 # ---------------------------------------------------------------------------
-# torch.compile helper (skip SSM/Titans — custom loops break CUDA inductor)
+# torch.compile helper
 # ---------------------------------------------------------------------------
 def try_compile_model(
     model: HelixForCausalLM,
@@ -505,9 +511,14 @@ def try_compile_model(
     use_ssm: bool,
     use_titans: bool,
 ) -> Tuple[HelixForCausalLM, bool, Optional[str]]:
-    if use_ssm or use_titans:
-        return model, False, "skipped: SSM/Titans autograd not compile-safe"
+    """Apply torch.compile to the full model.
 
+    Since the custom Python loops in _ssd_chunked_scan and TitansMemoryNode
+    are decorated with ``@torch.compiler.disable``, the inductor backend
+    now treats them as opaque ops instead of trying to unroll them.  This
+    means SSM/Titans configs can also be compiled — the loops run in eager
+    mode, everything else is compiled.
+    """
     try:
         compiled = torch.compile(model, mode="reduce-overhead", fullgraph=False)
         _smoke_test_model(compiled, device, seq_len)
@@ -587,7 +598,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         safe_log_tag("model_instantiation_error", traceback.format_exc())
         return float("inf")
 
-    # torch.compile attempt (skip SSM/Titans)
+    # torch.compile attempt (now works for ALL configs)
     compile_applied = False
     compile_error = None
     if args.try_compile:
@@ -811,7 +822,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-mem", type=int, default=None,
                         help="GPU memory in GB; filters viable-config table (e.g. 16 for T4, 24 for L4)")
     parser.add_argument("--try-compile", action="store_true",
-                        help="Attempt torch.compile on non-SSM/Titans configs")
+                        help="Attempt torch.compile on all configs (SSM/Titans loops are opaque to inductor)")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Override round-config max_samples (smoke-test friendly)")
     parser.add_argument("--epochs", type=int, default=None,
@@ -903,7 +914,7 @@ def main() -> None:
     print(f" Dataset: {args.dataset_repo}")
     if args.gpu_mem:
         print(f" GPU memory limit: {args.gpu_mem}GB")
-    print(f" torch.compile: {'enabled (selective)' if args.try_compile else 'disabled'}")
+    print(f" torch.compile: {'enabled (all configs)' if args.try_compile else 'disabled'}")
     print(f" Viable configs in table: {len(VIABLE_CONFIGS)}")
     print(f" MLflow experiment: {experiment_name}")
     print(f" Storage: {storage_path}")
