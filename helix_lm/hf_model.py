@@ -1,14 +1,21 @@
 """
 HelixLM HuggingFace PreTrainedModel integration (V5-orthodox).
 
-Fixes applied:
-  1. Weight-tying: proper _tied_weights_keys pointing to embed.weight.
+Design choices:
+  1. Weights are INTENTIONALLY NOT TIED.  The sacred baseline converges only
+     when lm_head.weight and model.embed.weight are separate parameters.
+     Tying merges the lm_head gradient into embed.weight, which already
+     receives ~2x gradient signal from the dual recurrent paths (hidden-state
+     + LTI injection).  That combined signal destabilizes training.
+     HF integration does not require tying; config explicitly sets
+     tie_word_embeddings=False.
   2. Forward pass: PRESERVES full gradient flow (no e.detach()). The sacred
      baseline passes e (not detached) to recurrent(), allowing gradients to
      flow through BOTH the hidden-state path and the LTI injection path.
      This gives the embedding layer ~2x stronger gradients and is essential
      for convergence to PPL ~15 (train) / ~90 (val).  DO NOT add detach().
   3. Generation: prepare_inputs_for_generation passes FULL sequence (no KV-cache).
+     The recurrent graph re-initializes node_states on every forward.
   4. Auto-registration: explicit, visible, no silent try/except.
   5. use_cache=False is hard-enforced — the recurrent graph has no KV state.
 
@@ -101,10 +108,13 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
     HelixLM causal language model with full HuggingFace compatibility.
 
     Weight-tying behavior:
-      - If config.tie_word_embeddings=True, lm_head.weight shares storage with
-        model.embed.weight (standard HF pattern).
-      - This is handled by HF's built-in _tie_or_clone_weights() via
-        _tied_weights_keys pointing to lm_head.weight.
+      - Weights are NOT tied (tie_word_embeddings=False in config).
+      - The sacred baseline converges only when lm_head.weight and
+        model.embed.weight are separate tensors.
+      - The embedding layer already receives gradients from BOTH recurrent
+        paths (hidden-state + LTI injection).  Adding the lm_head gradient
+        via weight tying overwhelms the optimization landscape and causes
+        a ~2x PPL regression.
 
     Generation behavior:
       - NO KV-cache: the recurrent graph re-initializes node_states on every
@@ -117,11 +127,13 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         preserves gradient flow through BOTH the hidden-state path and the LTI
         injection path, giving the embedding layer ~2x stronger gradients.
         This is ESSENTIAL for convergence (PPL ~15 train / ~90 val).
-        Adding e.detach() causes ~2x PPL regression (train PPL ~29, val ~150).
+        Adding e.detach() causes ~2x PPL regression (train PPL ~29 vs ~15 baseline).
     """
-    # HF 5.8 expects a dict: {tied_key: base_key}
-    # lm_head.weight is tied to model.embed.weight (input embeddings)
-    _tied_weights_keys = {"lm_head.weight": "model.embed.weight"}
+    # Intentionally empty: this architecture does not tie word embeddings.
+    # Tying merges lm_head gradients into embed.weight, which already receives
+    # ~2x gradient signal from the recurrent dual-input (h + LTI injection).
+    # The sacred baseline converges only when they are separate parameters.
+    _tied_weights_keys = {}
 
     def __init__(self, config: HelixConfig):
         super().__init__(config)
@@ -137,22 +149,10 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         # Initialize weights
         self.post_init()
 
-        # Tie weights if requested (HF standard mechanism)
-        if config.tie_word_embeddings:
-            self.tie_weights()
-
         # NOTE: We do NOT call self.to(device) here.
         # HF's from_pretrained() handles device placement; doing it ourselves
         # causes "Cannot copy out of meta tensor" errors during load.
         # Call model.to_device() explicitly after construction if desired.
-
-    def tie_weights(self, **kwargs):
-        """Tie lm_head.weight to model.embed.weight using HF's built-in mechanism."""
-        # HF PreTrainedModel.tie_weights() uses _tied_weights_keys to find
-        # which weights to tie, then calls _tie_or_clone_weights().
-        # We override get_input_embeddings() and get_output_embeddings()
-        # so HF knows which tensors to tie together.
-        super().tie_weights(**kwargs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed
