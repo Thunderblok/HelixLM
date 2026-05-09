@@ -674,27 +674,27 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
     # If compiled model fails, fallback to uncompiled. If that fails, bail.
     # -----------------------------------------------------------------------
     compile_applied = False
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        _smoke_test_model(model, device, cfg.seq_len)
-        compile_applied = True
-        print(f"  [COMPILE] torch.compile(mode='reduce-overhead') applied and verified")
-    except Exception as e:
-        print(f"  [COMPILE] Compiled model failed smoke test: {repr(e)}")
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        try:
-            model = HelixForCausalLM(cfg).to(device)
-            param_count = model.count_parameters()["total"]
-            _smoke_test_model(model, device, cfg.seq_len)
-            print(f"  [COMPILE] Fallback to uncompiled model verified")
-        except Exception as e2:
-            print(f"  [FAIL FAST] Uncompiled model also failed smoke test: {repr(e2)}")
-            safe_log_param("model_smoke_test_failed", repr(e2))
-            safe_log_tag("traceback", traceback.format_exc())
-            return float("inf")
+    # try:
+    #     # model = torch.compile(model, mode="reduce-overhead")
+    #    _smoke_test_model(model, device, cfg.seq_len)
+    #     compile_applied = True
+    #     print(f"  [COMPILE] torch.compile(mode='reduce-overhead') applied and verified")
+    # except Exception as e:
+    #    print(f"  [COMPILE] Compiled model failed smoke test: {repr(e)}")
+    #    del model
+    #    gc.collect()
+    #    if torch.cuda.is_available():
+    #        torch.cuda.empty_cache()
+    #    try:
+    #        model = HelixForCausalLM(cfg).to(device)
+    #        param_count = model.count_parameters()["total"]
+    #        _smoke_test_model(model, device, cfg.seq_len)
+    #        print(f"  [COMPILE] Fallback to uncompiled model verified")
+    #    except Exception as e2:
+    #        print(f"  [FAIL FAST] Uncompiled model also failed smoke test: {repr(e2)}")
+    #        safe_log_param("model_smoke_test_failed", repr(e2))
+    #        safe_log_tag("traceback", traceback.format_exc())
+    #        return float("inf")
 
     run_name = f"trial_{trial.number:03d}_seq{params['seq_len']}_d{params['d_model']}"
     with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
