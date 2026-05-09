@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-nas_helixlm.py  v2.1  —  Neural Architecture Search for HelixLM
+nas_helixlm.py  v2.3  —  Neural Architecture Search for HelixLM
 
-THOUGHT-EXPERIMENT SCREENING (already baked into VIABLE_CONFIGS):
-  - Any config with batch*seq*d_model² > VRAM budget is EXCLUDED.
-  - SSM only enabled when d_model >= 256 (state-dim overhead is real).
-  - Titans memory_dim is derived from d_model, never independent.
-  - fp16 is forced ONLY when seq_len >= 256 AND d_model >= 256.
-    (Small models run stabler in fp32; no memory pressure to justify AMP.)
-  - torch.compile is SKIPPED for SSM/Titans paths (Python loops break inductor).
-  - grad_accum >= 2 whenever batch >= 16 to keep effective batch sane.
-  - nodes_per_column is REMOVED from search — graph.py builds its own topology.
-    n_columns + attention_mode are the real controls.
+DATA PATH (native):
+  load_dataset(streaming) -> Python list of strings -> Trainer(train_texts=...)
+  which internally builds DocumentAwareDataset / create_document_loader.
+  No custom collators, no foreign masking logic.
 
-FAILURE MODES WE CATCH:
-  1. Unlimited fail tolerance      — Optuna catch=(Exception,)
-  2. Frozen-trial watchdog         — SIGALRM aborts if epoch > 3× expected
-  3. NaN / all-batches-skipped     — loss=0 & PPL=1 or skipped==steps
-  4. Timestamped MLflow experiment — prevents history clutter & leakage
+SCREENING PHILOSOPHY:
+  - Force fp32 everywhere. Models are < 1 GB; AMP (fp16) causes immediate NaN
+    on d>=256 with LR=3e-3. No memory pressure justifies AMP at this scale.
+  - Viable-config table replaces blind TPE over interdependent params.
+  - SSM + Titans combined config included (VRAM impact of Titans is ~0.3 MB).
 
-ROUNDS
-  screening   : cycles through VIABLE_CONFIGS table (exhaustive, cheap)
-  validation  : enqueues top screening configs, runs longer
-  final       : enqueues top validation configs, runs full data
+FAILURE MODES CAUGHT:
+  1. Unlimited fail tolerance      — wrapper catches Exception, returns inf
+  2. Proper Optuna pruning         — TrialPruned is re-raised, NOT swallowed
+  3. Frozen-trial watchdog         — SIGALRM aborts if epoch > 3× expected
+  4. NaN / all-batches-skipped     — loss=0 & PPL=1 is caught as dead trial
+  5. Timestamped MLflow experiment — prevents history clutter & leakage
 """
-SCRIPT_VERSION = "2.1.0-20260510"
+SCRIPT_VERSION = "2.3.0-20260510"
 SCRIPT_REVISION_NOTE = (
-    "v2.1: fixed GB->MB filter bug, enqueued-param propagation, "
-    "IterableDataset n_batches fix, cost-model watchdog, "
-    "deterministic viable-config table for screening"
+    "v2.3: force fp32 (no AMP), proper TrialPruned propagation, "
+    "native DocumentAwareDataset via Trainer(train_texts), "
+    "SSM+Titans combo config, removed fake search params"
 )
 
 import argparse
@@ -50,35 +46,25 @@ import numpy as np
 import optuna
 import torch
 from datasets import load_dataset
-from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# Path setup
-# ---------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
 
-# ---------------------------------------------------------------------------
-# Globals
-# ---------------------------------------------------------------------------
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-# If a trial epoch exceeds this multiplier × expected epoch wall-time,
-# we consider it frozen and raise FrozenTrialError.
 FROZEN_TRIAL_MULTIPLIER = 3.0
 
 # ---------------------------------------------------------------------------
-# Round configs  (overrideable via CLI --max-samples / --epochs)
+# Round configs (overrideable via CLI --max-samples / --epochs)
 # ---------------------------------------------------------------------------
 ROUNDS: Dict[str, Dict[str, Any]] = {
     "screening": {
         "max_samples": 5000,
         "epochs": 3,
-        "n_trials": None,           # defaults to len(VIABLE_CONFIGS)
+        "n_trials": None,
         "n_parallel": 2,
         "instance_cost_hr": 1.52,
     },
@@ -99,27 +85,17 @@ ROUNDS: Dict[str, Dict[str, Any]] = {
 }
 
 # ---------------------------------------------------------------------------
-# VIABLE_CONFIG_TABLE  (thought-experiment screened)
-#
-# Rules:
-#   - d_model 128 / 256 / 384 only for screening (sweep widths, not depths).
-#   - n_loops capped at 2 for d_model=256, 1 for d_model=384 to respect L4 24GB.
-#   - batch_size chosen so peak fits in target VRAM with 15% CUDA slack.
-#   - SSM configs use batch=4, lower ffn_expansion (state-chain is greedy).
-#   - Titans configs use batch=4, memory_dim_ratio 0.5 (not 1.0).
-#   - NO "full" attention on d_model=384 with seq=256 + batch>4 (O(n²) kills VRAM).
+# VIABLE CONFIG TABLE — thought-experiment screened
 # ---------------------------------------------------------------------------
-
 VIABLE_CONFIGS: List[Dict[str, Any]] = [
     # ---- T4-friendly (<= 16 GB) ----
     {
         "name": "xs_linear_128",
         "d_model": 128, "n_columns": 2, "n_loops": 1,
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 16, "grad_accum": 2,
     },
@@ -127,10 +103,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "xs_hybrid_128",
         "d_model": 128, "n_columns": 2, "n_loops": 1,
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 16, "grad_accum": 2,
     },
@@ -138,10 +113,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "xs_linear_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 8, "grad_accum": 2,
     },
@@ -149,10 +123,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "xs_hybrid_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 8, "grad_accum": 2,
     },
@@ -161,10 +134,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_linear_256",
         "d_model": 256, "n_columns": 3, "n_loops": 2,
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.5, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 8, "grad_accum": 2,
     },
@@ -172,10 +144,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_hybrid_256",
         "d_model": 256, "n_columns": 3, "n_loops": 2,
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.5, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 8, "grad_accum": 2,
     },
@@ -183,10 +154,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_full_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
         "attention_mode": "full", "hybrid_full_attention_interval": None,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.5, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 8, "grad_accum": 2,
     },
@@ -194,11 +164,10 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_ssm_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
-        "use_ssm": True, "use_titans": False,
+        "use_ssm": True, "use_titans_memory": False,
         "ssm_d_state": 64, "ssm_dt_rank": 16, "ssm_d_conv": 3, "ssm_expand": 2,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 4, "grad_accum": 2,
     },
@@ -206,11 +175,20 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_titans_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
-        "use_ssm": False, "use_titans": True,
-        "titans_memory_dim_ratio": 0.5, "titans_num_memories": 4, "titans_memory_lr": 1e-3,
+        "use_ssm": False, "use_titans_memory": True,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
+        "grad_clip": 1.0, "warmup_ratio": 0.05,
+        "batch_size": 4, "grad_accum": 2,
+    },
+    {
+        "name": "sm_ssm_titans_256",
+        "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "attention_mode": "linear", "hybrid_full_attention_interval": None,
+        "use_ssm": True, "use_titans_memory": True,
+        "ssm_d_state": 64, "ssm_dt_rank": 16, "ssm_d_conv": 3, "ssm_expand": 2,
+        "ffn_expansion": 2.0, "dropout": 0.05,
+        "lr": 3e-3, "weight_decay": 0.01,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 4, "grad_accum": 2,
     },
@@ -218,10 +196,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_linear_384",
         "d_model": 384, "n_columns": 2, "n_loops": 1,
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 4, "grad_accum": 2,
     },
@@ -229,10 +206,9 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
         "name": "sm_hybrid_384",
         "d_model": 384, "n_columns": 2, "n_loops": 1,
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
-        "use_ssm": False, "use_titans": False,
+        "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
         "lr": 3e-3, "weight_decay": 0.01,
-        "beta1": 0.9, "beta2": 0.999, "adam_eps": 1e-6,
         "grad_clip": 1.0, "warmup_ratio": 0.05,
         "batch_size": 4, "grad_accum": 2,
     },
@@ -240,110 +216,17 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
 
 
 # ---------------------------------------------------------------------------
-# Streaming loader (works with IterableDataset / streaming=True)
+# Data loading: native HF streaming -> list of strings -> Trainer
 # ---------------------------------------------------------------------------
-class _StreamingTextDataset(IterableDataset):
-    def __init__(
-        self,
-        hf_stream,
-        tokenizer,
-        seq_len: int,
-        max_samples: Optional[int] = None,
-    ):
-        super().__init__()
-        self.hf_stream = hf_stream
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.max_samples = max_samples
-
-    def __iter__(self):
-        count = 0
-        buffer: List[int] = []
-        pad_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
-
-        for item in self.hf_stream:
-            text = item.get("text", "")
-            if not text:
-                continue
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if not ids:
-                continue
-            buffer.extend(ids)
-            while len(buffer) >= self.seq_len:
-                chunk = buffer[: self.seq_len]
-                buffer = buffer[self.seq_len :]
-                input_ids = torch.tensor(chunk, dtype=torch.long)
-                labels = input_ids.clone()
-                attention_mask = torch.ones(self.seq_len, dtype=torch.long)
-                yield {
-                    "input_ids": input_ids,
-                    "labels": labels,
-                    "attention_mask": attention_mask,
-                    "is_natural_stop": torch.tensor(False, dtype=torch.bool),
-                }
-                count += 1
-                if self.max_samples is not None and count >= self.max_samples:
-                    return
-
-        if 0 < len(buffer) < self.seq_len:
-            pad_len = self.seq_len - len(buffer)
-            chunk = buffer + [pad_id] * pad_len
-            input_ids = torch.tensor(chunk, dtype=torch.long)
-            labels = input_ids.clone()
-            labels[-pad_len:] = -100
-            attention_mask = (input_ids != pad_id).long()
-            yield {
-                "input_ids": input_ids,
-                "labels": labels,
-                "attention_mask": attention_mask,
-                "is_natural_stop": torch.tensor(True, dtype=torch.bool),
-            }
-
-
-def create_streaming_loader(
-    dataset_stream,
-    tokenizer,
-    seq_len: int,
-    batch_size: int,
-    max_samples: Optional[int] = None,
-    num_workers: int = 0,
-    pin_memory: bool = False,
-):
-    ds = _StreamingTextDataset(dataset_stream, tokenizer, seq_len, max_samples)
-
-    def collate_fn(batch):
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        labels = torch.stack([b["labels"] for b in batch])
-        attention_mask = torch.stack([b["attention_mask"] for b in batch])
-        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "is_natural_stop": is_natural_stop,
-        }
-
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
-def load_texts(repo_id: str, split_name: str, max_samples: Optional[int] = None) -> List[str]:
-    print(f"  Streaming '{split_name}' ...")
-    ds = load_dataset(repo_id, split=split_name, streaming=True)
+def load_texts(repo_id: str, split: str, max_samples: Optional[int] = None) -> List[str]:
+    print(f"  Loading '{repo_id}' [{split}] (max={max_samples}) ...")
+    ds = load_dataset(repo_id, split=split, streaming=True)
     texts = []
-    for i, item in enumerate(tqdm(ds, desc=f"  {split_name}", unit="smpl", leave=False)):
+    for i, item in enumerate(tqdm(ds, desc=f"  {split}", unit="smpl", leave=False)):
         if max_samples is not None and i >= max_samples:
             break
-        texts.append(item["text"])
-    print(f"  -> {len(texts):,} samples loaded")
+        texts.append(item.get("text", ""))
+    print(f"  -> {len(texts):,} samples")
     return texts
 
 
@@ -390,17 +273,9 @@ def safe_log_tag(key: str, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fixed VRAM estimator
+# VRAM estimator (heuristic but catches obvious OOMs)
 # ---------------------------------------------------------------------------
 def estimate_vram(params: Dict[str, Any]) -> float:
-    """
-    Peak training VRAM estimate (MB).
-    Accounts for:
-      - mamba2 autograd chain (h state kept at every timestep)
-      - Titans persistent memory tensor M
-      - full-attention O(n²) activation memory
-      - AdamW optimizer 2× states + gradients
-    """
     d = params["d_model"]
     n_col = params["n_columns"]
     loops = params["n_loops"]
@@ -408,31 +283,29 @@ def estimate_vram(params: Dict[str, Any]) -> float:
     batch = params.get("batch_size", 32)
     vocab = 50257
 
-    # Embedding table
     embed_mb = vocab * d * 4 / (1024 ** 2)
 
-    # Graph parameters (rough: each column has ~3 nodes, each ~2 d² matrices)
-    nodes_per_col = 3
+    # Graph params: ~3.5 nodes/col, ~2 d² matrices each
+    nodes_per_col = 3.5
     graph_params_mb = n_col * nodes_per_col * 2 * (d ** 2) * 4 / (1024 ** 2)
 
-    # Activations: each loop processes batch×seq×d through n_col columns
+    # Activations
     base_activations_mb = batch * seq * d * loops * n_col * 4 / (1024 ** 2)
 
-    # Full attention quadratic memory
+    # Full attention O(n²)
     full_attn_cols = 0
     if params["attention_mode"] == "full":
         full_attn_cols = n_col
     elif params["attention_mode"] == "hybrid":
-        interval = params.get("hybrid_full_attention_interval", 2)
+        interval = params.get("hybrid_full_attention_interval") or 2
         full_attn_cols = (n_col + interval - 1) // interval
 
+    attn_act_mb = 0.0
     if full_attn_cols > 0:
         heads = max(2, d // 64)
         attn_act_mb = full_attn_cols * batch * heads * (seq ** 2) * 4 / (1024 ** 2)
-    else:
-        attn_act_mb = 0.0
 
-    # SSM autograd chain: each mamba2 node keeps (seq) copies of h state
+    # SSM autograd chain
     ssm_autograd_mb = 0.0
     if params.get("use_ssm", False):
         ssm_expand = params.get("ssm_expand", 2)
@@ -442,32 +315,21 @@ def estimate_vram(params: Dict[str, Any]) -> float:
         ssm_autograd_mb = ssm_nodes * seq * batch * d_inner * ssm_d_state * 4 / (1024 ** 2)
         graph_params_mb *= 1.3
 
-    # Titans memory
+    # Titans persistent memory M: (batch, feature_dim, d_model)
     titans_mem_mb = 0.0
-    if params.get("use_titans", False):
-        n_mem = params.get("titans_num_memories", 8)
-        feature_dim = 64
-        titans_mem_mb = n_mem * batch * feature_dim * d * 4 / (1024 ** 2)
-        graph_params_mb *= 1.1
+    if params.get("use_titans_memory", False):
+        feature_dim = 64  # TitansMemoryNode default
+        titans_mem_mb = batch * feature_dim * d * 4 / (1024 ** 2)
+        graph_params_mb *= 1.05
 
-    # Optimizer states (AdamW keeps 2 copies per param)
     optimizer_mb = 2 * (embed_mb + graph_params_mb)
-    # Gradients
     gradients_mb = embed_mb + graph_params_mb
 
-    # Peak = params + forward_activations + attn + ssm + titans + backward_peak + optimizer
     total_mb = (
-        embed_mb
-        + graph_params_mb
-        + base_activations_mb
-        + attn_act_mb
-        + ssm_autograd_mb
-        + titans_mem_mb
-        + optimizer_mb
-        + gradients_mb
-        + base_activations_mb
-    ) * 1.15  # fragmentation buffer
-
+        embed_mb + graph_params_mb + base_activations_mb +
+        attn_act_mb + ssm_autograd_mb + titans_mem_mb +
+        optimizer_mb + gradients_mb + base_activations_mb
+    ) * 1.15
     return total_mb
 
 
@@ -490,7 +352,7 @@ def estimate_training_cost(
         base_tok_per_sec = 25000
         loop_penalty = 1.0 / max(1, params["n_loops"] ** 0.7)
         ssm_penalty = 0.7 if params.get("use_ssm", False) else 1.0
-        titans_penalty = 0.85 if params.get("use_titans", False) else 1.0
+        titans_penalty = 0.9 if params.get("use_titans_memory", False) else 1.0
         if params["attention_mode"] == "full":
             attn_penalty = 0.4
         elif params["attention_mode"] == "hybrid":
@@ -499,12 +361,8 @@ def estimate_training_cost(
             attn_penalty = 1.0
         seq_penalty = 256 / seq_len
         tok_per_sec = (
-            base_tok_per_sec
-            * loop_penalty
-            * ssm_penalty
-            * titans_penalty
-            * attn_penalty
-            * seq_penalty
+            base_tok_per_sec * loop_penalty * ssm_penalty *
+            titans_penalty * attn_penalty * seq_penalty
         )
     else:
         tok_per_sec = tok_per_sec_assumed
@@ -527,158 +385,32 @@ def estimate_training_cost(
 
 
 # ---------------------------------------------------------------------------
-# Node-type assignment (deterministic topology builder)
-# ---------------------------------------------------------------------------
-def build_node_config(node_type: str, params: Dict[str, Any], col_idx: int, node_idx: int) -> Dict[str, Any]:
-    d = params["d_model"]
-    ffn = params["ffn_expansion"]
-
-    if node_type == "linear_attn":
-        feature_dim = d // 2 if params["n_loops"] >= 3 else d
-        return {
-            "type": "LinearAttnNode",
-            "num_heads": max(2, d // 64),
-            "feature_dim": feature_dim,
-            "dropout": params["dropout"],
-            "use_rope": True,
-            "feature_map": "elu",
-        }
-
-    elif node_type == "full_attn":
-        heads = max(4, d // 32)
-        if params["n_columns"] >= 4:
-            heads = max(2, heads // 2)
-        return {
-            "type": "FullAttnNode",
-            "num_heads": heads,
-            "attn_dropout": params["dropout"],
-            "use_rope": True,
-            "causal": True,
-        }
-
-    elif node_type == "swiglu":
-        col_depth = 3
-        adjusted_ffn = ffn * (1.0 - 0.05 * (col_depth - 2))
-        adjusted_ffn = max(1.5, adjusted_ffn)
-        return {
-            "type": "SwiGLUNode",
-            "expansion_factor": round(adjusted_ffn, 2),
-            "dropout": params["dropout"],
-            "activation": "silu",
-        }
-
-    elif node_type == "mamba2":
-        d_state = params.get("ssm_d_state", 64)
-        d_state = min(d_state, d // 2)
-        return {
-            "type": "Mamba2Node",
-            "d_state": d_state,
-            "d_conv": params.get("ssm_d_conv", 4),
-            "dt_rank": params.get("ssm_dt_rank", "auto"),
-            "expand": params.get("ssm_expand", 2),
-            "use_mem_eff_path": True,
-        }
-
-    elif node_type == "gate":
-        return {
-            "type": "GateNode",
-            "aggregation": "learned_softmax",
-            "max_inputs": 4,
-            "dropout": 0.0,
-        }
-
-    elif node_type == "titans_memory":
-        return {
-            "type": "TitansMemoryNode",
-            "memory_dim": params.get("titans_memory_dim", d),
-            "num_memories": params.get("titans_num_memories", 8),
-            "memory_lr": params.get("titans_memory_lr", 3e-4),
-        }
-
-    else:
-        return {"type": "SwiGLUNode", "expansion_factor": ffn}
-
-
-# ---------------------------------------------------------------------------
-# Build HelixConfig
+# Config builder (sacred: align with real HelixConfig fields)
 # ---------------------------------------------------------------------------
 def build_helix_config(
     params: Dict[str, Any],
     vocab_size: int,
     device: str,
-    tokenizer_name: str = "gpt2",
-) -> Any:
-    # Derive Titans dim
-    if params.get("use_titans") and params.get("titans_memory_dim_ratio") is not None:
-        params["titans_memory_dim"] = int(params["d_model"] * params["titans_memory_dim_ratio"])
-    else:
-        params["titans_memory_dim"] = None
-
-    n_columns = params["n_columns"]
-    attention_mode = params["attention_mode"]
-    hybrid_interval = params.get("hybrid_full_attention_interval")
-    use_ssm = params.get("use_ssm", False)
-    use_titans = params.get("use_titans", False)
-
-    column_specs: List[List[Dict[str, Any]]] = []
-    for col_idx in range(n_columns):
-        nodes: List[Dict[str, Any]] = []
-
-        # Attention node
-        if attention_mode == "full":
-            nodes.append(build_node_config("full_attn", params, col_idx, 0))
-        elif attention_mode == "hybrid":
-            interval = hybrid_interval or 2
-            if col_idx % interval == 0:
-                nodes.append(build_node_config("full_attn", params, col_idx, 0))
-            else:
-                nodes.append(build_node_config("linear_attn", params, col_idx, 0))
-        else:
-            nodes.append(build_node_config("linear_attn", params, col_idx, 0))
-
-        # FFN
-        nodes.append(build_node_config("swiglu", params, col_idx, 1))
-
-        # Optional SSM
-        if use_ssm:
-            nodes.append(build_node_config("mamba2", params, col_idx, 2))
-
-        # Optional Titans (middle column only)
-        if use_titans and col_idx == n_columns // 2:
-            nodes.append(build_node_config("titans_memory", params, col_idx, 0))
-
-        # Gate
-        if len(nodes) > 1 or col_idx > 0:
-            nodes.append(build_node_config("gate", params, col_idx, len(nodes)))
-
-        column_specs.append(nodes)
-
-    nodes_per_column = tuple(len(col) for col in column_specs)
-
-    # dtype / AMP decision
-    if params["seq_len"] >= 256 and params["d_model"] >= 256:
-        dtype_str = "float16"
-        use_amp = True
-    else:
-        dtype_str = "float32"
-        use_amp = False
+) -> Tuple[Any, bool]:
+    # Force fp32 everywhere — AMP causes immediate NaN on d>=256 with LR=3e-3.
+    # Models are tiny; no memory pressure justifies fp16 at screening scale.
+    dtype_str = "float32"
+    use_amp = False
 
     effective_batch = params["batch_size"] * params["grad_accum"]
     steps_per_epoch = max(1, 20000 // effective_batch)
-    warmup_steps = max(1, int(steps_per_epoch * params["warmup_ratio"]))
+    warmup_steps = max(1, int(steps_per_epoch * params.get("warmup_ratio", 0.05)))
 
-    cfg = HelixConfig.tiny(
+    cfg_kwargs: Dict[str, Any] = dict(
         vocab_size=vocab_size,
         d_model=params["d_model"],
         n_columns=params["n_columns"],
-        nodes_per_column=nodes_per_column,
         n_loops=params["n_loops"],
         seq_len=params["seq_len"],
-        tokenizer_name=tokenizer_name,
+        tokenizer_name="gpt2",
         attention_mode=params["attention_mode"],
-        hybrid_full_attention_interval=params.get("hybrid_full_attention_interval", 2),
         use_ssm=params.get("use_ssm", False),
-        use_titans_memory=params.get("use_titans", False),
+        use_titans_memory=params.get("use_titans_memory", False),
         use_rope=True,
         ffn_expansion=params["ffn_expansion"],
         dropout=params["dropout"],
@@ -687,23 +419,23 @@ def build_helix_config(
         grad_clip=params["grad_clip"],
         warmup_steps=warmup_steps,
         batch_size=params["batch_size"],
-        grad_accum_steps=params["grad_accum"],
-        use_amp=use_amp,
         dtype=dtype_str,
         device=device,
-        adam_beta1=params["beta1"],
-        adam_beta2=params["beta2"],
-        adam_eps=params["adam_eps"],
-        ssm_d_state=params.get("ssm_d_state"),
-        ssm_dt_rank=params.get("ssm_dt_rank"),
-        ssm_d_conv=params.get("ssm_d_conv"),
-        ssm_expand=params.get("ssm_expand"),
-        titans_memory_dim=params.get("titans_memory_dim"),
-        titans_num_memories=params.get("titans_num_memories"),
-        titans_memory_lr=params.get("titans_memory_lr"),
-        column_specs=column_specs,
     )
-    return cfg
+
+    if params.get("hybrid_full_attention_interval") is not None:
+        cfg_kwargs["hybrid_full_attention_interval"] = params["hybrid_full_attention_interval"]
+
+    if params.get("use_ssm", False):
+        cfg_kwargs.update(
+            ssm_d_state=params.get("ssm_d_state", 64),
+            ssm_dt_rank=params.get("ssm_dt_rank", "auto"),
+            ssm_d_conv=params.get("ssm_d_conv", 4),
+            ssm_expand=params.get("ssm_expand", 2),
+        )
+
+    cfg = HelixConfig.tiny(**cfg_kwargs)
+    return cfg, use_amp
 
 
 def params_to_flat_dict(params: Dict[str, Any]) -> Dict[str, str]:
@@ -728,10 +460,9 @@ def _smoke_test_model(model: HelixForCausalLM, device: torch.device, seq_len: in
     dummy_labels = dummy_ids.clone()
 
     outputs = model(dummy_ids, labels=dummy_labels)
-    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+    loss = outputs["loss"] if hasattr(outputs, "loss") else outputs[0]
     if loss is None:
         raise RuntimeError("Model returned None loss on smoke test")
-
     if torch.isnan(loss) or torch.isinf(loss):
         raise RuntimeError(f"Smoke test produced non-finite loss: {loss.item()}")
 
@@ -740,7 +471,7 @@ def _smoke_test_model(model: HelixForCausalLM, device: torch.device, seq_len: in
 
 
 # ---------------------------------------------------------------------------
-# Frozen-trial watchdog (Unix only; containers are Linux)
+# Frozen-trial watchdog
 # ---------------------------------------------------------------------------
 class FrozenTrialError(Exception):
     pass
@@ -751,8 +482,7 @@ def _install_watchdog(timeout_seconds: float):
     if hasattr(signal, 'SIGALRM'):
         def _handler(signum, frame):
             raise FrozenTrialError(
-                f"Trial frozen: exceeded {timeout_seconds:.0f}s wall-clock "
-                f"for this epoch/process."
+                f"Trial frozen: exceeded {timeout_seconds:.0f}s wall-clock for this epoch."
             )
         signal.signal(signal.SIGALRM, _handler)
         signal.alarm(int(timeout_seconds))
@@ -766,28 +496,22 @@ def _disable_watchdog():
 
 
 # ---------------------------------------------------------------------------
-# torch.compile helper (GPU-safe fallback)
+# torch.compile helper (skip SSM/Titans — custom loops break CUDA inductor)
 # ---------------------------------------------------------------------------
 def try_compile_model(
     model: HelixForCausalLM,
     device: torch.device,
     seq_len: int,
     use_ssm: bool,
+    use_titans: bool,
 ) -> Tuple[HelixForCausalLM, bool, Optional[str]]:
-    """
-    Attempt torch.compile.
-    WHY we skip SSM: mamba2's _ssd_chunked_scan has Python loops over timesteps
-    and in-place slice updates that break the inductor CUDA backend.
-    TitansMemoryNode also uses dynamic per-token updates that confuse the compiler.
-    CPU tests pass because the C++ backend tolerates the control flow differently.
-    """
-    if use_ssm:
-        return model, False, "skipped: SSM autograd chain not compile-safe"
+    if use_ssm or use_titans:
+        return model, False, "skipped: SSM/Titans autograd not compile-safe"
 
     try:
-        compiled = torch.compile(model, mode="default", fullgraph=False)
+        compiled = torch.compile(model, mode="reduce-overhead", fullgraph=False)
         _smoke_test_model(compiled, device, seq_len)
-        print("  [COMPILE] torch.compile(mode='default') applied and verified")
+        print("  [COMPILE] torch.compile(mode='reduce-overhead') applied and verified")
         return compiled, True, None
     except Exception as e:
         err_msg = repr(e)
@@ -799,12 +523,7 @@ def try_compile_model(
 # Viable-config sampler
 # ---------------------------------------------------------------------------
 def sample_viable_config(trial: optuna.Trial, seq_len: int, gpu_mem_gb: Optional[int]) -> Dict[str, Any]:
-    """
-    If trial.params is already populated (enqueued from prior round), use it.
-    Otherwise sample deterministically from the viable-config table.
-    """
     if trial.params:
-        # Enqueued / resumed trial — trust the params but force current seq_len
         params = dict(trial.params)
         params["seq_len"] = seq_len
         return params
@@ -814,7 +533,6 @@ def sample_viable_config(trial: optuna.Trial, seq_len: int, gpu_mem_gb: Optional
         c = dict(cfg)
         c["seq_len"] = seq_len
         vram = estimate_vram(c)
-        # CRITICAL FIX: compare MB to MB (gpu_mem_gb * 1024)
         if gpu_mem_gb is None or vram <= gpu_mem_gb * 1024 * 0.90:
             eligible.append((c, vram))
 
@@ -836,7 +554,6 @@ def sample_viable_config(trial: optuna.Trial, seq_len: int, gpu_mem_gb: Optional
 # Optuna objective
 # ---------------------------------------------------------------------------
 def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str, Any]) -> float:
-    # TIMESTAMPED experiment name — old failed runs cannot pollute this one
     experiment_name = f"helixlm_nas_{args.round}_{TIMESTAMP}"
     mlflow.set_experiment(experiment_name)
 
@@ -855,7 +572,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
 
     # Build config
     try:
-        cfg = build_helix_config(params, vocab_size, str(device))
+        cfg, use_amp = build_helix_config(params, vocab_size, str(device))
     except Exception as e:
         warnings.warn(f"Config build failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
         safe_log_tag("config_build_error", traceback.format_exc())
@@ -870,12 +587,14 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         safe_log_tag("model_instantiation_error", traceback.format_exc())
         return float("inf")
 
-    # torch.compile attempt (skip SSM)
+    # torch.compile attempt (skip SSM/Titans)
     compile_applied = False
     compile_error = None
     if args.try_compile:
         model, compile_applied, compile_error = try_compile_model(
-            model, device, cfg.seq_len, params.get("use_ssm", False)
+            model, device, cfg.seq_len,
+            params.get("use_ssm", False),
+            params.get("use_titans_memory", False),
         )
 
     run_name = (
@@ -909,9 +628,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         print(f"  d_model={params['d_model']}  loops={params['n_loops']}  "
               f"seq={params['seq_len']}  lr={params['lr']}")
         print(f"  attention={params['attention_mode']}  "
-              f"ssm={params.get('use_ssm', False)}  titans={params.get('use_titans', False)}")
-        print(f"  adam: beta1={params['beta1']}  beta2={params['beta2']}  "
-              f"wd={params['weight_decay']}  eps={params['adam_eps']}")
+              f"ssm={params.get('use_ssm', False)}  titans={params.get('use_titans_memory', False)}")
         print(f"  params={param_count:,}  est_vram={est_vram:.0f}MB  "
               f"batch={params['batch_size']}  accum={params['grad_accum']}")
         print(f"  est_cost=${cost_pred['estimated_cost_usd']}  "
@@ -922,63 +639,26 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         train_max = round_cfg["max_samples"]
         val_max = max(500, train_max // 10) if train_max else 5000
 
-        # Watchdog timeout based on cost model (per-epoch)
+        # Watchdog timeout: per-epoch, min 5 minutes
         expected_epoch_sec = max(60.0, cost_pred["wall_seconds"] / round_cfg["epochs"])
         watchdog_timeout = max(300.0, expected_epoch_sec * FROZEN_TRIAL_MULTIPLIER)
 
         try:
-            if train_max is None:
-                print("  [DATA] Using streaming loader (full dataset)")
-                train_stream = load_dataset(args.dataset_repo, split="pretrain_train", streaming=True)
-                val_stream = load_dataset(args.dataset_repo, split="pretrain_val", streaming=True)
+            train_texts = load_texts(args.dataset_repo, "pretrain_train", train_max)
+            val_texts = load_texts(args.dataset_repo, "pretrain_val", val_max) if val_max else None
 
-                train_loader = create_streaming_loader(
-                    train_stream, tokenizer, cfg.seq_len,
-                    batch_size=cfg.batch_size,
-                    max_samples=None,
-                    num_workers=2,
-                    pin_memory=True,
-                )
-                val_loader = create_streaming_loader(
-                    val_stream, tokenizer, cfg.seq_len,
-                    batch_size=cfg.batch_size,
-                    max_samples=val_max,
-                    num_workers=2,
-                    pin_memory=True,
-                )
-
-                trainer = Trainer(
-                    model=model,
-                    cfg=cfg,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    tokenizer=tokenizer,
-                    output_dir=os.path.join(args.output_dir, f"trial_{trial.number:03d}"),
-                    example_prompts=["The next day", "In 1492,"],
-                    generated_example_length=30,
-                    grad_accum_steps=params["grad_accum"],
-                    use_amp=params["seq_len"] >= 256 and params["d_model"] >= 256,
-                    min_tail_len=1,
-                    num_workers=0,
-                    pin_memory=True,
-                )
-            else:
-                train_texts = load_texts(args.dataset_repo, "pretrain_train", train_max)
-                val_texts = load_texts(args.dataset_repo, "pretrain_val", val_max)
-
-                trainer = Trainer(
-                    model=model,
-                    cfg=cfg,
-                    train_texts=train_texts,
-                    val_texts=val_texts,
-                    tokenizer=tokenizer,
-                    output_dir=os.path.join(args.output_dir, f"trial_{trial.number:03d}"),
-                    example_prompts=["The next day", "In 1492,"],
-                    generated_example_length=30,
-                    grad_accum_steps=params["grad_accum"],
-                    use_amp=params["seq_len"] >= 256 and params["d_model"] >= 256,
-                    min_tail_len=1,
-                )
+            trainer = Trainer(
+                model=model,
+                cfg=cfg,
+                train_texts=train_texts,
+                val_texts=val_texts,
+                tokenizer=tokenizer,
+                output_dir=os.path.join(args.output_dir, f"trial_{trial.number:03d}"),
+                example_prompts=["The next day", "In 1492,"],
+                generated_example_length=30,
+                grad_accum_steps=params["grad_accum"],
+                use_amp=use_amp,
+            )
         except Exception as e:
             safe_log_param("failed", "data_loading")
             safe_log_tag("data_loading_error", traceback.format_exc())
@@ -990,12 +670,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         start_time = time.time()
         any_valid_epoch = False
 
-        # We use cost_pred steps as n_batches (safe for IterableDataset)
-        n_batches = max(1, cost_pred["steps_per_epoch"])
-
         for epoch in range(1, round_cfg["epochs"] + 1):
             epoch_start = time.time()
-
             _install_watchdog(watchdog_timeout)
 
             try:
@@ -1016,7 +692,12 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
                 _disable_watchdog()
 
             epoch_time = time.time() - epoch_start
-            tokens_per_epoch = n_batches * cfg.batch_size * cfg.seq_len
+            tokens_per_epoch = (
+                cost_pred["steps_per_epoch"] *
+                params["grad_accum"] *
+                cfg.batch_size *
+                cfg.seq_len
+            )
             tok_per_sec = tokens_per_epoch / max(epoch_time, 1e-6)
             tok_per_sec_list.append(tok_per_sec)
 
@@ -1025,20 +706,16 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
             train_ppl = train_m.get("perplexity", float("inf"))
             skipped_batches = train_m.get("skipped_batches", 0)
 
-            is_all_skipped = (
-                (train_loss == 0.0 and train_ppl == 1.0)
-                or skipped_batches >= n_batches
-            )
+            is_all_skipped = (train_loss == 0.0 and train_ppl == 1.0)
 
             if is_all_skipped:
                 print(f"  [NaN GUARD] Trial {trial.number} epoch {epoch}: "
                       f"ALL batches skipped (loss={train_loss}, ppl={train_ppl}, "
-                      f"skipped={skipped_batches}/{n_batches}). Killing trial.")
+                      f"skipped={skipped_batches}). Killing trial.")
                 safe_log_param("failed", f"all_nan_epoch_{epoch}")
                 safe_log_param("nan_epoch_skipped_batches", skipped_batches)
                 return float("inf")
 
-            # Explosion detection
             if not math.isfinite(train_loss) or train_loss > 50000 or train_ppl > 50000:
                 print(f"  [EXPLODE] Trial {trial.number} epoch {epoch} "
                       f"(loss={train_loss:.2f}, ppl={train_ppl:.2f})")
@@ -1046,8 +723,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
                 safe_log_param("exploded_loss", train_loss)
                 return float("inf")
 
-            if not is_all_skipped:
-                any_valid_epoch = True
+            any_valid_epoch = True
 
             safe_log_metrics({
                 "train_loss": train_loss,
@@ -1057,7 +733,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
                 "skipped_batches": skipped_batches,
             }, step=epoch)
 
-            # Validation (every epoch for fast signal)
+            # Validation
             val_ppl = float("inf")
             if trainer.val_loader and epoch % max(1, round_cfg["epochs"] // 2) == 0:
                 try:
@@ -1121,7 +797,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HelixLM NAS with Optuna v2.1")
+    parser = argparse.ArgumentParser(description="HelixLM NAS with Optuna v2.3")
     parser.add_argument("--round", choices=["screening", "validation", "final"], required=True)
     parser.add_argument("--output-dir", default="./nas_results")
     parser.add_argument("--n-trials", type=int, default=None)
@@ -1135,7 +811,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-mem", type=int, default=None,
                         help="GPU memory in GB; filters viable-config table (e.g. 16 for T4, 24 for L4)")
     parser.add_argument("--try-compile", action="store_true",
-                        help="Attempt torch.compile on non-SSM configs")
+                        help="Attempt torch.compile on non-SSM/Titans configs")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Override round-config max_samples (smoke-test friendly)")
     parser.add_argument("--epochs", type=int, default=None,
@@ -1156,7 +832,6 @@ def main() -> None:
     args = parse_args()
     round_cfg = dict(ROUNDS[args.round])
 
-    # Allow CLI overrides for rapid smoke testing without editing code
     if args.max_samples is not None:
         round_cfg["max_samples"] = args.max_samples
     if args.epochs is not None:
@@ -1194,7 +869,7 @@ def main() -> None:
         load_if_exists=True,
     )
 
-    # Enqueue winners from previous round for validation/final
+    # Enqueue winners from previous round
     if args.round in ("validation", "final"):
         prev_round = "screening" if args.round == "validation" else "validation"
         import glob
@@ -1203,7 +878,6 @@ def main() -> None:
         if prev_files:
             prev_storage = prev_files[-1]
             try:
-                # Derive study name from filename
                 prev_fname = os.path.basename(prev_storage).replace(".db", "")
                 prev_study = optuna.load_study(
                     study_name=prev_fname,
@@ -1242,19 +916,29 @@ def main() -> None:
         vram = estimate_vram(c)
         eligible = (args.gpu_mem is None) or (vram <= args.gpu_mem * 1024 * 0.90)
         mark = "✓" if eligible else "✗"
-        print(f"  {mark} {i:2d}: {cfg['name']:20s}  d={cfg['d_model']:3d}  "
+        print(f"  {mark} {i:2d}: {cfg['name']:22s}  d={cfg['d_model']:3d}  "
               f"cols={cfg['n_columns']}  loops={cfg['n_loops']}  "
               f"attn={cfg['attention_mode']:7s}  ssm={str(cfg['use_ssm']):5s}  "
-              f"titans={str(cfg['use_titans']):5s}  batch={cfg['batch_size']:2d}  "
-              f"est_vram={vram:6.0f}MB")
+              f"titans={str(cfg.get('use_titans_memory', False)):5s}  "
+              f"batch={cfg['batch_size']:2d}  est_vram={vram:6.0f}MB")
     print()
 
-    # Unlimited fail tolerance via catch=(Exception,)
+    # Wrapper ensures TrialPruned is NOT swallowed by a broad catch tuple.
+    def _objective_wrapper(trial: optuna.Trial) -> float:
+        try:
+            return objective(trial, args, round_cfg)
+        except optuna.TrialPruned:
+            raise  # Optuna must see this to record PRUNED correctly
+        except Exception as e:
+            print(f"[CATCH] Trial {trial.number} failed: {repr(e)}")
+            traceback.print_exc()
+            return float("inf")
+
     study.optimize(
-        lambda trial: objective(trial, args, round_cfg),
+        _objective_wrapper,
         n_trials=n_trials,
         n_jobs=n_jobs,
-        catch=(Exception,),
+        catch=(),  # handled inside wrapper
         show_progress_bar=True,
     )
 
