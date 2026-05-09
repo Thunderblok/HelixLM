@@ -643,7 +643,7 @@ def _smoke_test_model(model: HelixForCausalLM, device: torch.device, seq_len: in
 # Optuna objective
 # ---------------------------------------------------------------------------
 def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str, Any]) -> float:
-    mlflow.set_experiment(f"helixlm_nas_{args.round}")
+    mlflow.set_experiment(f"helixlm_nas_{args.round}-0002")
 
     if args.search_seq_len:
         seq_len = trial.suggest_categorical("seq_len", [128, 256, 512])
