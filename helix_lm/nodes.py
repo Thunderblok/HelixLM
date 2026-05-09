@@ -2,16 +2,15 @@
 Heterogeneous neural nodes for HelixLM.
 
 REFACTOR NOTES (v2-optimized):
-  - SSMNode: chunked sequential scan (16x fewer Python-loop iterations)
-  - TitansMemoryNode: pre-computed projections, chunked loop body
-  - All other nodes unchanged (attention variants, SwiGLU, Dense, Gate)
+ - SSMNode: chunked sequential scan (16x fewer Python-loop iterations)
+ - TitansMemoryNode: pre-computed projections, chunked loop body
+ - All other nodes unchanged (attention variants, SwiGLU, Dense, Gate)
 """
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Any
-
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -23,7 +22,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
-
 class HeteroNode(nn.Module):
     """Base class for all heterogeneous nodes."""
     def __init__(self, d_model: int):
@@ -33,7 +31,6 @@ class HeteroNode(nn.Module):
 
     def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
         raise NotImplementedError
-
 
 class LinearAttnNode(HeteroNode):
     """
@@ -86,7 +83,6 @@ class LinearAttnNode(HeteroNode):
         out = self.dropout(self.out_proj(out))
         return out, None
 
-
 class FullAttnNode(HeteroNode):
     """Standard causal softmax attention with multi-head support and optional RoPE."""
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True):
@@ -128,7 +124,6 @@ class FullAttnNode(HeteroNode):
         out = self.resid_dropout(self.out_proj(out))
         return out, None
 
-
 class DenseNode(HeteroNode):
     """Dense processing node with GELU activation."""
     def __init__(self, d_model: int, expansion: float = 2.0, dropout: float = 0.0):
@@ -145,7 +140,6 @@ class DenseNode(HeteroNode):
         h = F.gelu(self.w1(x))
         out = self.w2(h)
         return self.dropout(out), None
-
 
 class SwiGLUNode(HeteroNode):
     """SwiGLU activation node."""
@@ -166,11 +160,11 @@ class SwiGLUNode(HeteroNode):
         out = self.down(h)
         return self.dropout(out), None
 
-
 # ============================================================================
 # SSMNode -- chunked sequential scan (16x fewer iterations)
 # ============================================================================
 
+@torch.compiler.disable
 def _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
     """Chunked sequential scan: 16x fewer Python-loop iterations.
 
@@ -194,13 +188,23 @@ def _ssm_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
         B_c = B_bar[:, s:s + chunk_size]
         x_c = x_conv[:, s:s + chunk_size]
         C_c = C[:, s:s + chunk_size]
-        for t in range(chunk_size):
-            h = A_c[:, t] * h + B_c[:, t] * x_c[:, t].unsqueeze(-1)
-            y_t = (h * C_c[:, t].unsqueeze(1)).sum(dim=-1)
-            y_t = y_t + D * x_c[:, t]
-            ys.append(y_t)
-    return torch.stack(ys[:T], dim=1)
 
+        def _chunk_scan(h_in, A_c_in, B_c_in, x_c_in, C_c_in):
+            ys_c = []
+            h = h_in
+            for t in range(chunk_size):
+                h = A_c_in[:, t] * h + B_c_in[:, t] * x_c_in[:, t].unsqueeze(-1)
+                y_t = (h * C_c_in[:, t].unsqueeze(1)).sum(dim=-1)
+                y_t = y_t + D * x_c_in[:, t]
+                ys_c.append(y_t)
+            return h, torch.stack(ys_c, dim=1)
+
+        h, ys_chunk = torch.utils.checkpoint.checkpoint(
+            _chunk_scan, h, A_c, B_c, x_c, C_c,
+            use_reentrant=False,
+        )
+        ys.extend(torch.unbind(ys_chunk, dim=1))
+    return torch.stack(ys[:T], dim=1)
 
 class SSMNode(HeteroNode):
     """
@@ -256,7 +260,6 @@ class SSMNode(HeteroNode):
         out = self.dropout(self.out_proj(out.to(x.dtype)))
         return out, None
 
-
 class Mamba2Node(HeteroNode):
     """Mamba-2 SSD node wrapper (delegates to the optimized Mamba2SSD)."""
     def __init__(self, d_model: int, d_state: int = 64, d_conv: int = 4, expand: int = 2,
@@ -273,7 +276,6 @@ class Mamba2Node(HeteroNode):
         x = self.norm(x)
         out, new_state = self.mamba(x, state=state)
         return self.dropout(out), new_state
-
 
 class GateNode(HeteroNode):
     """Aggregation node with learned softmax weighted sum."""
@@ -296,7 +298,6 @@ class GateNode(HeteroNode):
         out = self.out_proj(out)
         return self.dropout(out), None
 
-
 # ============================================================================
 # TitansMemoryNode -- pre-computed projections, chunked loop
 # ============================================================================
@@ -306,15 +307,15 @@ class TitansMemoryNode(HeteroNode):
     Titans-style neural long-term memory node for HelixLM.
 
     Optimizations:
-      1. All key/value/query projections computed ONCE outside the loop
-      2. Chunked memory update loop (fewer Python iterations)
-      3. In-place add_ where possible
+    1. All key/value/query projections computed ONCE outside the loop
+    2. Chunked memory update loop (fewer Python iterations)
+    3. In-place add_ where possible
 
     Architecture (Behrouz et al. 2025 "Titans" MAC variant):
-        - Keys and values projected from input hidden states.
-        - Persistent memory tensor M stores long-term key->value mapping.
-        - Surprise metric = ||v_pred - v_true|| drives update magnitude.
-        - Retrieval uses query projection + ELU feature map.
+    - Keys and values projected from input hidden states.
+    - Persistent memory tensor M stores long-term key->value mapping.
+    - Surprise metric = ||v_pred - v_true|| drives update magnitude.
+    - Retrieval uses query projection + ELU feature map.
     """
     def __init__(
         self,
@@ -347,6 +348,7 @@ class TitansMemoryNode(HeteroNode):
     def _init_memory(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return torch.zeros(batch_size, self.feature_dim, self.d_model, device=device, dtype=dtype)
 
+    @torch.compiler.disable
     def forward(
         self,
         x: torch.Tensor,
@@ -360,9 +362,9 @@ class TitansMemoryNode(HeteroNode):
 
         # Pre-norm and project ALL at once (outside loop)
         x_norm = self.norm(x)
-        k = self.phi(self.k_proj(x_norm))   # (B, T, F)
+        k = self.phi(self.k_proj(x_norm))  # (B, T, F)
         v = self.v_proj(x_norm)              # (B, T, D)
-        q = self.phi(self.q_proj(x_norm))   # (B, T, F)
+        q = self.phi(self.q_proj(x_norm))    # (B, T, F)
 
         eta = self.eta.abs().clamp(min=1e-6)
         eta_view = eta.view(1, -1, 1)
