@@ -2,15 +2,15 @@
 HelixLM Trainer with gradient accumulation, configurable AMP, and progress bars.
 
 Key features:
-  - Gradient accumulation for effective larger batch sizes
-  - Configurable AMP (default: off for stability on small models)
-  - NaN/Inf detection and batch skipping
-  - Scheduler steps count optimizer steps, not raw batches
-  - Uses DocumentAwareDataset (no cross-document boundary crossings)
-  - Modern torch.amp API (not deprecated torch.cuda.amp)
-  - Live tqdm progress bars with loss, PPL, LR, and throughput metrics
-  - Optional train/val DataLoader injection for custom dataset pipelines
-  - generate_sample() uses standard model.generate() with tokenizer passthrough
+ - Gradient accumulation for effective larger batch sizes
+ - Configurable AMP (default: off for stability on small models)
+ - NaN/Inf detection and batch skipping
+ - Scheduler steps count optimizer steps, not raw batches
+ - Uses DocumentAwareDataset (no cross-document boundary crossings)
+ - Modern torch.amp API (not deprecated torch.cuda.amp)
+ - Live tqdm progress bars with loss, PPL, LR, and throughput metrics
+ - Optional train/val DataLoader injection for custom dataset pipelines
+ - generate_sample() uses standard model.generate() with tokenizer passthrough
 """
 import os
 import math
@@ -29,7 +29,6 @@ from tqdm import tqdm
 from .config import HelixConfig
 from .hf_model import HelixForCausalLM
 from .dataset import create_document_loader
-
 
 def get_cosine_schedule_with_warmup(
     optimizer,
@@ -52,11 +51,9 @@ def get_cosine_schedule_with_warmup(
 
     return LambdaLR(optimizer, lr_lambda)
 
-
 def compute_perplexity(loss: float) -> float:
     """Compute perplexity from loss, capping at exp(20) to avoid overflow."""
     return math.exp(min(loss, 20))
-
 
 def format_time(seconds: float) -> str:
     """Format seconds into human-readable string."""
@@ -65,7 +62,6 @@ def format_time(seconds: float) -> str:
     elif seconds < 3600:
         return f"{seconds/60:.1f}m"
     return f"{seconds/3600:.1f}h"
-
 
 class Trainer:
     """Trainer for HelixLM with gradient accumulation, AMP, and progress bars."""
@@ -182,14 +178,23 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.history = {"train_loss": [], "val_loss": [], "perplexity": []}
 
-        # GradScaler for AMP (only if use_amp=True and CUDA available)
+        # GradScaler for AMP (only if use_amp=True, CUDA available, AND fp16).
+        # bf16 has the same exponent range as fp32 — no loss scaling needed.
         self.scaler = None
         if self.use_amp:
-            try:
-                from torch.amp import GradScaler
-                self.scaler = GradScaler("cuda")
-            except Exception:
-                self.use_amp = False
+            amp_dtype = getattr(cfg, "dtype", torch.float32)
+            if isinstance(amp_dtype, str):
+                amp_dtype = getattr(torch, amp_dtype.replace("torch.", ""), torch.float32)
+            is_fp16 = amp_dtype == torch.float16
+            if is_fp16:
+                try:
+                    from torch.amp import GradScaler
+                    self.scaler = GradScaler("cuda")
+                except Exception:
+                    self.use_amp = False
+            else:
+                # bf16 path: autocast without scaler
+                self.scaler = None
 
     def _get_device(self) -> torch.device:
         """Get device from config."""
@@ -258,9 +263,11 @@ class Trainer:
             tokens_seen += input_ids.numel()
 
             # Forward pass
-            if self.use_amp and self.scaler is not None:
+            if self.use_amp:
+                # Resolve the actual AMP dtype from config (bfloat16 on GPU, fp32 fallback)
+                amp_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16
+                    device_type="cuda", dtype=amp_dtype
                 ):
                     outputs = self.model(input_ids, labels=labels)
                     loss = outputs["loss"]
@@ -358,9 +365,10 @@ class Trainer:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
 
-            if self.use_amp and self.scaler is not None:
+            if self.use_amp:
+                amp_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16
+                    device_type="cuda", dtype=amp_dtype
                 ):
                     outputs = self.model(input_ids, labels=labels)
             else:
@@ -370,11 +378,11 @@ class Trainer:
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item()
                 num_batches += 1
-                avg = total_loss / max(num_batches, 1)
-                pbar.set_postfix({
-                    "loss": f"{avg:.4f}",
-                    "ppl": f"{compute_perplexity(avg):.2f}",
-                })
+            avg = total_loss / max(num_batches, 1)
+            pbar.set_postfix({
+                "loss": f"{avg:.4f}",
+                "ppl": f"{compute_perplexity(avg):.2f}",
+            })
 
         avg_loss = total_loss / max(num_batches, 1)
         return {"loss": avg_loss, "perplexity": compute_perplexity(avg_loss)}
