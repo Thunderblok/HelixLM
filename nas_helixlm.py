@@ -26,6 +26,7 @@ import math
 import os
 import sys
 import time
+import traceback
 import warnings
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -126,7 +127,6 @@ class _StreamingTextDataset(IterableDataset):
                 if self.max_samples is not None and count >= self.max_samples:
                     return
 
-        # Emit any final partial chunk padded to seq_len (optional)
         if 0 < len(buffer) < self.seq_len:
             pad_len = self.seq_len - len(buffer)
             chunk = buffer + [pad_id] * pad_len
@@ -200,6 +200,41 @@ def get_device() -> torch.device:
 
 
 # ---------------------------------------------------------------------------
+# MLflow safety wrappers (never let a NaN or long string kill the run)
+# ---------------------------------------------------------------------------
+def safe_log_metrics(metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+    """Log metrics to MLflow, silently dropping NaN/Inf/non-finite values."""
+    clean: Dict[str, float] = {}
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            clean[k] = float(v)
+    if clean:
+        try:
+            mlflow.log_metrics(clean, step=step)
+        except Exception as e:
+            print(f"  [MLflow] metrics log failed: {repr(e)}")
+
+
+def safe_log_param(key: str, value: Any) -> None:
+    """Log param to MLflow, truncating to avoid length limits."""
+    try:
+        s = str(value)
+        if len(s) > 500:
+            s = s[:497] + "..."
+        mlflow.log_param(key, s)
+    except Exception as e:
+        print(f"  [MLflow] param log failed for {key}: {repr(e)}")
+
+
+def safe_log_tag(key: str, value: Any) -> None:
+    """Log tag to MLflow (tags have higher length limits than params)."""
+    try:
+        mlflow.set_tag(key, str(value)[:4000])
+    except Exception as e:
+        print(f"  [MLflow] tag log failed for {key}: {repr(e)}")
+
+
+# ---------------------------------------------------------------------------
 # Search Space
 # ---------------------------------------------------------------------------
 def get_search_space_bounds() -> Dict[str, List[Any]]:
@@ -247,7 +282,7 @@ def sample_params(trial: optuna.Trial, seq_len: Optional[int] = None) -> Dict[st
     else:
         params["hybrid_full_attention_interval"] = None
 
-    # 3. Optional Modules
+    # 3. Optional Modules — STATIC categorical spaces (never dynamic lists)
     params["use_ssm"] = trial.suggest_categorical("use_ssm", [False, True])
     if params["use_ssm"]:
         params["ssm_d_state"] = trial.suggest_categorical("ssm_d_state", [64, 128])
@@ -262,13 +297,14 @@ def sample_params(trial: optuna.Trial, seq_len: Optional[int] = None) -> Dict[st
 
     params["use_titans"] = trial.suggest_categorical("use_titans", [False, True])
     if params["use_titans"]:
-        params["titans_memory_dim"] = trial.suggest_categorical(
-            "titans_memory_dim", [params["d_model"], params["d_model"] // 2]
+        # FIXED ratio choices — actual dim computed later from d_model * ratio
+        params["titans_memory_dim_ratio"] = trial.suggest_categorical(
+            "titans_memory_dim_ratio", [0.5, 1.0]
         )
         params["titans_num_memories"] = trial.suggest_categorical("titans_num_memories", [4, 8, 16])
         params["titans_memory_lr"] = trial.suggest_categorical("titans_memory_lr", [1e-4, 3e-4, 1e-3])
     else:
-        params["titans_memory_dim"] = None
+        params["titans_memory_dim_ratio"] = None
         params["titans_num_memories"] = None
         params["titans_memory_lr"] = None
 
@@ -287,16 +323,9 @@ def sample_params(trial: optuna.Trial, seq_len: Optional[int] = None) -> Dict[st
     else:
         params["seq_len"] = trial.suggest_categorical("seq_len", [128, 256, 512])
 
-    # 6. Batch / Grad Accum
+    # 6. Batch / Grad Accum — STATIC categorical (was dynamic based on VRAM)
     params["grad_accum"] = trial.suggest_categorical("grad_accum", [1, 2])
-
-    vram_mb = estimate_vram(params)
-    if vram_mb > 22000:
-        params["batch_size"] = trial.suggest_categorical("batch_size", [16, 24, 32])
-    elif vram_mb > 14000:
-        params["batch_size"] = trial.suggest_categorical("batch_size", [8, 16, 24])
-    else:
-        params["batch_size"] = trial.suggest_categorical("batch_size", [4, 8, 16])
+    params["batch_size"] = trial.suggest_categorical("batch_size", [4, 8, 16, 24, 32])
 
     # 7. Derived flags
     params["force_fp32"] = params["seq_len"] <= 128
@@ -328,7 +357,7 @@ def estimate_vram(params: Dict[str, Any]) -> float:
         activations_mb += batch * seq * ssm_state * ssm_expand * 4 / (1024 ** 2)
 
     if params["use_titans"]:
-        mem_dim = params.get("titans_memory_dim", d)
+        mem_dim = int(params.get("titans_memory_dim_ratio", 1.0) * d)
         n_mem = params.get("titans_num_memories", 8)
         graph_params_mb *= 1.1
         activations_mb += n_mem * mem_dim * seq * 4 / (1024 ** 2)
@@ -495,6 +524,12 @@ def build_helix_config(
 ) -> Any:
     from helix_lm import HelixConfig
 
+    # Compute derived Titans dims BEFORE building node configs
+    if params.get("use_titans") and params.get("titans_memory_dim_ratio") is not None:
+        params["titans_memory_dim"] = int(params["d_model"] * params["titans_memory_dim_ratio"])
+    else:
+        params["titans_memory_dim"] = None
+
     nodes_per_column: Tuple[int, ...] = eval(params["nodes_per_column"])
 
     column_specs: List[List[Dict[str, Any]]] = []
@@ -526,11 +561,12 @@ def build_helix_config(
     steps_per_epoch = max(1, 20000 // effective_batch)
     warmup_steps = max(1, int(steps_per_epoch * params["warmup_ratio"]))
 
+    # Pass nodes_per_column as tuple (HelixConfig validation does tuple arithmetic)
     cfg = HelixConfig.tiny(
         vocab_size=vocab_size,
         d_model=params["d_model"],
         n_columns=params["n_columns"],
-        nodes_per_column=list(nodes_per_column),
+        nodes_per_column=nodes_per_column,
         n_loops=params["n_loops"],
         seq_len=params["seq_len"],
         tokenizer_name=tokenizer_name,
@@ -579,6 +615,31 @@ def params_to_flat_dict(params: Dict[str, Any]) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Fail-fast model validation (never load data for a broken model)
+# ---------------------------------------------------------------------------
+def _smoke_test_model(model: HelixForCausalLM, device: torch.device, seq_len: int) -> None:
+    """
+    Run one forward+backward pass on dummy data.
+    Raises on failure so caller can bail before wasting IO/time on data loading.
+    """
+    model.train()
+    dummy_len = min(seq_len, 64)
+    dummy_ids = torch.zeros((2, dummy_len), dtype=torch.long, device=device)
+    dummy_labels = dummy_ids.clone()
+
+    outputs = model(dummy_ids, labels=dummy_labels)
+    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+    if loss is None:
+        raise RuntimeError("Model returned None loss on smoke test")
+
+    if torch.isnan(loss) or torch.isinf(loss):
+        raise RuntimeError(f"Smoke test produced non-finite loss: {loss.item()}")
+
+    loss.backward()
+    model.zero_grad(set_to_none=True)
+
+
+# ---------------------------------------------------------------------------
 # Optuna objective
 # ---------------------------------------------------------------------------
 def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str, Any]) -> float:
@@ -598,33 +659,53 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
     try:
         cfg = build_helix_config(params, vocab_size, str(device))
     except Exception as e:
-        warnings.warn(f"Config build failed for trial {trial.number}: {e}")
+        warnings.warn(f"Config build failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
         return float("inf")
 
     try:
         model = HelixForCausalLM(cfg).to(device)
         param_count = model.count_parameters()["total"]
     except Exception as e:
-        warnings.warn(f"Model instantiation failed for trial {trial.number}: {e}")
+        warnings.warn(f"Model instantiation failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
         return float("inf")
 
     # -----------------------------------------------------------------------
-    # Apply torch.compile as requested
+    # torch.compile as requested, with full forward+backward smoke test.
+    # If compiled model fails, fallback to uncompiled. If that fails, bail.
     # -----------------------------------------------------------------------
+    compile_applied = False
     try:
         model = torch.compile(model, mode="reduce-overhead")
-        print(f"  [COMPILE] torch.compile(mode='reduce-overhead') applied")
+        _smoke_test_model(model, device, cfg.seq_len)
+        compile_applied = True
+        print(f"  [COMPILE] torch.compile(mode='reduce-overhead') applied and verified")
     except Exception as e:
-        print(f"  [COMPILE] torch.compile failed: {e}")
+        print(f"  [COMPILE] Compiled model failed smoke test: {repr(e)}")
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            model = HelixForCausalLM(cfg).to(device)
+            param_count = model.count_parameters()["total"]
+            _smoke_test_model(model, device, cfg.seq_len)
+            print(f"  [COMPILE] Fallback to uncompiled model verified")
+        except Exception as e2:
+            print(f"  [FAIL FAST] Uncompiled model also failed smoke test: {repr(e2)}")
+            safe_log_param("model_smoke_test_failed", repr(e2))
+            safe_log_tag("traceback", traceback.format_exc())
+            return float("inf")
 
     run_name = f"trial_{trial.number:03d}_seq{params['seq_len']}_d{params['d_model']}"
-    with mlflow.start_run(run_name=run_name):
-        mlflow.log_params(params_to_flat_dict(params))
-        mlflow.log_param("round", args.round)
-        mlflow.log_param("trial_number", trial.number)
-        mlflow.log_param("param_count", param_count)
-        mlflow.log_param("estimated_vram_mb", round(estimate_vram(params), 1))
-        mlflow.log_param("torch_compile", True)
+    with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
+        # Log all params up front so the run is never empty
+        for k, v in params_to_flat_dict(params).items():
+            safe_log_param(k, v)
+        safe_log_param("round", args.round)
+        safe_log_param("trial_number", trial.number)
+        safe_log_param("param_count", param_count)
+        safe_log_param("estimated_vram_mb", round(estimate_vram(params), 1))
+        safe_log_param("torch_compile", compile_applied)
 
         cost_pred = estimate_training_cost(
             params,
@@ -632,7 +713,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
             epochs=round_cfg["epochs"],
             instance_cost_per_hour=round_cfg["instance_cost_hr"],
         )
-        mlflow.log_params({f"cost_pred_{k}": str(v) for k, v in cost_pred.items()})
+        for k, v in cost_pred.items():
+            safe_log_param(f"cost_pred_{k}", v)
 
         print(f"\n{'='*60}")
         print(f"  TRIAL {trial.number} | {args.round.upper()}")
@@ -705,8 +787,9 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
                     min_tail_len=1,
                 )
         except Exception as e:
-            warnings.warn(f"Data loading failed: {e}")
-            mlflow.log_param("failed", "data_loading")
+            safe_log_param("failed", "data_loading")
+            safe_log_tag("data_loading_error", traceback.format_exc())
+            warnings.warn(f"Data loading failed: {repr(e)}\n{traceback.format_exc()}")
             return float("inf")
 
         best_val_ppl = float("inf")
@@ -719,12 +802,17 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
             try:
                 train_m = trainer.train_epoch(epoch)
             except Exception as e:
-                warnings.warn(f"Train epoch failed: {e}")
-                mlflow.log_param("failed", f"train_epoch_{epoch}")
+                safe_log_param(f"train_epoch_{epoch}_failed", repr(e))
+                safe_log_tag(f"epoch_{epoch}_traceback", traceback.format_exc())
+                warnings.warn(f"Train epoch failed: {repr(e)}\n{traceback.format_exc()}")
                 return float("inf")
 
             epoch_time = time.time() - epoch_start
-            tok_per_sec = train_m.get("tok_per_sec", 0.0) or train_m.get("tok/s", 0.0)
+            # Trainer doesn't return tok_per_sec; estimate from tokens / time
+            # We know batch_size, seq_len, and number of batches (approx)
+            n_batches = max(1, len(trainer.train_loader))
+            tokens_per_epoch = n_batches * cfg.batch_size * cfg.seq_len
+            tok_per_sec = tokens_per_epoch / max(epoch_time, 1e-6)
             tok_per_sec_list.append(tok_per_sec)
 
             train_loss = train_m.get("loss", float("inf"))
@@ -732,10 +820,20 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
             if not math.isfinite(train_loss) or train_loss > 50000 or train_ppl > 50000:
                 print(f"  [FAIL] Trial {trial.number} exploded at epoch {epoch} "
                       f"(loss={train_loss:.2f}, ppl={train_ppl:.2f})")
-                mlflow.log_param("failed", f"exploded_epoch_{epoch}")
-                mlflow.log_param("exploded_loss", train_loss)
+                safe_log_param("failed", f"exploded_epoch_{epoch}")
+                safe_log_param("exploded_loss", train_loss)
                 return float("inf")
 
+            # Log epoch metrics immediately
+            safe_log_metrics({
+                "train_loss": train_loss,
+                "train_ppl": train_ppl,
+                "tok_per_sec": tok_per_sec,
+                "epoch_time_sec": epoch_time,
+                "skipped_batches": train_m.get("skipped_batches", 0),
+            }, step=epoch)
+
+            # Validation
             val_ppl = float("inf")
             if trainer.val_loader and epoch % max(1, round_cfg["epochs"] // 2) == 0:
                 try:
@@ -744,31 +842,25 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
                     val_ppl = val_m.get("perplexity", float("inf"))
                     best_val_ppl = min(best_val_ppl, val_ppl)
 
-                    mlflow.log_metrics({
+                    safe_log_metrics({
                         "val_loss": val_loss,
                         "val_ppl": val_ppl,
                     }, step=epoch)
                 except Exception as e:
-                    warnings.warn(f"Validation failed: {e}")
-
-            mlflow.log_metrics({
-                "train_loss": train_loss,
-                "train_ppl": train_ppl,
-                "tok_per_sec": tok_per_sec,
-                "epoch_time_sec": epoch_time,
-            }, step=epoch)
+                    safe_log_tag("validation_error", traceback.format_exc())
+                    warnings.warn(f"Validation failed: {repr(e)}\n{traceback.format_exc()}")
 
             report_value = best_val_ppl if math.isfinite(best_val_ppl) else train_ppl
             trial.report(report_value, epoch)
             if trial.should_prune():
                 print(f"  [PRUNE] Trial {trial.number} pruned at epoch {epoch}")
-                mlflow.log_param("pruned_at_epoch", epoch)
+                safe_log_param("pruned_at_epoch", epoch)
                 raise optuna.TrialPruned()
 
         wall_time = time.time() - start_time
         avg_tok_per_sec = float(np.mean(tok_per_sec_list)) if tok_per_sec_list else 0.0
 
-        mlflow.log_metrics({
+        safe_log_metrics({
             "best_val_ppl": best_val_ppl if math.isfinite(best_val_ppl) else 99999.0,
             "avg_tok_per_sec": avg_tok_per_sec,
             "wall_time_sec": wall_time,
@@ -781,7 +873,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
             instance_cost_per_hour=round_cfg["instance_cost_hr"],
             tok_per_sec_assumed=avg_tok_per_sec,
         )
-        mlflow.log_params({f"actual_cost_{k}": str(v) for k, v in actual_cost.items()})
+        for k, v in actual_cost.items():
+            safe_log_param(f"actual_cost_{k}", v)
 
         print(f"  [DONE] Trial {trial.number} | best_val_ppl={best_val_ppl:.2f} | "
               f"avg_tok/s={avg_tok_per_sec:.0f} | wall={wall_time/60:.1f}min")
@@ -868,7 +961,7 @@ def main() -> None:
     print(f" HELIXLM NAS — {args.round.upper()} ROUND")
     print(f" Trials: {n_trials}  |  Parallel: {n_jobs}  |  SeqLen: {'searched' if args.search_seq_len else args.seq_len}")
     print(f" Dataset: {args.dataset_repo}")
-    print(f" torch.compile: reduce-overhead (applied to all trials)")
+    print(f" torch.compile: reduce-overhead (with full smoke-test fallback)")
     print(f" Storage: {storage_path}")
     print(f"{'='*70}\n")
 
