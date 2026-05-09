@@ -19,12 +19,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+@torch.compiler.disable
 def _ssd_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
     """
     Chunked sequential scan — 16x fewer Python-loop iterations.
 
     For seq_len=256, chunk_size=16 -> 16 iterations (was 256).
     Mathematically identical to the original sequential scan.
+
+    Memory optimization: each chunk's inner loop is checkpointed so only
+    the chunk boundary h states are materialised for backward.
 
     IMPORTANT: This function computes the FULL SSM output including the
     skip-connection term D * x_t at each timestep. The caller must NOT
@@ -47,11 +51,22 @@ def _ssd_chunked_scan(A_bar, B_bar, x_conv, C, D, chunk_size: int = 16):
         B_c = B_bar[:, s:s + chunk_size]
         x_c = x_conv[:, s:s + chunk_size]
         C_c = C[:, s:s + chunk_size]
-        for t in range(chunk_size):
-            h = A_c[:, t] * h + B_c[:, t] * x_c[:, t].unsqueeze(-1)
-            y_t = (h * C_c[:, t].unsqueeze(1)).sum(dim=-1)
-            y_t = y_t + D * x_c[:, t]
-            ys.append(y_t)
+
+        def _chunk_scan(h_in, A_c_in, B_c_in, x_c_in, C_c_in):
+            ys_c = []
+            h = h_in
+            for t in range(chunk_size):
+                h = A_c_in[:, t] * h + B_c_in[:, t] * x_c_in[:, t].unsqueeze(-1)
+                y_t = (h * C_c_in[:, t].unsqueeze(1)).sum(dim=-1)
+                y_t = y_t + D * x_c_in[:, t]
+                ys_c.append(y_t)
+            return h, torch.stack(ys_c, dim=1)
+
+        h, ys_chunk = torch.utils.checkpoint.checkpoint(
+            _chunk_scan, h, A_c, B_c, x_c, C_c,
+            use_reentrant=False,
+        )
+        ys.extend(torch.unbind(ys_chunk, dim=1))
     return torch.stack(ys[:T], dim=1)
 
 
