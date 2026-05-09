@@ -133,7 +133,7 @@ class HelixConfig(PretrainedConfig):
         memory_efficient_forward: bool = False,
         
         # --- Misc ---
-        tie_word_embeddings: bool = True,
+        tie_word_embeddings: bool = False,
         **kwargs,
     ):
         # --- HF PretrainedConfig expects these ---
