@@ -62,7 +62,7 @@ class HelixLMCore(nn.Module):
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         e = self.embed(token_ids)
-        h = self.recurrent(e, e.detach())
+        h = self.recurrent(e, e)   # not e.detach() causes regression in Perplexity.
         if self.head is not None:
             logits = self.head(self.out_norm(h))
         else:
