@@ -201,6 +201,8 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
 
         # Output
         h = self.model.out_norm(h)
+        if h.is_cuda:
+            h = h.clone()
         logits = self.lm_head(h)
 
         loss = None
