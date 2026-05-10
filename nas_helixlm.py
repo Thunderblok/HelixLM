@@ -520,9 +520,11 @@ def try_compile_model(
     mode, everything else is compiled.
     """
     try:
-        compiled = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+        import torch._inductor.config as inductor_cfg
+        inductor_cfg.triton.cudagraphs = False
+        compiled = torch.compile(model, mode="default", fullgraph=False)
         _smoke_test_model(compiled, device, seq_len)
-        print("  [COMPILE] torch.compile(mode='reduce-overhead') applied and verified")
+        print("  [COMPILE] torch.compile(mode='default', cudagraphs=False) applied and verified")
         return compiled, True, None
     except Exception as e:
         err_msg = repr(e)
@@ -855,6 +857,23 @@ def main() -> None:
     n_jobs = args.n_jobs or round_cfg["n_parallel"]
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Start MLflow with a file-based backend store if the URI is the default
+    # and no server is running (common in CI / sandbox environments).
+    if args.mlflow_uri == "http://localhost:5000":
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(("localhost", 5000))
+            sock.close()
+            if result != 0:
+                file_store = os.path.join(os.path.abspath(args.output_dir), "mlflow")
+                os.makedirs(file_store, exist_ok=True)
+                args.mlflow_uri = f"file://{file_store}"
+                print(f"  [MLflow] No server on :5000; switching to file store: {args.mlflow_uri}")
+        except Exception:
+            pass
 
     mlflow.set_tracking_uri(args.mlflow_uri)
     experiment_name = f"helixlm_nas_{args.round}_{TIMESTAMP}"
