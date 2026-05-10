@@ -313,7 +313,7 @@ def main():
         if args.hf_token:
             repo_name = args.hf_repo_id or build_model_name(args, param_count)
             print(f"Pushing to HF hub: {repo_name}")
-            model.push_to_hub(repo_name, token=args.hf_token, safe_serialization=True)
+            model.push_to_hub(repo_name, token=args.hf_token)
             tokenizer.push_to_hub(repo_name, token=args.hf_token)
             print(f"Done: https://huggingface.co/{repo_name}")
 
