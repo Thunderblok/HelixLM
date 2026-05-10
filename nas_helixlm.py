@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nas_helixlm.py  v2.3  —  Neural Architecture Search for HelixLM
+nas_helixlm.py  v2.4  —  Neural Architecture Search for HelixLM
 
 DATA PATH (native):
   load_dataset(streaming) -> Python list of strings -> Trainer(train_texts=...)
@@ -21,12 +21,11 @@ FAILURE MODES CAUGHT:
   4. NaN / all-batches-skipped     — loss=0 & PPL=1 is caught as dead trial
   5. Timestamped MLflow experiment — prevents history clutter & leakage
 """
-SCRIPT_VERSION = "2.3.0-20260510"
+SCRIPT_VERSION = "2.4.0-20260510"
 SCRIPT_REVISION_NOTE = (
-    "v2.3: bf16 on GPU / fp32 on CPU, proper TrialPruned propagation, "
-    "native DocumentAwareDataset via Trainer(train_texts), "
-    "SSM+Titans combo config, removed fake search params, "
-    "torch.compile enabled for all configs via @torch.compiler.disable"
+    "v2.4: scheduler horizon fix (epochs passed to config), tokenizer ID sync, "
+    "explicit min_tail_len, nodes_per_column in viable configs, "
+    "unconditional GPU cleanup per trial via try/finally"
 )
 
 import argparse
@@ -94,6 +93,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "xs_linear_128",
         "d_model": 128, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -104,6 +104,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "xs_hybrid_128",
         "d_model": 128, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -114,6 +115,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "xs_linear_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -124,6 +126,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "xs_hybrid_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -135,6 +138,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_linear_256",
         "d_model": 256, "n_columns": 3, "n_loops": 2,
+        "nodes_per_column": (2, 3, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.5, "dropout": 0.05,
@@ -145,6 +149,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_hybrid_256",
         "d_model": 256, "n_columns": 3, "n_loops": 2,
+        "nodes_per_column": (2, 3, 2),
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.5, "dropout": 0.05,
@@ -155,6 +160,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_full_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "full", "hybrid_full_attention_interval": None,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.5, "dropout": 0.05,
@@ -165,6 +171,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_ssm_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": True, "use_titans_memory": False,
         "ssm_d_state": 64, "ssm_dt_rank": 16, "ssm_d_conv": 3, "ssm_expand": 2,
@@ -176,6 +183,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_titans_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": False, "use_titans_memory": True,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -186,6 +194,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_ssm_titans_256",
         "d_model": 256, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": True, "use_titans_memory": True,
         "ssm_d_state": 64, "ssm_dt_rank": 16, "ssm_d_conv": 3, "ssm_expand": 2,
@@ -197,6 +206,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_linear_384",
         "d_model": 384, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "linear", "hybrid_full_attention_interval": None,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -207,6 +217,7 @@ VIABLE_CONFIGS: List[Dict[str, Any]] = [
     {
         "name": "sm_hybrid_384",
         "d_model": 384, "n_columns": 2, "n_loops": 1,
+        "nodes_per_column": (2, 2),
         "attention_mode": "hybrid", "hybrid_full_attention_interval": 2,
         "use_ssm": False, "use_titans_memory": False,
         "ffn_expansion": 2.0, "dropout": 0.05,
@@ -393,6 +404,8 @@ def build_helix_config(
     params: Dict[str, Any],
     vocab_size: int,
     device: str,
+    epochs: int,
+    tokenizer,
 ) -> Tuple[Any, bool]:
     # bfloat16 on GPU gives 16-bit speed without fp16 dynamic-range problems.
     # fp32 on CPU is the safe fallback (bfloat16 has limited CPU support).
@@ -424,6 +437,7 @@ def build_helix_config(
         weight_decay=params["weight_decay"],
         grad_clip=params["grad_clip"],
         warmup_steps=warmup_steps,
+        epochs=epochs,
         batch_size=params["batch_size"],
         dtype=dtype_str,
         device=device,
@@ -440,7 +454,14 @@ def build_helix_config(
             ssm_expand=params.get("ssm_expand", 2),
         )
 
+    if "nodes_per_column" in params:
+        cfg_kwargs["nodes_per_column"] = params["nodes_per_column"]
+
     cfg = HelixConfig.tiny(**cfg_kwargs)
+    cfg.pad_token_id = tokenizer.pad_token_id
+    cfg.eos_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None:
+        cfg.bos_token_id = tokenizer.bos_token_id
     return cfg, use_amp
 
 
@@ -567,250 +588,265 @@ def sample_viable_config(trial: optuna.Trial, seq_len: int, gpu_mem_gb: Optional
 # Optuna objective
 # ---------------------------------------------------------------------------
 def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str, Any]) -> float:
-    experiment_name = f"helixlm_nas_{args.round}_{TIMESTAMP}"
-    mlflow.set_experiment(experiment_name)
-
-    params = sample_viable_config(trial, args.seq_len, args.gpu_mem)
-
-    tokenizer = HelixTokenizer("gpt2")
-    vocab_size = len(tokenizer)
-    device = get_device()
-
-    # VRAM pre-check
-    est_vram = estimate_vram(params)
-    if args.gpu_mem and est_vram > args.gpu_mem * 1024:
-        print(f"  [VRAM SKIP] est={est_vram:.0f}MB > {args.gpu_mem*1024:.0f}MB limit")
-        safe_log_param("skipped_vram", f"{est_vram:.0f}MB > {args.gpu_mem*1024:.0f}MB")
-        return float("inf")
-
-    # Build config
+    # -- Unconditional GPU cleanup: handles early returns, exceptions, and prunes
+    model = None
+    trainer = None
     try:
-        cfg, use_amp = build_helix_config(params, vocab_size, str(device))
-    except Exception as e:
-        warnings.warn(f"Config build failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
-        safe_log_tag("config_build_error", traceback.format_exc())
-        return float("inf")
+        experiment_name = f"helixlm_nas_{args.round}_{TIMESTAMP}"
+        mlflow.set_experiment(experiment_name)
 
-    # Instantiate model
-    try:
-        model = HelixForCausalLM(cfg).to(device)
-        param_count = model.count_parameters()["total"]
-    except Exception as e:
-        warnings.warn(f"Model instantiation failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
-        safe_log_tag("model_instantiation_error", traceback.format_exc())
-        return float("inf")
+        params = sample_viable_config(trial, args.seq_len, args.gpu_mem)
 
-    # torch.compile attempt (now works for ALL configs)
-    compile_applied = False
-    compile_error = None
-    if args.try_compile:
-        model, compile_applied, compile_error = try_compile_model(
-            model, device, cfg.seq_len,
-            params.get("use_ssm", False),
-            params.get("use_titans_memory", False),
-        )
+        tokenizer = HelixTokenizer("gpt2")
+        vocab_size = len(tokenizer)
+        device = get_device()
 
-    run_name = (
-        f"trial_{trial.number:03d}_"
-        f"{params.get('name', 'cfg')}_"
-        f"seq{params['seq_len']}_d{params['d_model']}"
-    )
+        # VRAM pre-check
+        est_vram = estimate_vram(params)
+        if args.gpu_mem and est_vram > args.gpu_mem * 1024:
+            print(f"  [VRAM SKIP] est={est_vram:.0f}MB > {args.gpu_mem*1024:.0f}MB limit")
+            safe_log_param("skipped_vram", f"{est_vram:.0f}MB > {args.gpu_mem*1024:.0f}MB")
+            return float("inf")
 
-    with mlflow.start_run(run_name=run_name, log_system_metrics=True):
-        for k, v in params_to_flat_dict(params).items():
-            safe_log_param(k, v)
-        safe_log_param("round", args.round)
-        safe_log_param("trial_number", trial.number)
-        safe_log_param("param_count", param_count)
-        safe_log_param("estimated_vram_mb", round(est_vram, 1))
-        safe_log_param("torch_compile", compile_applied)
-        if compile_error:
-            safe_log_tag("torch_compile_error", compile_error)
-
-        cost_pred = estimate_training_cost(
-            params,
-            dataset_tokens=5_000_000 if args.round == "screening" else 400_000_000,
-            epochs=round_cfg["epochs"],
-            instance_cost_per_hour=round_cfg["instance_cost_hr"],
-        )
-        for k, v in cost_pred.items():
-            safe_log_param(f"cost_pred_{k}", v)
-
-        print(f"\n{'='*60}")
-        print(f"  TRIAL {trial.number} | {args.round.upper()} | {params.get('name', 'unknown')}")
-        print(f"  d_model={params['d_model']}  loops={params['n_loops']}  "
-              f"seq={params['seq_len']}  lr={params['lr']}")
-        print(f"  attention={params['attention_mode']}  "
-              f"ssm={params.get('use_ssm', False)}  titans={params.get('use_titans_memory', False)}")
-        print(f"  params={param_count:,}  est_vram={est_vram:.0f}MB  "
-              f"batch={params['batch_size']}  accum={params['grad_accum']}")
-        print(f"  est_cost=${cost_pred['estimated_cost_usd']}  "
-              f"est_wall={cost_pred['wall_days']} days")
-        print(f"  torch_compile={compile_applied}")
-        print(f"{'='*60}")
-
-        train_max = round_cfg["max_samples"]
-        val_max = max(500, train_max // 10) if train_max else 5000
-
-        # Watchdog timeout: per-epoch, min 5 minutes
-        expected_epoch_sec = max(60.0, cost_pred["wall_seconds"] / round_cfg["epochs"])
-        watchdog_timeout = max(300.0, expected_epoch_sec * FROZEN_TRIAL_MULTIPLIER)
-
+        # Build config
         try:
-            train_texts = load_texts(args.dataset_repo, "pretrain_train", train_max)
-            val_texts = load_texts(args.dataset_repo, "pretrain_val", val_max) if val_max else None
-
-            trainer = Trainer(
-                model=model,
-                cfg=cfg,
-                train_texts=train_texts,
-                val_texts=val_texts,
+            cfg, use_amp = build_helix_config(
+                params, vocab_size, str(device),
+                epochs=round_cfg["epochs"],
                 tokenizer=tokenizer,
-                output_dir=os.path.join(args.output_dir, f"trial_{trial.number:03d}"),
-                example_prompts=["The next day", "In 1492,"],
-                generated_example_length=30,
-                grad_accum_steps=params["grad_accum"],
-                use_amp=use_amp,
             )
         except Exception as e:
-            safe_log_param("failed", "data_loading")
-            safe_log_tag("data_loading_error", traceback.format_exc())
-            warnings.warn(f"Data loading failed: {repr(e)}\n{traceback.format_exc()}")
+            warnings.warn(f"Config build failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
+            safe_log_tag("config_build_error", traceback.format_exc())
             return float("inf")
 
-        best_val_ppl = float("inf")
-        tok_per_sec_list: List[float] = []
-        start_time = time.time()
-        any_valid_epoch = False
+        # Instantiate model
+        try:
+            model = HelixForCausalLM(cfg).to(device)
+            param_count = model.count_parameters()["total"]
+        except Exception as e:
+            warnings.warn(f"Model instantiation failed for trial {trial.number}: {repr(e)}\n{traceback.format_exc()}")
+            safe_log_tag("model_instantiation_error", traceback.format_exc())
+            return float("inf")
 
-        for epoch in range(1, round_cfg["epochs"] + 1):
-            epoch_start = time.time()
-            _install_watchdog(watchdog_timeout)
+        # torch.compile attempt (now works for ALL configs)
+        compile_applied = False
+        compile_error = None
+        if args.try_compile:
+            model, compile_applied, compile_error = try_compile_model(
+                model, device, cfg.seq_len,
+                params.get("use_ssm", False),
+                params.get("use_titans_memory", False),
+            )
+
+        run_name = (
+            f"trial_{trial.number:03d}_"
+            f"{params.get('name', 'cfg')}_"
+            f"seq{params['seq_len']}_d{params['d_model']}"
+        )
+
+        with mlflow.start_run(run_name=run_name, log_system_metrics=True):
+            for k, v in params_to_flat_dict(params).items():
+                safe_log_param(k, v)
+            safe_log_param("round", args.round)
+            safe_log_param("trial_number", trial.number)
+            safe_log_param("param_count", param_count)
+            safe_log_param("estimated_vram_mb", round(est_vram, 1))
+            safe_log_param("torch_compile", compile_applied)
+            if compile_error:
+                safe_log_tag("torch_compile_error", compile_error)
+
+            cost_pred = estimate_training_cost(
+                params,
+                dataset_tokens=5_000_000 if args.round == "screening" else 400_000_000,
+                epochs=round_cfg["epochs"],
+                instance_cost_per_hour=round_cfg["instance_cost_hr"],
+            )
+            for k, v in cost_pred.items():
+                safe_log_param(f"cost_pred_{k}", v)
+
+            print(f"\n{'='*60}")
+            print(f"  TRIAL {trial.number} | {args.round.upper()} | {params.get('name', 'unknown')}")
+            print(f"  d_model={params['d_model']}  loops={params['n_loops']}  "
+                  f"seq={params['seq_len']}  lr={params['lr']}")
+            print(f"  attention={params['attention_mode']}  "
+                  f"ssm={params.get('use_ssm', False)}  titans={params.get('use_titans_memory', False)}")
+            print(f"  params={param_count:,}  est_vram={est_vram:.0f}MB  "
+                  f"batch={params['batch_size']}  accum={params['grad_accum']}")
+            print(f"  est_cost=${cost_pred['estimated_cost_usd']}  "
+                  f"est_wall={cost_pred['wall_days']} days")
+            print(f"  torch_compile={compile_applied}")
+            print(f"{'='*60}")
+
+            train_max = round_cfg["max_samples"]
+            val_max = max(500, train_max // 10) if train_max else 5000
+
+            # Watchdog timeout: per-epoch, min 5 minutes
+            expected_epoch_sec = max(60.0, cost_pred["wall_seconds"] / round_cfg["epochs"])
+            watchdog_timeout = max(300.0, expected_epoch_sec * FROZEN_TRIAL_MULTIPLIER)
+
+            min_tail_len = params.get("min_tail_len", args.seq_len // 4)
 
             try:
-                train_m = trainer.train_epoch(epoch)
-            except FrozenTrialError as fte:
-                _disable_watchdog()
-                print(f"  [FROZEN] {fte}")
-                safe_log_param("failed", "frozen_trial")
-                safe_log_tag("frozen_trial_error", str(fte))
-                return float("inf")
+                train_texts = load_texts(args.dataset_repo, "pretrain_train", train_max)
+                val_texts = load_texts(args.dataset_repo, "pretrain_val", val_max) if val_max else None
+
+                trainer = Trainer(
+                    model=model,
+                    cfg=cfg,
+                    train_texts=train_texts,
+                    val_texts=val_texts,
+                    tokenizer=tokenizer,
+                    output_dir=os.path.join(args.output_dir, f"trial_{trial.number:03d}"),
+                    example_prompts=["The next day", "In 1492,"],
+                    generated_example_length=30,
+                    grad_accum_steps=params["grad_accum"],
+                    use_amp=use_amp,
+                    min_tail_len=min_tail_len,
+                )
             except Exception as e:
-                _disable_watchdog()
-                safe_log_param(f"train_epoch_{epoch}_failed", repr(e))
-                safe_log_tag(f"epoch_{epoch}_traceback", traceback.format_exc())
-                warnings.warn(f"Train epoch failed: {repr(e)}\n{traceback.format_exc()}")
-                return float("inf")
-            finally:
-                _disable_watchdog()
-
-            epoch_time = time.time() - epoch_start
-            tokens_per_epoch = (
-                cost_pred["steps_per_epoch"] *
-                params["grad_accum"] *
-                cfg.batch_size *
-                cfg.seq_len
-            )
-            tok_per_sec = tokens_per_epoch / max(epoch_time, 1e-6)
-            tok_per_sec_list.append(tok_per_sec)
-
-            # ----- NaN / all-batches-skipped detection -----
-            train_loss = train_m.get("loss", float("inf"))
-            train_ppl = train_m.get("perplexity", float("inf"))
-            skipped_batches = train_m.get("skipped_batches", 0)
-
-            is_all_skipped = (train_loss == 0.0 and train_ppl == 1.0)
-
-            if is_all_skipped:
-                print(f"  [NaN GUARD] Trial {trial.number} epoch {epoch}: "
-                      f"ALL batches skipped (loss={train_loss}, ppl={train_ppl}, "
-                      f"skipped={skipped_batches}). Killing trial.")
-                safe_log_param("failed", f"all_nan_epoch_{epoch}")
-                safe_log_param("nan_epoch_skipped_batches", skipped_batches)
+                safe_log_param("failed", "data_loading")
+                safe_log_tag("data_loading_error", traceback.format_exc())
+                warnings.warn(f"Data loading failed: {repr(e)}\n{traceback.format_exc()}")
                 return float("inf")
 
-            if not math.isfinite(train_loss) or train_loss > 50000 or train_ppl > 50000:
-                print(f"  [EXPLODE] Trial {trial.number} epoch {epoch} "
-                      f"(loss={train_loss:.2f}, ppl={train_ppl:.2f})")
-                safe_log_param("failed", f"exploded_epoch_{epoch}")
-                safe_log_param("exploded_loss", train_loss)
-                return float("inf")
+            best_val_ppl = float("inf")
+            tok_per_sec_list: List[float] = []
+            start_time = time.time()
+            any_valid_epoch = False
 
-            any_valid_epoch = True
+            for epoch in range(1, round_cfg["epochs"] + 1):
+                epoch_start = time.time()
+                _install_watchdog(watchdog_timeout)
+
+                try:
+                    train_m = trainer.train_epoch(epoch)
+                except FrozenTrialError as fte:
+                    _disable_watchdog()
+                    print(f"  [FROZEN] {fte}")
+                    safe_log_param("failed", "frozen_trial")
+                    safe_log_tag("frozen_trial_error", str(fte))
+                    return float("inf")
+                except Exception as e:
+                    _disable_watchdog()
+                    safe_log_param(f"train_epoch_{epoch}_failed", repr(e))
+                    safe_log_tag(f"epoch_{epoch}_traceback", traceback.format_exc())
+                    warnings.warn(f"Train epoch failed: {repr(e)}\n{traceback.format_exc()}")
+                    return float("inf")
+                finally:
+                    _disable_watchdog()
+
+                epoch_time = time.time() - epoch_start
+                tokens_per_epoch = (
+                    cost_pred["steps_per_epoch"] *
+                    params["grad_accum"] *
+                    cfg.batch_size *
+                    cfg.seq_len
+                )
+                tok_per_sec = tokens_per_epoch / max(epoch_time, 1e-6)
+                tok_per_sec_list.append(tok_per_sec)
+
+                # ----- NaN / all-batches-skipped detection -----
+                train_loss = train_m.get("loss", float("inf"))
+                train_ppl = train_m.get("perplexity", float("inf"))
+                skipped_batches = train_m.get("skipped_batches", 0)
+
+                is_all_skipped = (train_loss == 0.0 and train_ppl == 1.0)
+
+                if is_all_skipped:
+                    print(f"  [NaN GUARD] Trial {trial.number} epoch {epoch}: "
+                          f"ALL batches skipped (loss={train_loss}, ppl={train_ppl}, "
+                          f"skipped={skipped_batches}). Killing trial.")
+                    safe_log_param("failed", f"all_nan_epoch_{epoch}")
+                    safe_log_param("nan_epoch_skipped_batches", skipped_batches)
+                    return float("inf")
+
+                if not math.isfinite(train_loss) or train_loss > 50000 or train_ppl > 50000:
+                    print(f"  [EXPLODE] Trial {trial.number} epoch {epoch} "
+                          f"(loss={train_loss:.2f}, ppl={train_ppl:.2f})")
+                    safe_log_param("failed", f"exploded_epoch_{epoch}")
+                    safe_log_param("exploded_loss", train_loss)
+                    return float("inf")
+
+                any_valid_epoch = True
+
+                safe_log_metrics({
+                    "train_loss": train_loss,
+                    "train_ppl": train_ppl,
+                    "tok_per_sec": tok_per_sec,
+                    "epoch_time_sec": epoch_time,
+                    "skipped_batches": skipped_batches,
+                }, step=epoch)
+
+                # Validation
+                val_ppl = float("inf")
+                if trainer.val_loader and epoch % max(1, round_cfg["epochs"] // 2) == 0:
+                    try:
+                        val_m = trainer.evaluate()
+                        val_loss = val_m.get("loss", float("inf"))
+                        val_ppl = val_m.get("perplexity", float("inf"))
+                        best_val_ppl = min(best_val_ppl, val_ppl)
+
+                        safe_log_metrics({
+                            "val_loss": val_loss,
+                            "val_ppl": val_ppl,
+                        }, step=epoch)
+                    except Exception as e:
+                        safe_log_tag("validation_error", traceback.format_exc())
+                        warnings.warn(f"Validation failed: {repr(e)}\n{traceback.format_exc()}")
+
+                # Optuna pruning
+                report_value = best_val_ppl if math.isfinite(best_val_ppl) else train_ppl
+                trial.report(report_value, epoch)
+                if trial.should_prune():
+                    print(f"  [PRUNE] Trial {trial.number} pruned at epoch {epoch}")
+                    safe_log_param("pruned_at_epoch", epoch)
+                    raise optuna.TrialPruned()
+
+            wall_time = time.time() - start_time
+            avg_tok_per_sec = float(np.mean(tok_per_sec_list)) if tok_per_sec_list else 0.0
+
+            if not any_valid_epoch:
+                print(f"  [NaN GUARD] Trial {trial.number}: no epoch produced valid batches.")
+                safe_log_param("failed", "all_epochs_zero_batches")
+                return float("inf")
 
             safe_log_metrics({
-                "train_loss": train_loss,
-                "train_ppl": train_ppl,
-                "tok_per_sec": tok_per_sec,
-                "epoch_time_sec": epoch_time,
-                "skipped_batches": skipped_batches,
-            }, step=epoch)
+                "best_val_ppl": best_val_ppl if math.isfinite(best_val_ppl) else 99999.0,
+                "avg_tok_per_sec": avg_tok_per_sec,
+                "wall_time_sec": wall_time,
+            })
 
-            # Validation
-            val_ppl = float("inf")
-            if trainer.val_loader and epoch % max(1, round_cfg["epochs"] // 2) == 0:
-                try:
-                    val_m = trainer.evaluate()
-                    val_loss = val_m.get("loss", float("inf"))
-                    val_ppl = val_m.get("perplexity", float("inf"))
-                    best_val_ppl = min(best_val_ppl, val_ppl)
+            actual_cost = estimate_training_cost(
+                params,
+                dataset_tokens=5_000_000 if args.round == "screening" else 400_000_000,
+                epochs=round_cfg["epochs"],
+                instance_cost_per_hour=round_cfg["instance_cost_hr"],
+                tok_per_sec_assumed=avg_tok_per_sec,
+            )
+            for k, v in actual_cost.items():
+                safe_log_param(f"actual_cost_{k}", v)
 
-                    safe_log_metrics({
-                        "val_loss": val_loss,
-                        "val_ppl": val_ppl,
-                    }, step=epoch)
-                except Exception as e:
-                    safe_log_tag("validation_error", traceback.format_exc())
-                    warnings.warn(f"Validation failed: {repr(e)}\n{traceback.format_exc()}")
+            print(f"  [DONE] Trial {trial.number} | best_val_ppl={best_val_ppl:.2f} | "
+                  f"avg_tok/s={avg_tok_per_sec:.0f} | wall={wall_time/60:.1f}min")
 
-            # Optuna pruning
-            report_value = best_val_ppl if math.isfinite(best_val_ppl) else train_ppl
-            trial.report(report_value, epoch)
-            if trial.should_prune():
-                print(f"  [PRUNE] Trial {trial.number} pruned at epoch {epoch}")
-                safe_log_param("pruned_at_epoch", epoch)
-                raise optuna.TrialPruned()
-
-        wall_time = time.time() - start_time
-        avg_tok_per_sec = float(np.mean(tok_per_sec_list)) if tok_per_sec_list else 0.0
-
-        if not any_valid_epoch:
-            print(f"  [NaN GUARD] Trial {trial.number}: no epoch produced valid batches.")
-            safe_log_param("failed", "all_epochs_zero_batches")
-            return float("inf")
-
-        safe_log_metrics({
-            "best_val_ppl": best_val_ppl if math.isfinite(best_val_ppl) else 99999.0,
-            "avg_tok_per_sec": avg_tok_per_sec,
-            "wall_time_sec": wall_time,
-        })
-
-        actual_cost = estimate_training_cost(
-            params,
-            dataset_tokens=5_000_000 if args.round == "screening" else 400_000_000,
-            epochs=round_cfg["epochs"],
-            instance_cost_per_hour=round_cfg["instance_cost_hr"],
-            tok_per_sec_assumed=avg_tok_per_sec,
-        )
-        for k, v in actual_cost.items():
-            safe_log_param(f"actual_cost_{k}", v)
-
-        print(f"  [DONE] Trial {trial.number} | best_val_ppl={best_val_ppl:.2f} | "
-              f"avg_tok/s={avg_tok_per_sec:.0f} | wall={wall_time/60:.1f}min")
-
-        del model, trainer
+            return best_val_ppl if math.isfinite(best_val_ppl) else 99999.0
+    finally:
+        if trainer is not None:
+            del trainer
+        if model is not None:
+            del model
         gc.collect()
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
-
-        return best_val_ppl if math.isfinite(best_val_ppl) else 99999.0
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HelixLM NAS with Optuna v2.3")
+    parser = argparse.ArgumentParser(description="HelixLM NAS with Optuna v2.4")
     parser.add_argument("--round", choices=["screening", "validation", "final"], required=True)
     parser.add_argument("--output-dir", default="./nas_results")
     parser.add_argument("--n-trials", type=int, default=None)
