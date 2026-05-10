@@ -305,6 +305,11 @@ class Trainer:
             total_loss += loss.item() * divisor
             raw_count += 1
 
+            # Step marker to prevent CUDAGraphs memory aliasing across steps
+            # Must be called AFTER backward but BEFORE the next forward
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+
             # Optimizer step after accumulation
             is_last = (batch_idx + 1) == len(self.train_loader)
             if accum_count >= self.grad_accum_steps or is_last:
