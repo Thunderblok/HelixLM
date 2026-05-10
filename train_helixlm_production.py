@@ -43,11 +43,6 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
-# Add repo root to path (works in HF job container where repo is mounted)
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_SCRIPT_DIR) if os.path.basename(_SCRIPT_DIR) == "scripts" else _SCRIPT_DIR
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
 
@@ -146,18 +141,19 @@ def build_model_name(args, param_count):
 def load_split(repo_id, split_name, max_samples=None):
     """
     Load a dataset split into a list of strings.
-
-    CRITICAL: Follows the pattern from nas_helixlm.py and
-    train-with-dataset-cicd-test.py. Uses non-streaming for I/O speed;
-    materializes only the 'text' column.
+    
+    Uses streaming=True to match the NAS script and avoid disk cache.
+    NOTE: List[str] still materializes in RAM; for 730k samples this is ~1-2 GB.
+    The DocumentAwareDataset chunking step is the larger consumer (~2-3 GB).
+    Both fit comfortably in L4/L40S RAM.
     """
     print(f"  Loading {repo_id}  split={split_name} ...")
-    ds = load_dataset(repo_id, split=split_name, trust_remote_code=False)
-    total = len(ds)
-    limit = max_samples if max_samples else total
+    ds = load_dataset(repo_id, split=split_name, streaming=True, trust_remote_code=False)
     texts = []
-    for i in tqdm(range(min(limit, total)), desc=f"  {split_name}", leave=False):
-        item = ds[i]
+    iterable = tqdm(ds, desc=f"  {split_name}", total=max_samples, leave=False)
+    for i, item in enumerate(iterable):
+        if max_samples is not None and i >= max_samples:
+            break
         texts.append(item.get("text", ""))
     print(f"  -> {len(texts):,} samples")
     return texts
