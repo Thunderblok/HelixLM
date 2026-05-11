@@ -219,15 +219,7 @@ class HelixGraph(nn.Module):
         new_states = {}
         cache: Dict[str, torch.Tensor] = {}
 
-        for name in self.nodes:
-            if not self.graph[name]:
-                # Stateful nodes must run forward to produce/update their state
-                if not isinstance(self.nodes[name], (SSMNode, Mamba2Node, TitansMemoryNode)):
-                    cache[name] = x
-
         for name in self.order:
-            if name in cache:
-                continue
             preds = self.graph[name]
             if not preds:
                 feats = []
