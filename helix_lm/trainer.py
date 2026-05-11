@@ -82,6 +82,7 @@ class Trainer:
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
+        stride: Optional[int] = None,
     ):
         """
         Initialize Trainer.
@@ -101,6 +102,7 @@ class Trainer:
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
             verbose: Whether to show tqdm progress bars and print logs.
+            stride: Optional stride for DocumentAwareDataset overlap (< seq_len).
         """
         self.model = model
         self.cfg = cfg
@@ -141,6 +143,7 @@ class Trainer:
                 shuffle=True,
                 min_tail_len=min_tail_len,
                 lazy=True,
+                stride=stride,
             )
 
         self.val_loader = None
@@ -156,14 +159,15 @@ class Trainer:
                 drop_last=False,
                 min_tail_len=min_tail_len,
                 lazy=True,
+                stride=stride,
             )
 
-        # AdamW with standard betas (0.9, 0.999)
+        # Fix #6: AdamW betas configurable (modern default beta2=0.95 for small models)
         self.optimizer = AdamW(
             model.parameters(),
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
-            betas=(0.9, 0.999),
+            betas=(getattr(cfg, "beta1", 0.9), getattr(cfg, "beta2", 0.95)),
         )
 
         # Scheduler steps count optimizer steps, not raw batches

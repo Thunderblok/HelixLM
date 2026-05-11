@@ -92,6 +92,8 @@ class HelixConfig(PretrainedConfig):
         epochs: int = 100,
         warmup_steps: int = 100,
         grad_clip: float = 1.0,
+        beta1: float = 0.9,
+        beta2: float = 0.95,
 
         # --- Initialization ---
         initializer_range: float = 0.02,
@@ -199,6 +201,8 @@ class HelixConfig(PretrainedConfig):
         self.epochs = epochs
         self.warmup_steps = warmup_steps
         self.grad_clip = grad_clip
+        self.beta1 = beta1
+        self.beta2 = beta2
         self.initializer_range = initializer_range
         self.device = device
         if isinstance(dtype, str):

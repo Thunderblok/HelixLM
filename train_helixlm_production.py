@@ -83,14 +83,25 @@ def parse_args():
 
     # Training
     parser.add_argument("--seq-len", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--grad-accum", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="Gradient accumulation steps (default 1 to avoid any scaling issues)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Native batch size (default 16)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override stage default")
     parser.add_argument("--lr", type=float, default=None,
                         help="Override stage default")
-    parser.add_argument("--warmup-steps", type=int, default=2000)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                        help="Warmup steps (default: 10% of optimizer steps per epoch)")
+    parser.add_argument("--warmup-ratio", type=float, default=0.1,
+                        help="Fraction of total steps for warmup (used if --warmup-steps not set)")
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--beta1", type=float, default=0.9,
+                        help="AdamW beta1 (default 0.9)")
+    parser.add_argument("--beta2", type=float, default=0.95,
+                        help="AdamW beta2 (default 0.95; use 0.999 for old behavior)")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Dataset stride for overlap (< seq_len). Default: seq_len//2 for tiny datasets, seq_len for production.")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--min-tail-len", type=int, default=None)
 
@@ -171,6 +182,27 @@ def main():
     if args.min_tail_len is None:
         args.min_tail_len = args.seq_len // 4
 
+    # Fix #7: Compute warmup steps dynamically if not explicitly set.
+    # For tiny datasets, default 2000 steps is excessive (can be >1 epoch).
+    # Use warmup_ratio (default 10%) of total optimizer steps.
+    if args.warmup_steps is None:
+        # Estimate steps per epoch from dataset size if known, else use heuristic
+        # We will compute more precisely after loading data, but need a placeholder.
+        # For now, set to a small default; Trainer will recompute if needed.
+        # Actually, Trainer computes steps_per_epoch from len(train_loader) which
+        # requires the dataset to be loaded. We'll pass warmup_steps as-is and
+        # let the script compute it after data loading.
+        pass
+
+    # Fix #8: Auto stride for tiny datasets (increase steps/epoch via overlap)
+    if args.stride is None:
+        # Use overlap only for tiny datasets to increase steps/epoch
+        # Heuristic: if max_samples is set and < 50000, use half overlap
+        if args.max_samples is not None and args.max_samples < 50000:
+            args.stride = max(1, args.seq_len // 2)
+        else:
+            args.stride = args.seq_len  # no overlap for production
+
     # Fix #4: Explicit nodes_per_column (never rely on .tiny() hardcode)
     args.nodes_per_column = tuple(int(x.strip()) for x in args.nodes_per_column.split(","))
     if len(args.nodes_per_column) != args.n_columns:
@@ -215,6 +247,8 @@ def main():
         epochs=args.epochs,
         warmup_steps=args.warmup_steps,
         grad_clip=args.grad_clip,
+        beta1=args.beta1,
+        beta2=args.beta2,
         dtype=args.dtype,
         device=args.device,
         tokenizer_name="gpt2",
@@ -243,6 +277,8 @@ def main():
             model.config.warmup_steps = args.warmup_steps
             model.config.grad_clip = args.grad_clip
             model.config.weight_decay = args.weight_decay
+            model.config.beta1 = args.beta1
+            model.config.beta2 = args.beta2
         else:
             model = HelixForCausalLM(cfg)
 
@@ -273,7 +309,23 @@ def main():
                 print(f"  [WARN] Val split {args.val_split} not loaded: {e}")
                 val_texts = None
 
-        # Trainer (Fix #3: explicit min_tail_len passthrough)
+        # Fix #7b: Compute warmup_steps from warmup_ratio if not explicitly set.
+        # We now know the dataset size, so we can compute total optimizer steps.
+        if args.warmup_steps is None:
+            # Estimate chunks per epoch from texts (rough heuristic before chunking)
+            avg_doc_len = 500  # tokens per doc heuristic
+            total_tokens = len(train_texts) * avg_doc_len
+            chunks_per_epoch = max(1, total_tokens // (args.seq_len * args.batch_size))
+            total_optimizer_steps = chunks_per_epoch * args.epochs // args.grad_accum
+            args.warmup_steps = max(1, int(total_optimizer_steps * args.warmup_ratio))
+            print(f"[INFO] Auto-computed warmup_steps={args.warmup_steps} "
+                  f"(ratio={args.warmup_ratio}, total_opt_steps≈{total_optimizer_steps})")
+            # Update config with computed warmup
+            cfg.warmup_steps = args.warmup_steps
+            if model is not None and hasattr(model, "config"):
+                model.config.warmup_steps = args.warmup_steps
+
+        # Trainer (Fix #3: explicit min_tail_len passthrough; Fix #8: stride for overlap)
         effective_cfg = model.config if args.resume_from else cfg
         trainer = Trainer(
             model=model,
@@ -292,6 +344,7 @@ def main():
             use_amp=(args.dtype == "bfloat16" and torch.cuda.is_available()),
             min_tail_len=args.min_tail_len,
             verbose=True,
+            stride=args.stride if args.stride < args.seq_len else None,
         )
 
         # Train
