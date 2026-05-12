@@ -335,19 +335,21 @@ def main() -> None:
         
         # Save incremental results
         json_path = os.path.join(args.output_dir, f"nas_400m_{TIMESTAMP}_results.json")
+        json_data = {
+            "script_version": SCRIPT_VERSION,
+            "timestamp": TIMESTAMP,
+            "n_trials": len(trials),
+            "epochs_per_trial": args.epochs,
+            "max_samples": args.max_samples,
+            "dataset_repo": args.dataset_repo,
+            "arch_config": ARCH_CONFIG,
+            "search_space": {k: v for k, v in SEARCH_SPACE.items()},
+            "results": results,
+        }
+        print(json_data)  # Python repr for quick scanning
+        print(json.dumps(json_data, indent=2, default=str))  # Pretty JSON for readability
         with open(json_path, "w") as f:
-            json.dump({
-                "script_version": SCRIPT_VERSION,
-                "timestamp": TIMESTAMP,
-                "n_trials": len(trials),
-                "epochs_per_trial": args.epochs,
-                "max_samples": args.max_samples,
-                "dataset_repo": args.dataset_repo,
-                "arch_config": ARCH_CONFIG,
-                "search_space": {k: v for k, v in SEARCH_SPACE.items()},
-                "results": results,
-            }, f, indent=2, default=str)
-        print(f"  Saved: {json_path}")
+            json.dump(json_data, f, indent=2, default=str)
     
     # Summary
     print(f"\n{'='*70}")
