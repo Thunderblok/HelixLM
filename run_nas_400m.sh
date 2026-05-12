@@ -9,4 +9,5 @@ python nas_400m_poc.py \
   --epochs 1 \
   --max-samples 10000 \
   --output-dir ./nas_400m_results \
-  --dataset-repo david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430
+  --dataset-repo https://huggingface.co/datasets/david-thrower/HelixLM-small-50.0Mt-91250pt-7143it-20260427
+
