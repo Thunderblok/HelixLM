@@ -95,6 +95,9 @@ class HelixConfig(PretrainedConfig):
         beta1: float = 0.9,
         beta2: float = 0.95,
 
+        # --- Regularization ---
+        stochastic_depth_p: float = 0.0,  # Probability of skipping root non-stateful nodes during training
+
         # --- Initialization ---
         initializer_range: float = 0.02,
 
@@ -203,6 +206,7 @@ class HelixConfig(PretrainedConfig):
         self.grad_clip = grad_clip
         self.beta1 = beta1
         self.beta2 = beta2
+        self.stochastic_depth_p = stochastic_depth_p
         self.initializer_range = initializer_range
         self.device = device
         if isinstance(dtype, str):

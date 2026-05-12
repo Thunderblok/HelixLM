@@ -219,6 +219,13 @@ class HelixGraph(nn.Module):
         new_states = {}
         cache: Dict[str, torch.Tensor] = {}
 
+        # Stochastic depth: during training, randomly skip root non-stateful nodes
+        # with probability p. This acts as a regularization mechanism similar to
+        # the accidental "bug" that improved perplexity, but applied intentionally
+        # and probabilistically rather than permanently.
+        stochastic_depth_p = getattr(self.cfg, 'stochastic_depth_p', 0.0)
+        use_stochastic_depth = self.training and stochastic_depth_p > 0
+
         for name in self.order:
             preds = self.graph[name]
             if not preds:
@@ -226,6 +233,12 @@ class HelixGraph(nn.Module):
             else:
                 feats = [cache[p] for p in preds]
             _, _, ntype = self.node_meta[name]
+
+            # Stochastic depth: skip non-stateful root nodes during training
+            if use_stochastic_depth and not preds and ntype not in ('ssm', 'mamba2', 'titans'):
+                if torch.rand(1).item() < stochastic_depth_p:
+                    cache[name] = x
+                    continue
 
             if ntype == "gate":
                 merged = feats if len(feats) > 0 else [x]  # GateNode always expects a list
