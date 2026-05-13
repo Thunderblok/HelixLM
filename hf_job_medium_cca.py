@@ -2,7 +2,7 @@
 Medium-scale CCA training for HF Jobs.
 Run: python hf_job_medium_cca.py
 """
-import sys, os, math, random, json
+import sys, os, math, random, json, time
 
 # Install dependencies
 os.system("pip install -e . --quiet 2>&1 | tail -5")
