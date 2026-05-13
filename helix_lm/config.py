@@ -132,6 +132,11 @@ class HelixConfig(PretrainedConfig):
         # memory
         memory_efficient_forward: bool = False,
         
+        # --- Curriculum Component Activation ---
+        use_cca: bool = False,
+        cca_warmup_steps: int = 5000,
+        cca_ramp_mode: str = "quadratic",  # "quadratic" | "linear"
+
         # --- Misc ---
         tie_word_embeddings: bool = True,
         **kwargs,
@@ -157,6 +162,11 @@ class HelixConfig(PretrainedConfig):
         self.k_proj_dim = k_proj_dim
         self.dropout = dropout
         self.linear_feature_dim = linear_feature_dim
+
+        # --- CCA ---
+        self.use_cca = use_cca
+        self.cca_warmup_steps = cca_warmup_steps
+        self.cca_ramp_mode = cca_ramp_mode
 
         # --- SSM ---
         self.use_ssm = use_ssm

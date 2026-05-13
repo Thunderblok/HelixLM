@@ -345,6 +345,8 @@ class TitansMemoryNode(HeteroNode):
         x: torch.Tensor,
         state: Any = None,
         cache: Any = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Args:

@@ -85,6 +85,18 @@ class HelixGraph(nn.Module):
         last_col = max(v[0] for v in self.node_meta.values())
         self.sink_nodes = [k for k, v in self.node_meta.items() if v[0] == last_col]
 
+        # Native CCA (Curriculum Component Activation) gates for attention nodes
+        self.use_cca = getattr(cfg, 'use_cca', False)
+        self.cca_warmup_steps = getattr(cfg, 'cca_warmup_steps', 5000)
+        self.cca_ramp_mode = getattr(cfg, 'cca_ramp_mode', 'quadratic')
+        if self.use_cca:
+            self.attention_gates = nn.ParameterDict()
+            for name, (ci, idx, ntype) in self.node_meta.items():
+                if ntype in ("linear_attn", "full_attn"):
+                    self.attention_gates[name] = nn.Parameter(torch.zeros(1))
+            self._cca_step = 0
+            self._cca_total_steps = self.cca_warmup_steps
+
     def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
         cfg = self.cfg
         spec = []
@@ -226,6 +238,16 @@ class HelixGraph(nn.Module):
                 out, _ = node(merged, attention_mask=attention_mask)
             else:
                 out, _ = node(merged, attention_mask=attention_mask)
+
+            # CCA: Curriculum Component Activation for attention nodes
+            if self.use_cca and ntype in ("linear_attn", "full_attn") and name in self.attention_gates:
+                total = max(1, self._cca_total_steps)
+                progress = min(1.0, self._cca_step / total)
+                scale = progress ** 2 if self.cca_ramp_mode == 'quadratic' else progress
+                learned_gate = torch.sigmoid(self.attention_gates[name])
+                curriculum_gate = learned_gate * scale
+                out = curriculum_gate * out + (1 - curriculum_gate) * merged
+
             cache[name] = out
 
         if len(self.sink_nodes) == 1:

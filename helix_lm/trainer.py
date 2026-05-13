@@ -181,6 +181,14 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.history = {"train_loss": [], "val_loss": [], "perplexity": []}
 
+        # Auto-enable CCA on the graph if config asks for it
+        if getattr(self.cfg, "use_cca", False):
+            graph = getattr(self.model.model.recurrent, "graph", None)
+            if graph is not None:
+                graph.use_cca = True
+                graph.cca_warmup_steps = getattr(self.cfg, "cca_warmup_steps", 5000)
+                graph.cca_ramp_mode = getattr(self.cfg, "cca_ramp_mode", "quadratic")
+
         # GradScaler for AMP (only if use_amp=True and CUDA available)
         self.scaler = None
         if self.use_amp:
@@ -251,7 +259,19 @@ class Trainer:
             disable=not self.verbose,
         )
 
+        # Update CCA step counter before epoch loop
+        if getattr(self.cfg, "use_cca", False):
+            graph = getattr(self.model.model.recurrent, "graph", None)
+            if graph is not None:
+                graph._cca_step = self.global_step
+
         for batch_idx, batch in enumerate(pbar):
+            # Update CCA step at each batch
+            if getattr(self.cfg, "use_cca", False):
+                graph = getattr(self.model.model.recurrent, "graph", None)
+                if graph is not None:
+                    graph._cca_step = self.global_step * self.grad_accum_steps + batch_idx
+
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
             tokens_seen += input_ids.numel()

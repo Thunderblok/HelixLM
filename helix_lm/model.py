@@ -62,7 +62,7 @@ class HelixLMCore(nn.Module):
 
     def forward(self, token_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         e = self.embed(token_ids)
-        h = self.recurrent(e, e.detach(), attention_mask=attention_mask)
+        h = self.recurrent(e, e, attention_mask=attention_mask)
         if self.head is not None:
             logits = self.head(self.out_norm(h))
         else:
