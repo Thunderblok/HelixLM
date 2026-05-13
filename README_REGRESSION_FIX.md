@@ -127,3 +127,11 @@ HelixConfig(
 
 Live monitoring: https://huggingface.co/spaces/david-thrower/ml-intern-helixlm
 Project: `helixlm-regression-fix`
+
+---
+
+## Important Note on Dataset Matching
+
+The first medium-scale GPU run failed because `tiny-stories-mini-96-seq-len` has ~96-token stories. When `seq_len=512`, the default `min_tail_len=seq_len//4=128` drops nearly all documents. **Set `min_tail_len=1` when using this dataset at 512 seq_len**, or use a longer-text dataset for 512-seq runs. The production script has been updated to handle this.
+
+For proper medium-scale validation, use a dataset with longer texts, or use `seq_len=128` with the tiny-stories dataset (which still benefits from the attention_mask fix + CCA).

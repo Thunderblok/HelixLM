@@ -211,9 +211,21 @@ def main():
     train_texts = all_texts[:n_train]
     val_texts = all_texts[n_train:args.samples]
 
+    # CRITICAL: For short-text datasets at long seq_len, set min_tail_len=1
+    # to prevent dropping nearly all documents. The dataset has ~96-token stories.
+    from helix_lm.dataset import create_document_loader
+    train_loader = create_document_loader(
+        train_texts, tok, seq_len=args.seq_len, batch_size=args.batch_size,
+        shuffle=True, drop_last=True, min_tail_len=1, lazy=True,
+    )
+    val_loader = create_document_loader(
+        val_texts, tok, seq_len=args.seq_len, batch_size=args.batch_size,
+        shuffle=False, drop_last=False, min_tail_len=1, lazy=True,
+    )
+
     trainer = CCATrainer(
         model=model, cfg=cfg,
-        train_texts=train_texts, val_texts=val_texts,
+        train_loader=train_loader, val_loader=val_loader,
         tokenizer=tok,
         output_dir=args.output_dir,
         example_prompts=["Once upon a time", "The cat sat on the"],
