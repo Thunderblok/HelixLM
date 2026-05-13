@@ -25,7 +25,7 @@ subprocess.run([
 import trackio
 trackio.init(
     project="helixlm-400m-prod",
-    run_name="helixlm-384d-cca-400Mt-l40s",
+    name="helixlm-384d-cca-400Mt-l40s",
 )
 
 # ── Import HelixLM ─────────────────────────────────────────────────────
