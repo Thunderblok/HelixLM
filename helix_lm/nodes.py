@@ -29,7 +29,7 @@ class HeteroNode(nn.Module):
         self.d_model = d_model
         self.norm = RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         raise NotImplementedError
 
 
@@ -61,7 +61,7 @@ class LinearAttnNode(HeteroNode):
     def _feature_map(self, x: torch.Tensor) -> torch.Tensor:
         return F.elu(x) + 1.0
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
         x = self.norm(x)
 
@@ -74,6 +74,12 @@ class LinearAttnNode(HeteroNode):
         q_fp32 = self._feature_map(self.q_feat(q.float()))
         k_fp32 = self._feature_map(self.k_feat(k.float()))
         v_fp32 = v.float()
+
+        # Apply attention mask: zero out k,v contributions from pad positions
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).unsqueeze(-1).float()  # (B, 1, T, 1)
+            k_fp32 = k_fp32 * mask
+            v_fp32 = v_fp32 * mask
 
         kv = torch.einsum('bhTf,bhTd->bhTfd', k_fp32, v_fp32)
         kv_cum = torch.cumsum(kv, dim=2)
@@ -110,7 +116,7 @@ class FullAttnNode(HeteroNode):
         nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
         x = self.norm(x)
 
@@ -121,6 +127,11 @@ class FullAttnNode(HeteroNode):
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(causal_mask, float('-inf'))
+
+        # Apply attention mask: prevent attending to pad positions
+        if attention_mask is not None:
+            pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(pad_mask, float('-inf'))
 
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -141,7 +152,7 @@ class DenseNode(HeteroNode):
         nn.init.xavier_uniform_(self.w1.weight)
         nn.init.xavier_uniform_(self.w2.weight)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         x = self.norm(x)
         h = F.gelu(self.w1(x))
         out = self.w2(h)
@@ -161,7 +172,7 @@ class SwiGLUNode(HeteroNode):
         nn.init.xavier_uniform_(self.up.weight)
         nn.init.xavier_uniform_(self.down.weight)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         x = self.norm(x)
         h = F.silu(self.gate(x)) * self.up(x)
         out = self.down(h)
@@ -196,7 +207,7 @@ class SSMNode(HeteroNode):
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log.data = torch.log(A)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
         x = self.norm(x)
 
@@ -245,7 +256,7 @@ class Mamba2Node(HeteroNode):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         x = self.norm(x)
         out, new_state = self.mamba(x, state=state)
         return self.dropout(out), new_state
@@ -261,7 +272,7 @@ class GateNode(HeteroNode):
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.out_proj.weight)
 
-    def forward(self, x_list, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x_list, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         if not isinstance(x_list, list):
             raise TypeError("GateNode expects a list of predecessor tensors")
         n = len(x_list)

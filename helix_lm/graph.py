@@ -187,7 +187,7 @@ class HelixGraph(nn.Module):
             raise ValueError(f"Cycle detected! Remaining: {remaining}")
         return out
 
-    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None, attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if states is None:
             states = {}
         new_states = {}
@@ -220,12 +220,12 @@ class HelixGraph(nn.Module):
 
             node = self.nodes[name]
             if isinstance(node, (SSMNode, Mamba2Node, TitansMemoryNode)):
-                out, s = node(merged, state=states.get(name))
+                out, s = node(merged, state=states.get(name), attention_mask=attention_mask)
                 new_states[name] = s
             elif isinstance(node, GateNode):
-                out, _ = node(merged)
+                out, _ = node(merged, attention_mask=attention_mask)
             else:
-                out, _ = node(merged)
+                out, _ = node(merged, attention_mask=attention_mask)
             cache[name] = out
 
         if len(self.sink_nodes) == 1:
