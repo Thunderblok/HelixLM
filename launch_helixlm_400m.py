@@ -4,32 +4,9 @@ Clones repo, installs deps, runs train_production_cca.py with trackio logging.
 """
 import os, subprocess, sys, math, json
 
-# ── Clone repo ──────────────────────────────────────────────────────────
-REPO_URL = "https://github.com/david-thrower/HelixLM.git"
-BRANCH = "agent-2027-05-13-regression-fix"
-REPO_DIR = "/app/HelixLM"
 
-if not os.path.exists(REPO_DIR):
-    subprocess.run(["git", "clone", "--depth=1", "--branch", BRANCH, REPO_URL, REPO_DIR], check=True)
-os.chdir(REPO_DIR)
-subprocess.run(["git", "fetch", "origin", BRANCH], check=False)
-subprocess.run(["git", "checkout", BRANCH], check=True)
-
-# ── Install deps ────────────────────────────────────────────────────────
-subprocess.run([
-    sys.executable, "-m", "pip", "install", "-q",
-    "torch", "transformers", "datasets", "numpy", "tqdm", "trackio",
-], check=True)
-
-# ── Setup trackio ────────────────────────────────────────────────────────
-import trackio
-trackio.init(
-    project="helixlm-400m-prod",
-    name="helixlm-384d-cca-400Mt-l40s",
-)
 
 # ── Import HelixLM ─────────────────────────────────────────────────────
-sys.path.insert(0, REPO_DIR)
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer
 from helix_lm.trainer import Trainer
 from helix_lm.dataset import create_document_loader
@@ -43,7 +20,7 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-# ── Config (Card A3 winner + CCA) ─────────────────────────────────────
+# ── Config (Card A3 winner + CCA, configs were set on 96 seq len, tiny stories, need re-optimized) 
 SEQ_LEN = 512
 BATCH_SIZE = 16
 EPOCHS = 3
@@ -89,19 +66,6 @@ model = HelixForCausalLM(cfg)
 params = model.count_parameters()["total"]
 print(f"Params: {params:,}")
 
-# Trackio log config
-trackio.log({
-    "params": params,
-    "d_model": D_MODEL,
-    "seq_len": SEQ_LEN,
-    "batch_size": BATCH_SIZE,
-    "lr": LR,
-    "wd": WD,
-    "dropout": DROPOUT,
-    "n_loops": N_LOOPS,
-    "cca": True,
-    "cca_warmup": 5000,
-})
 
 train_loader = create_document_loader(
     train_texts, tok, seq_len=SEQ_LEN, batch_size=BATCH_SIZE,
@@ -126,19 +90,12 @@ trainer = Trainer(
 for group in trainer.optimizer.param_groups:
     group["betas"] = (0.9, 0.999)
 
-# ── Train with trackio logging ─────────────────────────────────────────
+
 history = trainer.train(num_epochs=EPOCHS, eval_every=1)
 
 final_val_loss = history["val_loss"][-1] if history.get("val_loss") else float("inf")
 final_ppl = math.exp(min(final_val_loss, 20))
 final_train_loss = history["train_loss"][-1]
-
-# Trackio log final results
-trackio.log({
-    "final_train_loss": final_train_loss,
-    "final_val_loss": final_val_loss,
-    "final_val_ppl": final_ppl,
-})
 
 print(f"\n{'='*60}")
 print("RESULTS")
