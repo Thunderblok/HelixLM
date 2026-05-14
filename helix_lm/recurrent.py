@@ -65,7 +65,7 @@ class HelixRecurrentBlock(nn.Module):
         self.act = ACTHalting(cfg.d_model, cfg.act_threshold)
         self.loop_dim = cfg.loop_dim
 
-    def forward(self, h: torch.Tensor, e: torch.Tensor, freqs_cis=None, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, h: torch.Tensor, e: torch.Tensor, freqs_cis=None, attention_mask: Optional[torch.Tensor] = None, cca_step: Optional[int] = None):
         B, T, D = h.shape
         device = h.device
 
@@ -77,7 +77,7 @@ class HelixRecurrentBlock(nn.Module):
         for t in range(self.cfg.n_loops):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
-            trans_out, node_states = self.graph(combined, states=node_states, attention_mask=attention_mask)
+            trans_out, node_states = self.graph(combined, states=node_states, attention_mask=attention_mask, cca_step=cca_step)
             h = self.injection(h, e, trans_out)
             p = self.act(h)
 

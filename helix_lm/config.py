@@ -135,7 +135,8 @@ class HelixConfig(PretrainedConfig):
         # --- Curriculum Component Activation ---
         use_cca: bool = False,
         cca_warmup_steps: int = 5000,
-        cca_ramp_mode: str = "quadratic",  # "quadratic" | "linear"
+        cca_ramp_mode: str = "quadratic",  # "quadratic" | "cubic_ease" | "linear"
+        cca_min_scale: float = 0.05,  # Minimum attention contribution (prevents FFN-only collapse)
 
         # --- Misc ---
         tie_word_embeddings: bool = True,
@@ -167,6 +168,7 @@ class HelixConfig(PretrainedConfig):
         self.use_cca = use_cca
         self.cca_warmup_steps = cca_warmup_steps
         self.cca_ramp_mode = cca_ramp_mode
+        self.cca_min_scale = cca_min_scale
 
         # --- SSM ---
         self.use_ssm = use_ssm

@@ -89,11 +89,13 @@ class HelixGraph(nn.Module):
         self.use_cca = getattr(cfg, 'use_cca', False)
         self.cca_warmup_steps = getattr(cfg, 'cca_warmup_steps', 5000)
         self.cca_ramp_mode = getattr(cfg, 'cca_ramp_mode', 'quadratic')
+        self.cca_min_scale = getattr(cfg, 'cca_min_scale', 0.05)
         if self.use_cca:
             self.attention_gates = nn.ParameterDict()
             for name, (ci, idx, ntype) in self.node_meta.items():
                 if ntype in ("linear_attn", "full_attn"):
-                    self.attention_gates[name] = nn.Parameter(torch.zeros(1))
+                    # FIXED: init +2.0 so gate can reach full attention
+                    self.attention_gates[name] = nn.Parameter(torch.tensor(2.0))
             self._cca_step = 0
             self._cca_total_steps = self.cca_warmup_steps
 
@@ -199,7 +201,7 @@ class HelixGraph(nn.Module):
             raise ValueError(f"Cycle detected! Remaining: {remaining}")
         return out
 
-    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None, attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None, attention_mask: Optional[torch.Tensor] = None, cca_step: Optional[int] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if states is None:
             states = {}
         new_states = {}
@@ -242,8 +244,16 @@ class HelixGraph(nn.Module):
             # CCA: Curriculum Component Activation for attention nodes
             if self.use_cca and ntype in ("linear_attn", "full_attn") and name in self.attention_gates:
                 total = max(1, self._cca_total_steps)
-                progress = min(1.0, self._cca_step / total)
-                scale = progress ** 2 if self.cca_ramp_mode == 'quadratic' else progress
+                step = cca_step if cca_step is not None else self._cca_step
+                progress = min(1.0, step / total)
+                if self.cca_ramp_mode == 'quadratic':
+                    scale = progress ** 2
+                elif self.cca_ramp_mode == 'cubic_ease':
+                    scale = progress ** 2 * (3 - 2 * progress)  # Smoothstep
+                else:
+                    scale = progress
+                # Apply minimum scale: attention always contributes at least cca_min_scale
+                scale = self.cca_min_scale + (1.0 - self.cca_min_scale) * scale
                 learned_gate = torch.sigmoid(self.attention_gates[name])
                 curriculum_gate = learned_gate * scale
                 out = curriculum_gate * out + (1 - curriculum_gate) * merged

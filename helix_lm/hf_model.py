@@ -187,8 +187,8 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         else:
             e = self.model.embed(input_ids)
 
-        # Run through recurrent core — pass attention_mask if available
-        h = self.model.recurrent(e, e, attention_mask=attention_mask)
+        # Run through recurrent core — pass attention_mask and cca_step if available
+        h = self.model.recurrent(e, e, attention_mask=attention_mask, cca_step=kwargs.get("cca_step", None))
 
         # Output
         h = self.model.out_norm(h)
