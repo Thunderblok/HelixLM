@@ -191,4 +191,11 @@ with open("./checkpoints_tiny_smoke_fixed/results.json", "w") as f:
         }
     }, f)
 
+# Push to hub if token available
+try:
+    model.push_to_hub("david-thrower/helixlm-tiny-smoke-fixed")
+    print("Pushed to david-thrower/helixlm-tiny-smoke-fixed")
+except Exception as e:
+    print(f"Hub push skipped: {e}")
+
 print(f"\nCheckpoint saved to ./checkpoints_tiny_smoke_fixed/")
