@@ -96,8 +96,8 @@ class HelixGraph(nn.Module):
             self.attention_gates = nn.ParameterDict()
             for name, (ci, idx, ntype) in self.node_meta.items():
                 if ntype in ("linear_attn", "full_attn"):
-                    # FIXED: init +2.0 so gate can reach full attention
-                    self.attention_gates[name] = nn.Parameter(torch.tensor(2.0))
+                    # Init -2.0 so gate starts ~0.12, allowing FFN to dominate early.
+                    self.attention_gates[name] = nn.Parameter(torch.tensor(-2.0))
             self._cca_step = 0
             self._cca_total_steps = self.cca_warmup_steps
 

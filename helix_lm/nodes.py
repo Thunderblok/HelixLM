@@ -61,12 +61,12 @@ class LinearAttnNode(HeteroNode):
         return F.elu(x) + 1.0
 
     def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(self.v_proj.weight)
-        # Zero-init out_proj so attention starts as identity passthrough (via residual).
-        # Prevents untrained random attention from drowning the FFN signal during CCA warmup.
-        nn.init.zeros_(self.out_proj.weight)
+        # Tiny-scale out_proj so attention starts very weak but can learn.
+        # Avoids zero-init dead-zone while preventing random attention from drowning FFN.
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.01)
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
@@ -124,11 +124,11 @@ class FullAttnNode(HeteroNode):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(self.v_proj.weight)
-        # Zero-init out_proj so attention starts as identity passthrough (via residual).
-        nn.init.zeros_(self.out_proj.weight)
+        # Tiny-scale out_proj so attention starts very weak but can learn.
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.01)
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
