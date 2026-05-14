@@ -47,6 +47,7 @@ class HelixConfig(PretrainedConfig):
         n_heads: int = 4,
         k_proj_dim: int = 32,
         dropout: float = 0.05,
+        attn_dropout: float = 0.1,  # Higher dropout specifically for attention nodes
 
         # --- Linear Attention ---
         linear_feature_dim: int = 64,

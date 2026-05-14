@@ -38,7 +38,8 @@ class LinearAttnNode(HeteroNode):
     Causal linear attention node using feature maps.
     O(n) in sequence length during training via prefix sums.
     """
-    def __init__(self, d_model: int, n_heads: int = 4, feature_dim: int = 64, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int = 4, feature_dim: int = 64, dropout: float = 0.0,
+                 attn_dropout: float = 0.0):
         super().__init__(d_model)
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -52,6 +53,7 @@ class LinearAttnNode(HeteroNode):
         self.q_feat = nn.Linear(self.head_dim, feature_dim, bias=False)
         self.k_feat = nn.Linear(self.head_dim, feature_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
 
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
@@ -90,13 +92,14 @@ class LinearAttnNode(HeteroNode):
         # --------------------------------------------------------------
 
         out = out.transpose(1, 2).reshape(B, T, D)
-        out = self.dropout(self.out_proj(out))
+        out = self.attn_dropout(self.out_proj(out))
         return out, None
 
 
 class FullAttnNode(HeteroNode):
     """Standard causal softmax attention with multi-head support and optional RoPE."""
-    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True):
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True,
+                 attn_dropout: float = 0.0):
         super().__init__(d_model)
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -108,7 +111,7 @@ class FullAttnNode(HeteroNode):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.attn_dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
         nn.init.xavier_uniform_(self.q_proj.weight)

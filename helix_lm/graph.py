@@ -76,9 +76,11 @@ class HelixGraph(nn.Module):
 
         # Merge layers for multi-predecessor non-gate nodes
         self.merges = nn.ModuleDict()
+        self.merge_norms = nn.ModuleDict()
         for name, preds in self.graph.items():
             if len(preds) > 1 and self.node_meta[name][2] != "gate":
                 self.merges[name] = nn.Linear(len(preds) * cfg.d_model, cfg.d_model)
+                self.merge_norms[name] = RMSNorm(cfg.d_model)
 
         self.order = self._topsort()
         self.root_nodes = [n for n in names if len(self.graph[n]) == 0 or self.node_meta[n][0] == 0]
@@ -110,15 +112,18 @@ class HelixGraph(nn.Module):
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
 
+            attn_drop = getattr(cfg, 'attn_dropout', cfg.dropout)
             if use_full_attn:
                 column.append(("full_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
+                    "attn_dropout": attn_drop,
                 }))
             else:
                 column.append(("linear_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout,
+                    "attn_dropout": attn_drop,
                 }))
 
             column.append(("swiglu", {
@@ -231,6 +236,8 @@ class HelixGraph(nn.Module):
                 merged = x  # Root node with no predecessors
             else:
                 merged = self.merges[name](torch.cat(feats, dim=-1))
+                if name in self.merge_norms:
+                    merged = self.merge_norms[name](merged)
 
             node = self.nodes[name]
             if isinstance(node, (SSMNode, Mamba2Node, TitansMemoryNode)):
