@@ -55,13 +55,20 @@ class LinearAttnNode(HeteroNode):
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
 
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight)
+        self._reset_parameters()
 
     def _feature_map(self, x: torch.Tensor) -> torch.Tensor:
         return F.elu(x) + 1.0
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        # Zero-init out_proj so attention starts as identity passthrough (via residual).
+        # Prevents untrained random attention from drowning the FFN signal during CCA warmup.
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
@@ -114,10 +121,16 @@ class FullAttnNode(HeteroNode):
         self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
+        self._reset_parameters()
+
+    def _reset_parameters(self):
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight)
+        # Zero-init out_proj so attention starts as identity passthrough (via residual).
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
