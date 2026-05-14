@@ -89,6 +89,15 @@ model = HelixForCausalLM(cfg)
 params = model.count_parameters()["total"]
 print(f"Params: {params:,}")
 
+# ── torch.compile (validated in compile ablation) ─────────────────────────
+if torch.cuda.is_available():
+    print("\nEnabling torch.compile for speedup...")
+    try:
+        model = torch.compile(model, mode="default")
+        print("✅ torch.compile enabled.")
+    except Exception as e:
+        print(f"⚠ torch.compile failed: {e}. Continuing eager mode.")
+
 # ── DataLoaders ──────────────────────────────────────────────────────────
 train_loader = create_document_loader(
     train_texts, tok, seq_len=args.seq_len, batch_size=args.batch_size,
