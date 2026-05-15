@@ -67,7 +67,12 @@ def format_time(seconds: float) -> str:
 
 
 class Trainer:
-    """Trainer for HelixLM with gradient accumulation, AMP, and progress bars."""
+    """Trainer for HelixLM with gradient accumulation, AMP, and progress bars.
+
+    Supports custom optimizers and multi-optimizer setups (e.g. Muon + AdamW)
+    via the `optimizer` parameter. When multiple optimizers are provided,
+    scheduler, gradient clipping, and stepping are handled automatically.
+    """
 
     def __init__(
         self,
@@ -85,6 +90,7 @@ class Trainer:
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
+        optimizer: Optional[Any] = None,
     ):
         """
         Initialize Trainer.
@@ -104,6 +110,9 @@ class Trainer:
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
             verbose: Whether to show tqdm progress bars and print logs.
+            optimizer: Custom optimizer (single torch.optim.Optimizer, list of optimizers,
+                      or an object with step()/zero_grad()/param_groups interface).
+                      If None, defaults to AdamW.
         """
         self.model = model
         self.cfg = cfg
@@ -161,13 +170,17 @@ class Trainer:
                 lazy=True,
             )
 
-        # AdamW with standard betas (0.9, 0.999)
-        self.optimizer = AdamW(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-            betas=(0.9, 0.999),
-        )
+        # Optimizer: use custom if provided, else default AdamW
+        if optimizer is not None:
+            self.optimizer = optimizer
+        else:
+            # AdamW with standard betas (0.9, 0.999)
+            self.optimizer = AdamW(
+                model.parameters(),
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+                betas=(0.9, 0.999),
+            )
 
         # Scheduler steps count optimizer steps, not raw batches
         # DEFERRED: avoid len() on lazy datasets to prevent eager chunking at init time.
@@ -216,6 +229,36 @@ class Trainer:
                 stacklevel=2,
             )
 
+    def _zero_grad(self):
+        """Zero gradients for single or multiple optimizers."""
+        if isinstance(self.optimizer, (list, tuple)):
+            for opt in self.optimizer:
+                opt.zero_grad()
+        else:
+            self.optimizer.zero_grad()
+
+    def _optimizer_step(self):
+        """Step single or multiple optimizers."""
+        if isinstance(self.optimizer, (list, tuple)):
+            for opt in self.optimizer:
+                opt.step()
+        else:
+            self.optimizer.step()
+
+    def _get_scheduler_lr(self):
+        """Get current learning rate from scheduler (first optimizer)."""
+        if self.scheduler is None:
+            return self.cfg.lr
+        try:
+            return self.scheduler.get_last_lr()[0]
+        except (AttributeError, RuntimeError):
+            return self.cfg.lr
+
+    def _scheduler_step(self):
+        """Step scheduler if available."""
+        if self.scheduler is not None:
+            self.scheduler.step()
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch with gradient accumulation and progress bar."""
         self.model.train()
@@ -226,7 +269,7 @@ class Trainer:
         epoch_start = time.time()
         tokens_seen = 0
 
-        self.optimizer.zero_grad()
+        self._zero_grad()
 
         # Lazily initialize scheduler now that we know real loader length.
         # This avoids forcing DocumentAwareDataset(lazy=True) to chunk all
@@ -236,8 +279,12 @@ class Trainer:
                 len(self.train_loader) / self.grad_accum_steps
             )
             total_optimizer_steps = steps_per_epoch * self.cfg.epochs
+            # Use first optimizer for scheduler if multi-optimizer
+            scheduler_target = self.optimizer
+            if isinstance(self.optimizer, (list, tuple)):
+                scheduler_target = self.optimizer[0]
             self.scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
+                scheduler_target,
                 num_warmup_steps=self._scheduler_warmup,
                 num_training_steps=total_optimizer_steps,
                 num_cycles=self._scheduler_cycles,
@@ -319,26 +366,32 @@ class Trainer:
             is_last = (batch_idx + 1) == len(self.train_loader)
             if accum_count >= self.grad_accum_steps or is_last:
                 if self.use_amp and self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
+                    # Use first optimizer for scaler unscale if multi-optimizer
+                    unscale_target = self.optimizer[0] if isinstance(self.optimizer, (list, tuple)) else self.optimizer
+                    self.scaler.unscale_(unscale_target)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.cfg.grad_clip
                     )
-                    self.scaler.step(self.optimizer)
+                    self.scaler.step(unscale_target)
+                    # Step remaining optimizers without scaler
+                    if isinstance(self.optimizer, (list, tuple)):
+                        for opt in self.optimizer[1:]:
+                            self.scaler.step(opt)
                     self.scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.cfg.grad_clip
                     )
-                    self.optimizer.step()
+                    self._optimizer_step()
 
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                self._scheduler_step()
+                self._zero_grad()
                 accum_count = 0
                 self.global_step += 1
 
             # Live progress bar update
             avg = total_loss / max(raw_count, 1)
-            lr = self.scheduler.get_last_lr()[0]
+            lr = self._get_scheduler_lr()
             elapsed = time.time() - epoch_start
             tok_per_sec = tokens_seen / max(elapsed, 1e-6)
             pbar.set_postfix({

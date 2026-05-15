@@ -15,6 +15,11 @@ from .dataset import (
     HelixDataset, HelixDatasetFromTokens, HelixHFDataset,
     DocumentAwareDataset, create_helix_dataloader, create_document_loader,
 )
+from .optim_utils import (
+    build_hybrid_muon_adamw,
+    split_params_by_dimension,
+    count_optimizer_params,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -29,4 +34,7 @@ __all__ = [
     "DocumentAwareDataset",
     "create_helix_dataloader",
     "create_document_loader",
+    "build_hybrid_muon_adamw",
+    "split_params_by_dimension",
+    "count_optimizer_params",
 ]
