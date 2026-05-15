@@ -103,8 +103,8 @@ params = model.count_parameters()["total"]
 print(f"Params: {params:,}")
 
 # ── torch.compile DISABLED ─────────────────────────────────────────────
-# torch.compile causes InductorError with heterogeneous graph.
-print("\n⚠ torch.compile DISABLED — eager mode for graph stability.")
+# torch.compile causes OOM on L4 with FP32 + heterogeneous graph.
+print("\n⚠ torch.compile DISABLED — eager mode for memory safety.")
 
 # ── DataLoaders ──────────────────────────────────────────────────────────
 train_loader = create_document_loader(
