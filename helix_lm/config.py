@@ -140,7 +140,7 @@ class HelixConfig(PretrainedConfig):
         cca_min_scale: float = 0.05,  # Minimum attention contribution (prevents FFN-only collapse)
 
         # --- Misc ---
-        tie_word_embeddings: bool = True,
+        tie_word_embeddings: bool = False,  # Disabled: HelixLM handles embeddings separately
         **kwargs,
     ):
         # --- HF PretrainedConfig expects these ---
@@ -263,6 +263,12 @@ class HelixConfig(PretrainedConfig):
 
         # --- HF compat ---
         self.use_cache = kwargs.get("use_cache", True)
+        self.hidden_size = self.d_model  # HF-standard alias
+        self.num_attention_heads = self.n_heads
+        self.num_hidden_layers = self.n_columns
+        # HF save_pretrained auto-picks dtype; prevent mismatch warnings
+        if not hasattr(self, "torch_dtype"):
+            self.torch_dtype = str(self.dtype).replace("torch.", "")
 
         super().__init__(
             pad_token_id=self.pad_token_id,
