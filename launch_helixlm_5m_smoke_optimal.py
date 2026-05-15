@@ -66,7 +66,7 @@ N_LOOPS = 2
 N_COLUMNS = 3
 NODES_PER_COLUMN = (2, 3, 2)
 
-CCA_WARMUP_STEPS = 5000
+CCA_WARMUP_STEPS = 1000000  # Fully suppress attention for entire 5M run (>> total steps)
 CCA_RAMP_MODE = "quadratic"
 CCA_MIN_SCALE = 0.05
 
