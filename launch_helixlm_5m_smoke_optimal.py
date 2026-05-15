@@ -52,20 +52,21 @@ tok = HelixTokenizer("gpt2")
 vs = len(tok)
 print(f"Vocab={vs}")
 
-# ── Optimal Config (from regression fix ablations) ─────────────────────────
+# ── Config: small model for 5M tokens to avoid overfitting ─────────────────
+# 42M params on 5M tokens = severe overfitting. Use ~5M params instead.
 SEQ_LEN = 512
 BATCH_SIZE = 8
 EPOCHS = 3
-LR = 2e-3
-WD = 0.05
-DROPOUT = 0.05
-ATTN_DROPOUT = 0.15  # Higher attention-specific dropout
-D_MODEL = 384
-N_LOOPS = 1
-N_COLUMNS = 2
-NODES_PER_COLUMN = (2, 2)
+LR = 1e-3
+WD = 0.1
+DROPOUT = 0.1
+ATTN_DROPOUT = 0.2
+D_MODEL = 256
+N_LOOPS = 2
+N_COLUMNS = 3
+NODES_PER_COLUMN = (2, 3, 2)
 
-CCA_WARMUP_STEPS = 15000  # Well beyond 3 epochs (~7935 steps) — attention stays fully suppressed for 5M run
+CCA_WARMUP_STEPS = 5000
 CCA_RAMP_MODE = "quadratic"
 CCA_MIN_SCALE = 0.05
 
@@ -101,14 +102,9 @@ model = HelixForCausalLM(cfg)
 params = model.count_parameters()["total"]
 print(f"Params: {params:,}")
 
-# ── torch.compile (validated in compile ablation) ─────────────────────────
-if torch.cuda.is_available():
-    print("\nEnabling torch.compile for speedup...")
-    try:
-        model = torch.compile(model, mode="default")
-        print("✅ torch.compile enabled.")
-    except Exception as e:
-        print(f"⚠ torch.compile failed: {e}. Continuing eager mode.")
+# ── torch.compile DISABLED ─────────────────────────────────────────────
+# torch.compile causes InductorError with heterogeneous graph.
+print("\n⚠ torch.compile DISABLED — eager mode for graph stability.")
 
 # ── DataLoaders ──────────────────────────────────────────────────────────
 train_loader = create_document_loader(
