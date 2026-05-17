@@ -4,3 +4,5 @@ __pycache__/
 checkpoints_*/
 checkpoints/
 ablation_*.json
+run_*.py
+diagnose_*.py
