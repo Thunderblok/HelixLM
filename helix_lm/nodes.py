@@ -134,8 +134,14 @@ class FullAttnNode(HeteroNode):
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # Causal mask
         causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(causal_mask, float('-inf'))
+        # Padding mask: prevent attending to padded positions
+        if attention_mask is not None:
+            # attention_mask: (B, T) with 0 for pad, 1 for real
+            pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+            scores = scores.masked_fill(pad_mask.expand(-1, self.n_heads, T, -1), float('-inf'))
 
         # Apply attention mask: prevent attending to pad positions
         if attention_mask is not None:

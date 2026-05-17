@@ -13,10 +13,21 @@ from .nodes import RMSNorm
 
 
 class LTIInjection(nn.Module):
-    """Linear Time-Invariant state update for stable recurrent loops."""
-    def __init__(self, dim: int):
+    """Linear Time-Invariant state update for stable recurrent loops.
+
+    CRITICAL FIX: Initialize with higher A (closer to 1.0) so gradients
+    can flow through long sequences. A starts at ~0.9 instead of 1/e≈0.368.
+    This allows the model to learn to reduce A if needed, rather than
+    being stuck with severe vanishing from the start.
+    """
+    def __init__(self, dim: int, init_A: float = 0.9):
         super().__init__()
-        self.log_A = nn.Parameter(torch.zeros(dim))
+        # Initialize log_A so that A ≈ init_A (default 0.9 for long sequences)
+        # A = exp(-exp(log_dt + log_A))
+        # For A=0.9: log(-log(0.9)) ≈ -0.834
+        # We set log_dt ≈ 0, so log_A ≈ -0.834
+        log_A_init = math.log(-math.log(init_A)) if 0 < init_A < 1 else 0.0
+        self.log_A = nn.Parameter(torch.full((dim,), log_A_init))
         self.log_dt = nn.Parameter(torch.zeros(1))
         self.B = nn.Parameter(torch.ones(dim) * 0.1)
 
