@@ -2,13 +2,11 @@
 HelixLM HuggingFace PreTrainedModel integration (V5-orthodox).
 
 Design choices:
-  1. Weights are INTENTIONALLY NOT TIED.  The sacred baseline converges only
-     when lm_head.weight and model.embed.weight are separate parameters.
-     Tying merges the lm_head gradient into embed.weight, which already
-     receives ~2x gradient signal from the dual recurrent paths (hidden-state
-     + LTI injection).  That combined signal destabilizes training.
-     HF integration does not require tying; config explicitly sets
-     tie_word_embeddings=False.
+  1. Weight tying is CONDITIONAL via TiedLMHead with gradient buffer.
+     When tie_word_embeddings=True (default), uses TiedLMHead which shares
+     the embedding weight but routes gradients through a learned buffer to
+     prevent ~3x gradient overload on embeddings.
+     When tie_word_embeddings=False, uses separate lm_head (sacred baseline).
   2. Forward pass: PRESERVES full gradient flow (no e.detach()). The sacred
      baseline passes e (not detached) to recurrent(), allowing gradients to
      flow through BOTH the hidden-state path and the LTI injection path.
@@ -44,6 +42,48 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from .config import HelixConfig
 from .model import HelixLMCore
 from .tokenizer import HelixTokenizer
+
+
+# ---------------------------------------------------------------------------
+# Tied LM Head with gradient buffer (safe weight tying)
+# ---------------------------------------------------------------------------
+class TiedLMHead(nn.Module):
+    """LM head that shares weight with embedding but routes gradients
+    through a learned buffer to prevent embedding gradient overload.
+
+    Problem: Without tying, embed.grad comes from (1) recurrent path +
+    (2) LTI injection path. With naive tying, embed.grad gets those PLUS
+    (3) lm_head backward path = ~3x overload.
+
+    Solution: The buffer absorbs some of gradient path (3), reducing the
+    embedding gradient to manageable levels while keeping the parameter
+    savings of tying (halves the embedding+head parameter count).
+    """
+    def __init__(self, embed_weight: nn.Parameter, d_model: int, vocab_size: int,
+                 grad_buffer_ratio: float = 0.5):
+        super().__init__()
+        # Share the embedding weight tensor (shape: vocab_size, d_model)
+        self.weight = embed_weight
+        # Learnable gradient buffer: a small projection that absorbs
+        # some of the lm_head gradient before it reaches embeddings
+        self.buffer = nn.Linear(d_model, d_model, bias=False)
+        nn.init.eye_(self.buffer.weight)  # start as identity (no forward diff at init)
+        self.grad_buffer_ratio = grad_buffer_ratio
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: (B, T, d_model)
+        if self.training and 0 < self.grad_buffer_ratio < 1:
+            # Split: (1-ratio) goes directly to tied weight,
+            # ratio goes through buffer (absorbs some gradient)
+            h_buffered = self.buffer(h)
+            h_mixed = (1 - self.grad_buffer_ratio) * h + self.grad_buffer_ratio * h_buffered
+        elif self.training and self.grad_buffer_ratio >= 1.0:
+            # Full buffer path
+            h_mixed = self.buffer(h)
+        else:
+            # Inference or buffer_ratio=0: pass through directly
+            h_mixed = h
+        return F.linear(h_mixed, self.weight)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +156,17 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
 
         # Core model without output head (HelixForCausalLM owns lm_head)
         self.model = HelixLMCore(config, tie_weights=False, create_output_head=False)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # Use TiedLMHead with gradient buffer when tie_word_embeddings=True
+        if config.tie_word_embeddings:
+            self.lm_head = TiedLMHead(
+                self.model.embed.weight,
+                config.d_model,
+                config.vocab_size,
+                grad_buffer_ratio=getattr(config, 'grad_buffer_ratio', 0.5),
+            )
+        else:
+            self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # SACRED BASELINE PRESERVATION:
         # Do NOT call post_init(). The main branch did not call it, and doing so

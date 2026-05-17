@@ -140,7 +140,8 @@ class HelixConfig(PretrainedConfig):
         cca_min_scale: float = 0.05,  # Minimum attention contribution (prevents FFN-only collapse)
 
         # --- Misc ---
-        tie_word_embeddings: bool = False,  # Disabled: HelixLM handles embeddings separately
+        tie_word_embeddings: bool = True,
+        grad_buffer_ratio: float = 0.5,  # Gradient buffer for safe weight tying (0=standard tying, 1=max buffer)
         **kwargs,
     ):
         # --- HF PretrainedConfig expects these ---
@@ -149,6 +150,7 @@ class HelixConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id or 0
         self.bos_token_id = bos_token_id or 0
         self.tie_word_embeddings = tie_word_embeddings
+        self.grad_buffer_ratio = grad_buffer_ratio
 
         # --- Core dims ---
         self.seq_len = seq_len
@@ -335,6 +337,39 @@ class HelixConfig(PretrainedConfig):
         defaults = dict(
             d_model=256, n_columns=3, nodes_per_column=(2, 3, 2),
             n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
+    def micro(cls, **kwargs):
+        """~10M parameters with tied embeddings -- rapid iteration / ablations."""
+        defaults = dict(
+            d_model=192, n_columns=2, nodes_per_column=(3, 3),
+            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+            use_titans_memory=False, ffn_expansion=2.0,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
+    def mini(cls, **kwargs):
+        """~13M parameters with tied embeddings -- small-scale pretraining target."""
+        defaults = dict(
+            d_model=224, n_columns=2, nodes_per_column=(3, 3),
+            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+            use_titans_memory=False, ffn_expansion=2.0,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
+    def small_v2(cls, **kwargs):
+        """~15M parameters with tied embeddings -- Gate 2b target."""
+        defaults = dict(
+            d_model=256, n_columns=2, nodes_per_column=(3, 3),
+            n_heads=4, n_loops=1, seq_len=512, use_ssm=False,
+            use_titans_memory=False, ffn_expansion=2.0,
         )
         defaults.update(kwargs)
         return cls(**defaults)
