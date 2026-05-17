@@ -211,7 +211,7 @@ class DocumentAwareDataset(Dataset):
             raise ValueError(f"stride must be in [1, seq_len], got {self.stride}")
 
         if min_tail_len is None:
-            min_tail_len = seq_len // 4
+            min_tail_len = 1  # Keep all documents; was seq_len//4 which dropped most docs at 512
         self.min_tail_len = min_tail_len
         self.add_eos = add_eos
 
@@ -449,7 +449,7 @@ class HelixHFDataset(Dataset):
 
         self._doc_dataset = DocumentAwareDataset(
             self._texts, tokenizer, seq_len,
-            min_tail_len=seq_len // 4, add_eos=True, lazy=lazy, stride=stride,
+            min_tail_len=1, add_eos=True, lazy=lazy, stride=stride,
         )
 
     def __len__(self) -> int:

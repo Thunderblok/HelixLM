@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from .config import HelixConfig
 from .nodes import (
     HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode
+    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode, RMSNorm
 )
 
 
@@ -76,14 +76,30 @@ class HelixGraph(nn.Module):
 
         # Merge layers for multi-predecessor non-gate nodes
         self.merges = nn.ModuleDict()
+        self.merge_norms = nn.ModuleDict()
         for name, preds in self.graph.items():
             if len(preds) > 1 and self.node_meta[name][2] != "gate":
                 self.merges[name] = nn.Linear(len(preds) * cfg.d_model, cfg.d_model)
+                self.merge_norms[name] = RMSNorm(cfg.d_model)
 
         self.order = self._topsort()
         self.root_nodes = [n for n in names if len(self.graph[n]) == 0 or self.node_meta[n][0] == 0]
         last_col = max(v[0] for v in self.node_meta.values())
         self.sink_nodes = [k for k, v in self.node_meta.items() if v[0] == last_col]
+
+        # Native CCA (Curriculum Component Activation) gates for attention nodes
+        self.use_cca = getattr(cfg, 'use_cca', False)
+        self.cca_warmup_steps = getattr(cfg, 'cca_warmup_steps', 5000)
+        self.cca_ramp_mode = getattr(cfg, 'cca_ramp_mode', 'quadratic')
+        self.cca_min_scale = getattr(cfg, 'cca_min_scale', 0.05)
+        if self.use_cca:
+            self.attention_gates = nn.ParameterDict()
+            for name, (ci, idx, ntype) in self.node_meta.items():
+                if ntype in ("linear_attn", "full_attn"):
+                    # FIXED: init +2.0 so gate can reach full attention
+                    self.attention_gates[name] = nn.Parameter(torch.tensor(2.0))
+            self._cca_step = 0
+            self._cca_total_steps = self.cca_warmup_steps
 
     def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
         cfg = self.cfg
@@ -96,15 +112,18 @@ class HelixGraph(nn.Module):
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
 
+            attn_drop = getattr(cfg, 'attn_dropout', cfg.dropout)
             if use_full_attn:
                 column.append(("full_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
+                    "attn_dropout": attn_drop,
                 }))
             else:
                 column.append(("linear_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout,
+                    "attn_dropout": attn_drop,
                 }))
 
             column.append(("swiglu", {
@@ -187,7 +206,7 @@ class HelixGraph(nn.Module):
             raise ValueError(f"Cycle detected! Remaining: {remaining}")
         return out
 
-    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None, attention_mask: Optional[torch.Tensor] = None, cca_step: Optional[int] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if states is None:
             states = {}
         new_states = {}
@@ -217,15 +236,35 @@ class HelixGraph(nn.Module):
                 merged = x  # Root node with no predecessors
             else:
                 merged = self.merges[name](torch.cat(feats, dim=-1))
+                if name in self.merge_norms:
+                    merged = self.merge_norms[name](merged)
 
             node = self.nodes[name]
             if isinstance(node, (SSMNode, Mamba2Node, TitansMemoryNode)):
-                out, s = node(merged, state=states.get(name))
+                out, s = node(merged, state=states.get(name), attention_mask=attention_mask)
                 new_states[name] = s
             elif isinstance(node, GateNode):
-                out, _ = node(merged)
+                out, _ = node(merged, attention_mask=attention_mask)
             else:
-                out, _ = node(merged)
+                out, _ = node(merged, attention_mask=attention_mask)
+
+            # CCA: Curriculum Component Activation for attention nodes
+            if self.use_cca and ntype in ("linear_attn", "full_attn") and name in self.attention_gates:
+                total = max(1, self._cca_total_steps)
+                step = cca_step if cca_step is not None else self._cca_step
+                progress = min(1.0, step / total)
+                if self.cca_ramp_mode == 'quadratic':
+                    scale = progress ** 2
+                elif self.cca_ramp_mode == 'cubic_ease':
+                    scale = progress ** 2 * (3 - 2 * progress)  # Smoothstep
+                else:
+                    scale = progress
+                # Apply minimum scale: attention always contributes at least cca_min_scale
+                scale = self.cca_min_scale + (1.0 - self.cca_min_scale) * scale
+                learned_gate = torch.sigmoid(self.attention_gates[name])
+                curriculum_gate = learned_gate * scale
+                out = curriculum_gate * out + (1 - curriculum_gate) * merged
+
             cache[name] = out
 
         if len(self.sink_nodes) == 1:

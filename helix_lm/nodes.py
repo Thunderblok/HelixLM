@@ -29,7 +29,7 @@ class HeteroNode(nn.Module):
         self.d_model = d_model
         self.norm = RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         raise NotImplementedError
 
 
@@ -38,7 +38,8 @@ class LinearAttnNode(HeteroNode):
     Causal linear attention node using feature maps.
     O(n) in sequence length during training via prefix sums.
     """
-    def __init__(self, d_model: int, n_heads: int = 4, feature_dim: int = 64, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int = 4, feature_dim: int = 64, dropout: float = 0.0,
+                 attn_dropout: float = 0.0):
         super().__init__(d_model)
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -52,16 +53,20 @@ class LinearAttnNode(HeteroNode):
         self.q_feat = nn.Linear(self.head_dim, feature_dim, bias=False)
         self.k_feat = nn.Linear(self.head_dim, feature_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
 
+        self._reset_parameters()
+
+    def _feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        return F.elu(x) + 1.0
+
+    def _reset_parameters(self):
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
 
-    def _feature_map(self, x: torch.Tensor) -> torch.Tensor:
-        return F.elu(x) + 1.0
-
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
         x = self.norm(x)
 
@@ -75,6 +80,12 @@ class LinearAttnNode(HeteroNode):
         k_fp32 = self._feature_map(self.k_feat(k.float()))
         v_fp32 = v.float()
 
+        # Apply attention mask: zero out k,v contributions from pad positions
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).unsqueeze(-1).float()  # (B, 1, T, 1)
+            k_fp32 = k_fp32 * mask
+            v_fp32 = v_fp32 * mask
+
         kv = torch.einsum('bhTf,bhTd->bhTfd', k_fp32, v_fp32)
         kv_cum = torch.cumsum(kv, dim=2)
         z = torch.cumsum(k_fp32, dim=2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -84,13 +95,14 @@ class LinearAttnNode(HeteroNode):
         # --------------------------------------------------------------
 
         out = out.transpose(1, 2).reshape(B, T, D)
-        out = self.dropout(self.out_proj(out))
+        out = self.attn_dropout(self.out_proj(out))
         return out, None
 
 
 class FullAttnNode(HeteroNode):
     """Standard causal softmax attention with multi-head support and optional RoPE."""
-    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True):
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True,
+                 attn_dropout: float = 0.0):
         super().__init__(d_model)
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -102,15 +114,18 @@ class FullAttnNode(HeteroNode):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.attn_dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
+        self._reset_parameters()
+
+    def _reset_parameters(self):
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
         x = self.norm(x)
 
@@ -119,8 +134,15 @@ class FullAttnNode(HeteroNode):
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # Causal mask
         causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(causal_mask, float('-inf'))
+        # Padding mask: prevent attending to padded positions
+        if attention_mask is not None:
+            # attention_mask: (B, T) with 0 for pad, 1 for real
+            # Expand to (B, n_heads, T, T) to mask key positions for all queries
+            pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(pad_mask.expand(-1, self.n_heads, T, -1), float('-inf'))
 
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -141,7 +163,7 @@ class DenseNode(HeteroNode):
         nn.init.xavier_uniform_(self.w1.weight)
         nn.init.xavier_uniform_(self.w2.weight)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         x = self.norm(x)
         h = F.gelu(self.w1(x))
         out = self.w2(h)
@@ -161,7 +183,7 @@ class SwiGLUNode(HeteroNode):
         nn.init.xavier_uniform_(self.up.weight)
         nn.init.xavier_uniform_(self.down.weight)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         x = self.norm(x)
         h = F.silu(self.gate(x)) * self.up(x)
         out = self.down(h)
@@ -196,7 +218,7 @@ class SSMNode(HeteroNode):
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log.data = torch.log(A)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         B, T, D = x.shape
         x = self.norm(x)
 
@@ -245,7 +267,7 @@ class Mamba2Node(HeteroNode):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         x = self.norm(x)
         out, new_state = self.mamba(x, state=state)
         return self.dropout(out), new_state
@@ -261,7 +283,7 @@ class GateNode(HeteroNode):
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.out_proj.weight)
 
-    def forward(self, x_list, state: Any = None, cache: Any = None) -> Tuple[torch.Tensor, Any]:
+    def forward(self, x_list, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         if not isinstance(x_list, list):
             raise TypeError("GateNode expects a list of predecessor tensors")
         n = len(x_list)
@@ -334,6 +356,8 @@ class TitansMemoryNode(HeteroNode):
         x: torch.Tensor,
         state: Any = None,
         cache: Any = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Args:

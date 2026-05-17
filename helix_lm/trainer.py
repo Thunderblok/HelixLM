@@ -256,15 +256,33 @@ class Trainer:
             labels = batch["labels"].to(self.device)
             tokens_seen += input_ids.numel()
 
+            # Get attention_mask from batch
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            # Build cca_step from global optimizer step (not batch index)
+            cca_step = None
+            if getattr(self.cfg, "use_cca", False):
+                cca_step = self.global_step
+
             # Forward pass
             if self.use_amp and self.scaler is not None:
                 with torch.amp.autocast(
                     device_type="cuda", dtype=torch.float16
                 ):
-                    outputs = self.model(input_ids, labels=labels)
+                    outputs = self.model(
+                        input_ids, labels=labels,
+                        attention_mask=attention_mask,
+                        cca_step=cca_step,
+                    )
                     loss = outputs["loss"]
             else:
-                outputs = self.model(input_ids, labels=labels)
+                outputs = self.model(
+                    input_ids, labels=labels,
+                    attention_mask=attention_mask,
+                    cca_step=cca_step,
+                )
                 loss = outputs["loss"]
 
             # Skip NaN/Inf losses (numerical instability)
@@ -356,14 +374,17 @@ class Trainer:
         for batch in pbar:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
 
             if self.use_amp and self.scaler is not None:
                 with torch.amp.autocast(
                     device_type="cuda", dtype=torch.float16
                 ):
-                    outputs = self.model(input_ids, labels=labels)
+                    outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
             else:
-                outputs = self.model(input_ids, labels=labels)
+                outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
 
             loss = outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):
