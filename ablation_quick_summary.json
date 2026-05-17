@@ -1,0 +1,28 @@
+{
+  "tied": {
+    "name": "model.recurrent.graph.nodes.n4.gate.weight",
+    "params": 508678,
+    "final_loss": 2.964286944270134,
+    "final_ppl": 19.38087866662788,
+    "elapsed": 28.936081409454346,
+    "alpha": 3.8004716045999114,
+    "log_norm": 1.0112315024782381,
+    "num_spikes": NaN,
+    "embed_grad": 1.117107629776001,
+    "head_grad": 0.10026510059833527,
+    "head_embed_ratio": 0.08975419908146194
+  },
+  "untied": {
+    "name": "model.recurrent.graph.nodes.n3.out_proj.weight",
+    "params": 502150,
+    "final_loss": 2.5215840846300126,
+    "final_ppl": 12.448300214450773,
+    "elapsed": 28.959893226623535,
+    "alpha": 3.8504173982978895,
+    "log_norm": 0.971589128678372,
+    "num_spikes": NaN,
+    "embed_grad": 0.5109609961509705,
+    "head_grad": 0.4399373233318329,
+    "head_embed_ratio": 0.8609998153398138
+  }
+}
