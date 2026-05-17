@@ -23,7 +23,7 @@ from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
 EPOCHS = 25
 MAX_SEQ_LEN = 96
 
-NUM_SAMPLES = 1_000
+NUM_SAMPLES = 7_000
 VAL_SPLIT = 0.2
 
 EXAMPLE_PROMPTS = [
