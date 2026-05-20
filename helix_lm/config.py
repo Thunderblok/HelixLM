@@ -142,7 +142,7 @@ class HelixConfig(PretrainedConfig):
 
         # --- Misc ---
         tie_word_embeddings: bool = True,
-        grad_buffer_ratio: float = 0.5,  # Gradient buffer for safe weight tying (0=standard tying, 1=max buffer)
+        grad_buffer_ratio: float = None,  # Gradient buffer for safe weight tying (0=standard tying, 1=max buffer)
         **kwargs,
     ):
         # --- HF PretrainedConfig expects these ---
@@ -152,6 +152,8 @@ class HelixConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id or 0
         self.tie_word_embeddings = tie_word_embeddings
         self.grad_buffer_ratio = grad_buffer_ratio
+        if self.grad_buffer_ratio is None:
+            self.grad_buffer_ratio = 1.0 / math.e
 
         # --- Core dims ---
         self.seq_len = seq_len
