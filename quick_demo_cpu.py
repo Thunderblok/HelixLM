@@ -50,7 +50,7 @@ def main():
     # ------------------------------------------------------------------
 
     # Config
-    cfg = HelixConfig.tiny(
+    cfg = HelixConfig.small_v2((
         vocab_size=VOCABULARY_SIZE,
         seq_len=MAX_SEQ_LEN,
         tokenizer_name="gpt2",
