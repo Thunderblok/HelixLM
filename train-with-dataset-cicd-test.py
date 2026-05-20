@@ -82,6 +82,7 @@ def build_cfg(vocab_size):
         epochs=N_EPOCHS,
         warmup_steps=50,
         grad_clip=1.0,
+        grad_buffer_ratio=0.0
     )
 
 
