@@ -4,6 +4,8 @@ HelixLM Configuration with HuggingFace PretrainedConfig integration.
 Scales from tiny smoke-test models (128 d_model) up to multi-billion
 parameter production models via a single dataclass.
 """
+
+from math import e
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
 import torch
@@ -153,7 +155,7 @@ class HelixConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.grad_buffer_ratio = grad_buffer_ratio
         if self.grad_buffer_ratio is None:
-            self.grad_buffer_ratio = 1.0 / math.e
+            self.grad_buffer_ratio = 1.0 / e
 
         # --- Core dims ---
         self.seq_len = seq_len
