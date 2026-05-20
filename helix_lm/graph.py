@@ -24,10 +24,20 @@ class HelixGraph(nn.Module):
     - Topology: Biological-style neural columns with vertical and lateral connections
     - Aggregation: learned per-node merge (Linear bottleneck) or Gate
     - Stateful nodes (SSM/Mamba-2) expose state read/write across loops
+
+    RNG safety: global torch and numpy RNG states are saved before graph
+    construction and restored afterward.  Two HelixGraph instances built with
+    the same seed at different times will produce identical topologies.
     """
     def __init__(self, cfg: HelixConfig, seed: int = 42):
         super().__init__()
         self.cfg = cfg
+
+        # ── save global RNG state ──────────────────────────────────
+        _torch_rng = torch.get_rng_state()
+        _numpy_rng = np.random.get_state()
+        # ────────────────────────────────────────────────────────────
+
         rng = np.random.RandomState(seed)
         torch.manual_seed(seed)
 
@@ -96,12 +106,17 @@ class HelixGraph(nn.Module):
             self.attention_gates = nn.ParameterDict()
             for name, (ci, idx, ntype) in self.node_meta.items():
                 if ntype in ("linear_attn", "full_attn"):
-                    # FIXED: init +2.0 so gate can reach full attention
                     self.attention_gates[name] = nn.Parameter(torch.tensor(2.0))
             self._cca_step = 0
             self._cca_total_steps = self.cca_warmup_steps
 
+        # ── restore global RNG state ───────────────────────────────
+        torch.set_rng_state(_torch_rng)
+        np.random.set_state(_numpy_rng)
+        # ────────────────────────────────────────────────────────────
+
     def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
+        # ... (unchanged — omitted for brevity but keep the existing implementation)
         cfg = self.cfg
         spec = []
         for ci in range(cfg.n_columns):
@@ -132,7 +147,6 @@ class HelixGraph(nn.Module):
 
             if cfg.use_ssm:
                 if hasattr(cfg, 'ssm_d_state') and cfg.ssm_d_state >= 64:
-                    # Use Mamba-2 for larger state dimensions
                     column.append(("mamba2", {
                         "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand,
@@ -147,7 +161,6 @@ class HelixGraph(nn.Module):
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand, "dropout": cfg.dropout,
                     }))
 
-            # Optional Titans Neural Memory — guaranteed at least once if enabled
             if cfg.use_titans_memory:
                 if cfg.titans_always_select and ci == 0:
                     column.append(("titans", {
@@ -214,7 +227,6 @@ class HelixGraph(nn.Module):
 
         for name in self.nodes:
             if not self.graph[name]:
-                # Stateful nodes must run forward to produce/update their state
                 if not isinstance(self.nodes[name], (SSMNode, Mamba2Node, TitansMemoryNode)):
                     cache[name] = x
 
@@ -229,11 +241,11 @@ class HelixGraph(nn.Module):
             _, _, ntype = self.node_meta[name]
 
             if ntype == "gate":
-                merged = feats if len(feats) > 0 else [x]  # GateNode always expects a list
+                merged = feats if len(feats) > 0 else [x]
             elif len(feats) == 1:
                 merged = feats[0]
             elif len(feats) == 0:
-                merged = x  # Root node with no predecessors
+                merged = x
             else:
                 merged = self.merges[name](torch.cat(feats, dim=-1))
                 if name in self.merge_norms:
@@ -248,7 +260,6 @@ class HelixGraph(nn.Module):
             else:
                 out, _ = node(merged, attention_mask=attention_mask)
 
-            # CCA: Curriculum Component Activation for attention nodes
             if self.use_cca and ntype in ("linear_attn", "full_attn") and name in self.attention_gates:
                 total = max(1, self._cca_total_steps)
                 step = cca_step if cca_step is not None else self._cca_step
@@ -256,10 +267,9 @@ class HelixGraph(nn.Module):
                 if self.cca_ramp_mode == 'quadratic':
                     scale = progress ** 2
                 elif self.cca_ramp_mode == 'cubic_ease':
-                    scale = progress ** 2 * (3 - 2 * progress)  # Smoothstep
+                    scale = progress ** 2 * (3 - 2 * progress)
                 else:
                     scale = progress
-                # Apply minimum scale: attention always contributes at least cca_min_scale
                 scale = self.cca_min_scale + (1.0 - self.cca_min_scale) * scale
                 learned_gate = torch.sigmoid(self.attention_gates[name])
                 curriculum_gate = learned_gate * scale
