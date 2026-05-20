@@ -96,6 +96,7 @@ class HelixConfig(PretrainedConfig):
 
         # --- Initialization ---
         initializer_range: float = 0.02,
+        lti_init_A: float = None,  # 1/e ≈ 0.368 default (set in recurrent.py)
 
         # --- Device ---
         device: str = "auto",

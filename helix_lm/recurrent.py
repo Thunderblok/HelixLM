@@ -15,17 +15,16 @@ from .nodes import RMSNorm
 class LTIInjection(nn.Module):
     """Linear Time-Invariant state update for stable recurrent loops.
 
-    CRITICAL FIX: Initialize with higher A (closer to 1.0) so gradients
-    can flow through long sequences. A starts at ~0.9 instead of 1/e≈0.368.
-    This allows the model to learn to reduce A if needed, rather than
-    being stuck with severe vanishing from the start.
+    CRITICAL FIX: init_A is now configurable via HelixConfig.lti_init_A.
+    Default is 1/e ≈ 0.368 (mathematically grounded for bounded recurrence).
+    Higher values (e.g., 0.9) were tested empirically and performed identically
+    on the micro preset, but 1/e remains the safer default per theory.
     """
-    def __init__(self, dim: int, init_A: float = 0.9):
+    def __init__(self, dim: int, init_A: float = None):
         super().__init__()
-        # Initialize log_A so that A ≈ init_A (default 0.9 for long sequences)
-        # A = exp(-exp(log_dt + log_A))
-        # For A=0.9: log(-log(0.9)) ≈ -0.834
-        # We set log_dt ≈ 0, so log_A ≈ -0.834
+        # Default: 1/e ≈ 0.368 (mathematically grounded for bounded recurrence)
+        if init_A is None:
+            init_A = 1.0 / math.e
         log_A_init = math.log(-math.log(init_A)) if 0 < init_A < 1 else 0.0
         self.log_A = nn.Parameter(torch.full((dim,), log_A_init))
         self.log_dt = nn.Parameter(torch.zeros(1))
@@ -72,7 +71,7 @@ class HelixRecurrentBlock(nn.Module):
         self.cfg = cfg
         self.graph = HelixGraph(cfg)
         self.norm = RMSNorm(cfg.d_model)
-        self.injection = LTIInjection(cfg.d_model)
+        self.injection = LTIInjection(cfg.d_model, init_A=getattr(cfg, 'lti_init_A', None))
         self.act = ACTHalting(cfg.d_model, cfg.act_threshold)
         self.loop_dim = cfg.loop_dim
 

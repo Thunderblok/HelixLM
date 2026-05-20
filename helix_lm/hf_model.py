@@ -72,16 +72,15 @@ class TiedLMHead(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         # h: (B, T, d_model)
-        if self.training and 0 < self.grad_buffer_ratio < 1:
-            # Split: (1-ratio) goes directly to tied weight,
-            # ratio goes through buffer (absorbs some gradient)
+        # P0 FIX: Buffer applied consistently in BOTH train and eval.
+        # Forward pass must NEVER depend on self.training.
+        if 0 < self.grad_buffer_ratio < 1:
             h_buffered = self.buffer(h)
             h_mixed = (1 - self.grad_buffer_ratio) * h + self.grad_buffer_ratio * h_buffered
-        elif self.training and self.grad_buffer_ratio >= 1.0:
-            # Full buffer path
+        elif self.grad_buffer_ratio >= 1.0:
             h_mixed = self.buffer(h)
         else:
-            # Inference or buffer_ratio=0: pass through directly
+            # buffer_ratio=0: pass through directly (standard tying)
             h_mixed = h
         return F.linear(h_mixed, self.weight)
 
@@ -266,9 +265,10 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         )
 
         # Output
+        # P2 FIX: Removed the CUDA-only h.clone() band-aid. The clone
+        # was hiding an in-place op bug (likely in RMSNorm). If in-place
+        # errors resurface, fix them at the source — not with conditional clones.
         h = self.model.out_norm(h)
-        if h.is_cuda:
-            h = h.clone()
         logits = self.lm_head(h)
 
         loss = None
