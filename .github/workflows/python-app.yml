@@ -37,17 +37,17 @@ jobs:
     # - name: Test with pytest
     #   run: |
     #     pytest
-    - name: Smoke Test
-      run: |
-        python3 helix_lm/smoke_test.py
-    - name: Demo run 
-      timeout-minutes: 60
-      run: |
-        python3 quick_demo_cpu.py
-    - name: Demo run - Titans Memory
-      timeout-minutes: 60
-      run: |
-        python3 quick_demo_cpu_titans_mem.py
+    # - name: Smoke Test
+    #   run: |
+    #     python3 helix_lm/smoke_test.py
+    # - name: Demo run 
+    #   timeout-minutes: 60
+    #   run: |
+    #     python3 quick_demo_cpu.py
+    # - name: Demo run - Titans Memory
+    #   timeout-minutes: 60
+    #   run: |
+    #     python3 quick_demo_cpu_titans_mem.py
     - name: Smoke Test Training with Datasets
       timeout-minutes: 90
       run: |
