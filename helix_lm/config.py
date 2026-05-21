@@ -376,7 +376,7 @@ class HelixConfig(PretrainedConfig):
         """~15M parameters with tied embeddings -- Gate 2b target."""
         defaults = dict(
             d_model=256, n_columns=2, nodes_per_column=(3, 3),
-            n_heads=4, n_loops=1, seq_len=512, use_ssm=False,
+            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
             use_titans_memory=False, ffn_expansion=2.0,
         )
         defaults.update(kwargs)
