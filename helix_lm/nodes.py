@@ -22,7 +22,8 @@ class RMSNorm(nn.Module):
         dtype = x.dtype
         x_f = x.float()
         norm = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x_f * norm * self.weight).to(dtype)
+        weight = self.weight.to(x_f.dtype)
+        return (x_f * norm * weight).to(dtype)
 
 
 class HeteroNode(nn.Module):

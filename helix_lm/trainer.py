@@ -271,8 +271,8 @@ class Trainer:
             if getattr(self.cfg, "use_cca", False):
                 cca_step = self.global_step
 
-            # Forward pass
-            if self.use_amp and self.scaler is not None:
+            # Forward pass — autocast whenever AMP is enabled (independent of scaler)
+            if self.use_amp:
                 with torch.amp.autocast(
                     device_type="cuda", dtype=self.amp_dtype
                 ):
@@ -310,8 +310,8 @@ class Trainer:
                     divisor = self.grad_accum_steps
                 loss = loss / divisor
 
-            # Backward pass
-            if self.use_amp and self.scaler is not None:
+            # Backward pass — scale only if scaler exists
+            if self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
@@ -323,7 +323,7 @@ class Trainer:
             # Optimizer step after accumulation
             is_last = (batch_idx + 1) == len(self.train_loader)
             if accum_count >= self.grad_accum_steps or is_last:
-                if self.use_amp and self.scaler is not None:
+                if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.cfg.grad_clip
@@ -383,7 +383,7 @@ class Trainer:
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self.device)
 
-            if self.use_amp and self.scaler is not None:
+            if self.use_amp:
                 with torch.amp.autocast(
                     device_type="cuda", dtype=self.amp_dtype
                 ):
