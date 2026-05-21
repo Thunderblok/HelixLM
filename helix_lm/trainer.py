@@ -81,7 +81,7 @@ class Trainer:
         generated_example_length: int = 15,
         grad_accum_steps: int = 1,
         use_amp: bool = False,
-        amp_dtype: str = "float16",
+        amp_dtype: Optional[str] = None,
         min_tail_len: Optional[int] = None,
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
@@ -114,7 +114,8 @@ class Trainer:
         os.makedirs(output_dir, exist_ok=True)
         self.grad_accum_steps = max(1, grad_accum_steps)
         self.use_amp = use_amp and torch.cuda.is_available()
-        self.amp_dtype = getattr(torch, amp_dtype) if isinstance(amp_dtype, str) else amp_dtype
+        _amp_dtype = amp_dtype if amp_dtype is not None else getattr(cfg, "amp_dtype", "float16")
+        self.amp_dtype = getattr(torch, _amp_dtype) if isinstance(_amp_dtype, str) else _amp_dtype
         self.verbose = verbose
 
         if example_prompts:
@@ -184,14 +185,15 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.history = {"train_loss": [], "val_loss": [], "perplexity": []}
 
-        # GradScaler for AMP (only if use_amp=True and CUDA available)
+        # GradScaler for AMP (only if use_amp=True and CUDA available and dtype is float16)
+        # BFloat16 does not need/ support GradScaler — it has sufficient range natively.
         self.scaler = None
-        if self.use_amp:
+        if self.use_amp and self.amp_dtype == torch.float16:
             try:
                 from torch.amp import GradScaler
                 self.scaler = GradScaler("cuda")
             except Exception:
-                self.use_amp = False
+                pass  # scaler stays None, AMP still works without scaling
 
     def _get_device(self) -> torch.device:
         """Get device from config."""
