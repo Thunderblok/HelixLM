@@ -12,6 +12,7 @@ import os
 import sys
 from math import ceil
 
+import numpy as np
 from datasets import load_dataset
 import torch
 
@@ -40,6 +41,10 @@ def main():
     # ------------------------------------------------------------------
     # Tokenizer setup
     # ------------------------------------------------------------------
+
+    random.seed(42)
+    np.random.seed(42)      # HelixGraph uses numpy RNG internally
+    torch.manual_seed(42) 
 
     tokenizer = HelixTokenizer("gpt2")
     VOCABULARY_SIZE = len(tokenizer)
