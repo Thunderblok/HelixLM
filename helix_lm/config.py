@@ -103,6 +103,7 @@ class HelixConfig(PretrainedConfig):
         # --- Device ---
         device: str = "auto",
         dtype: str = "float32",
+        amp_dtype: str = "float16",  # AMP autocast dtype: "float16" | "bfloat16"
 
         # --- Tokenizer ---
         tokenizer_name: str = "gpt2",  # "char", "gpt2", "qwen", "custom"
@@ -230,6 +231,8 @@ class HelixConfig(PretrainedConfig):
                 self.dtype = getattr(torch, dtype_str)
         else:
             self.dtype = dtype
+
+        self.amp_dtype = amp_dtype
 
         # --- Tokenizer ---
         self.tokenizer_name = tokenizer_name

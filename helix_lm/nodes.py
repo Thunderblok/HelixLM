@@ -19,7 +19,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        dtype = x.dtype
+        x_f = x.float()
+        norm = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x_f * norm * self.weight).to(dtype)
 
 
 class HeteroNode(nn.Module):
@@ -76,8 +79,11 @@ class LinearAttnNode(HeteroNode):
 
         # AMP-safe: compute feature maps and cumulatives in fp32 to prevent
         # float16 overflow. The einsum over feature_dim can exceed 65504.
-        q_fp32 = self._feature_map(self.q_feat(q.float()))
-        k_fp32 = self._feature_map(self.k_feat(k.float()))
+        # Cast weights to fp32 so matmul dtype matches even when weights are bf16.
+        q_fp32 = self._feature_map(F.linear(q.float(), self.q_feat.weight.float(),
+                                            self.q_feat.bias.float() if self.q_feat.bias is not None else None))
+        k_fp32 = self._feature_map(F.linear(k.float(), self.k_feat.weight.float(),
+                                            self.k_feat.bias.float() if self.k_feat.bias is not None else None))
         v_fp32 = v.float()
 
         # Apply attention mask: zero out k,v contributions from pad positions

@@ -81,6 +81,7 @@ class Trainer:
         generated_example_length: int = 15,
         grad_accum_steps: int = 1,
         use_amp: bool = False,
+        amp_dtype: str = "float16",
         min_tail_len: Optional[int] = None,
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
@@ -100,6 +101,7 @@ class Trainer:
             generated_example_length: Number of tokens to generate for samples.
             grad_accum_steps: Gradient accumulation steps (default: 1).
             use_amp: Whether to use torch.amp automatic mixed precision.
+            amp_dtype: AMP autocast dtype: "float16" or "bfloat16" (default: "float16").
             min_tail_len: Minimum tail length for DocumentAwareDataset.
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
@@ -112,6 +114,7 @@ class Trainer:
         os.makedirs(output_dir, exist_ok=True)
         self.grad_accum_steps = max(1, grad_accum_steps)
         self.use_amp = use_amp and torch.cuda.is_available()
+        self.amp_dtype = getattr(torch, amp_dtype) if isinstance(amp_dtype, str) else amp_dtype
         self.verbose = verbose
 
         if example_prompts:
@@ -269,7 +272,7 @@ class Trainer:
             # Forward pass
             if self.use_amp and self.scaler is not None:
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16
+                    device_type="cuda", dtype=self.amp_dtype
                 ):
                     outputs = self.model(
                         input_ids, labels=labels,
@@ -380,7 +383,7 @@ class Trainer:
 
             if self.use_amp and self.scaler is not None:
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16
+                    device_type="cuda", dtype=self.amp_dtype
                 ):
                     outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
             else:

@@ -74,6 +74,8 @@ class TiedLMHead(nn.Module):
         # h: (B, T, d_model)
         # P0 FIX: Buffer applied consistently in BOTH train and eval.
         # Forward pass must NEVER depend on self.training.
+        # Defensive: align h dtype to buffer weight dtype (guards against upstream casts)
+        h = h.to(self.buffer.weight.dtype)
         if 0 < self.grad_buffer_ratio < 1:
             h_buffered = self.buffer(h)
             h_mixed = (1 - self.grad_buffer_ratio) * h + self.grad_buffer_ratio * h_buffered
@@ -82,7 +84,7 @@ class TiedLMHead(nn.Module):
         else:
             # buffer_ratio=0: pass through directly (standard tying)
             h_mixed = h
-        return F.linear(h_mixed, self.weight)
+        return F.linear(h_mixed, self.weight.to(h_mixed.dtype))
 
 
 # ---------------------------------------------------------------------------
