@@ -2,8 +2,10 @@
 HelixLM Core model: embeddings, recurrent heterogeneous graph, output head, generation.
 """
 import math
+import random
 from typing import Optional, List, Dict, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,6 +25,14 @@ class HelixLMCore(nn.Module):
     def __init__(self, cfg: HelixConfig, tie_weights: bool = True, create_output_head: bool = True):
         super().__init__()
         self.cfg = cfg
+
+        # --- Fix A: Global RNG self-seeding ---
+        if getattr(cfg, 'seed', None) is not None:
+            torch.manual_seed(cfg.seed)
+            np.random.seed(cfg.seed)
+            random.seed(cfg.seed)
+            print(f"[HelixLM] Global RNG seed set to {cfg.seed} "
+                  f"(set HelixConfig(seed=None) to disable auto-seeding)")
 
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.recurrent = HelixRecurrentBlock(cfg)

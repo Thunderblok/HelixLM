@@ -29,7 +29,7 @@ class HelixGraph(nn.Module):
     construction and restored afterward.  Two HelixGraph instances built with
     the same seed at different times will produce identical topologies.
     """
-    def __init__(self, cfg: HelixConfig, seed: int = 42):
+    def __init__(self, cfg: HelixConfig, seed: int = None):
         super().__init__()
         self.cfg = cfg
 
@@ -38,6 +38,7 @@ class HelixGraph(nn.Module):
         _numpy_rng = np.random.get_state()
         # ────────────────────────────────────────────────────────────
 
+        seed = getattr(cfg, 'seed', 42) if seed is None else seed
         rng = np.random.RandomState(seed)
         torch.manual_seed(seed)
 

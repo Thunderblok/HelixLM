@@ -143,6 +143,9 @@ class HelixConfig(PretrainedConfig):
         cca_ramp_mode: str = "quadratic",  # "quadratic" | "cubic_ease" | "linear"
         cca_min_scale: float = 0.05,  # Minimum attention contribution (prevents FFN-only collapse)
 
+        # --- RNG seeding ---
+        seed: Optional[int] = 42,  # None = user manages RNG manually
+
         # --- Misc ---
         tie_word_embeddings: bool = True,
         grad_buffer_ratio: float = None,  # Gradient buffer for safe weight tying (0=standard tying, 1=max buffer)
@@ -155,6 +158,7 @@ class HelixConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id or 0
         self.tie_word_embeddings = tie_word_embeddings
         self.grad_buffer_ratio = grad_buffer_ratio
+        self.seed = seed
         if self.grad_buffer_ratio is None:
             self.grad_buffer_ratio = 1.0 / e
 
@@ -327,6 +331,8 @@ class HelixConfig(PretrainedConfig):
             d["dtype"] = str(self.dtype).replace("torch.", "")
         else:
             d["dtype"] = None
+        # Ensure seed is serialized
+        d["seed"] = getattr(self, "seed", None)
         return d
 
     @classmethod
