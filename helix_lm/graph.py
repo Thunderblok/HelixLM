@@ -20,7 +20,7 @@ from .nodes import (
 class HelixGraph(nn.Module):
     """
     Randomly wired heterogeneous graph of neural nodes.
-    
+
     - Topology: Biological-style neural columns with vertical and lateral connections
     - Aggregation: learned per-node merge (Linear bottleneck) or Gate
     - Stateful nodes (SSM/Mamba-2) expose state read/write across loops
@@ -39,8 +39,11 @@ class HelixGraph(nn.Module):
         # ────────────────────────────────────────────────────────────
 
         seed = getattr(cfg, 'seed', 42) if seed is None else seed
-        rng = np.random.RandomState(seed)
-        torch.manual_seed(seed)
+        if seed is not None:
+            rng = np.random.RandomState(seed)
+            torch.manual_seed(seed)
+        else:
+            rng = np.random.RandomState()
 
         self.node_spec = self._build_node_spec()
         self.nodes = nn.ModuleDict()
