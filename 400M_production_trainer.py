@@ -282,9 +282,10 @@ def main():
             grad_accum_steps=GRAD_ACCUM,
             use_amp=USE_AMP,
             amp_dtype=AMP_DTYPE,
-            min_tail_len=1,          # keep all docs, matches ablation stride=SEQ_LEN
+            min_tail_len=SEQ_LEN // 4,
             verbose=True,
         )
+        trainer._scheduler_min_lr = 1.0  # Disable cosine scheduler to prevent crystallization
 
         # ── Train one epoch ─────────────────────────────────────────
         t0 = time.time()
