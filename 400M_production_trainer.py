@@ -52,7 +52,7 @@ BATCH_SIZE = 32
 GRAD_ACCUM = 2
 WEIGHT_DECAY = 0.05             # ↓ from 0.1 — alpha=5.38 said over-regularized
 GRAD_CLIP = 1.0
-LR_STAGES = [2e-3, 1e-3, 3e-4]
+LR_STAGES = [4e-3, 2e-3, 6e-4]
 WARMUP_STAGES = [100, 10, 10]
 
 # Spike LR schedule ("KITA" to nudge the optimizer out of crystallization rabbit holes)...
@@ -339,7 +339,7 @@ def main():
             min_tail_len=SEQ_LEN // 4,   # matches ablation default (32)
             verbose=True,
         )
-        trainer._scheduler_min_lr = 1.0
+        # trainer._scheduler_min_lr = 1.0
 
         # ── Inject spike LR scheduler BEFORE training ────────────────
         # Trainer creates its scheduler lazily in train_epoch() only if
