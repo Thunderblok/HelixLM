@@ -166,12 +166,23 @@ class Trainer:
             )
 
         # AdamW with standard betas (0.9, 0.999)
-        self.optimizer = AdamW(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-            betas=(0.9, 0.999),
-        )
+        # ── Optimizer ───────────────────────────────────────────────────────
+        if getattr(cfg, "use_muon", False):
+            from .hybrid_optimizer import build_hybrid_optimizer
+            self.optimizer = build_hybrid_optimizer(model, cfg)
+            if self.verbose:
+                print(f"[Trainer] Muon hybrid optimizer enabled "
+                      f"(Muon LR={cfg.lr * getattr(cfg, 'muon_lr_factor', 1.0):.2e}, "
+                      f"AdamW LR={cfg.lr * getattr(cfg, 'adamw_lr_factor', 0.1):.2e})")
+        else:
+            self.optimizer = AdamW(
+                model.parameters(),
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+                betas=getattr(cfg, "adamw_betas", (0.9, 0.999)),
+            )
+            if self.verbose:
+                print(f"[Trainer] AdamW optimizer (lr={cfg.lr}, wd={cfg.weight_decay})")
 
         # Scheduler steps count optimizer steps, not raw batches
         # DEFERRED: avoid len() on lazy datasets to prevent eager chunking at init time.
