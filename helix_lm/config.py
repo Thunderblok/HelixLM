@@ -97,7 +97,7 @@ class HelixConfig(PretrainedConfig):
         grad_clip: float = 1.0,
 
         # --- Optimizer ---
-        use_muon: bool = False,
+        use_muon: bool = True,
         muon_lr_factor: float = 1.0,
         adamw_lr_factor: float = 0.1,
         muon_momentum: float = 0.95,
