@@ -29,24 +29,20 @@ class HybridOptimizer(Optimizer):
 
         all_params = [p for g in muon_optimizer.param_groups for p in g["params"]] + \
                      [p for g in adamw_optimizer.param_groups for p in g["params"]]
+
+        # super().__init__() will set self.param_groups = [] internally.
+        # We let it run, then replace with references to sub-optimizer groups.
         super().__init__(all_params, dict(lr=0.0))
 
         self.muon = muon_optimizer
         self.adamw = adamw_optimizer
 
-    @property
-    def param_groups(self):
-        # Return live references so Scheduler LR mutations apply in-place
-        groups = []
+        # Replace with live references so Scheduler LR mutations propagate
+        self.param_groups = []
         for g in self.muon.param_groups:
-            groups.append(g)
+            self.param_groups.append(g)
         for g in self.adamw.param_groups:
-            groups.append(g)
-        return groups
-
-    @param_groups.setter
-    def param_groups(self, value):
-        raise AttributeError("HybridOptimizer param_groups are read-only")
+            self.param_groups.append(g)
 
     def step(self, closure=None):
         loss_muon = self.muon.step(closure)
