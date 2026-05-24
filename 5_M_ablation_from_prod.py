@@ -298,8 +298,14 @@ def main():
         cfg.eos_token_id = tokenizer.eos_token_id
         cfg.bos_token_id = tokenizer.bos_token_id
 
+        print(f"lateral_p={cfg.lateral_p}, vertical_p={cfg.vertical_p}, vertical_depth={cfg.vertical_depth}")
+        print(f"Whole config: {cfg}")
+
         # ── Create model ─────────────────────────────────────────────
         model = HelixForCausalLM(cfg)
+        model = HelixForCausalLM(cfg)
+        graph_info = model.model.recurrent.graph.get_graph_info()
+        print(f"n_edges={graph_info['n_edges']}, n_nodes={graph_info['n_nodes']}")
 
         if prev_ckpt_dir is not None:
             st_path = os.path.join(prev_ckpt_dir, "model.safetensors")
