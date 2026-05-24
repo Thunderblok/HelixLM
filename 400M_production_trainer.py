@@ -49,16 +49,16 @@ GRAD_BUFFER_RATIO = 0.0         # ↓ from 1/e — isolate buffer role in modali
 
 # Training — adjusted
 BATCH_SIZE = 32
-GRAD_ACCUM = 1
+GRAD_ACCUM = 2
 WEIGHT_DECAY = 0.05             # ↓ from 0.1 — alpha=5.38 said over-regularized
 GRAD_CLIP = 1.0
-LR_STAGES = [2e-3, 1e-3, 3e-4]
-WARMUP_STAGES = [50, 10, 10]
+LR_STAGES = [3e-3, 1.5e-3, 4.5e-4]
+WARMUP_STAGES = [100, 10, 10]
 
 # Spike LR schedule ("KITA" to nudge the optimizer out of crystallization rabbit holes)...
-SPIKE_HEIGHT = 8.0              # LR multiplier during spike (5–20× range)
-SPIKE_WIDTH = 80                # batches per spike (few dozen to hundred)
-SPIKE_INTERVAL_PCT = 0.01       # spike every 1% of epoch
+SPIKE_HEIGHT = 6.0              # LR multiplier during spike (5–20× range)
+SPIKE_WIDTH = 100               # batches per spike (few dozen to hundred)
+SPIKE_INTERVAL_PCT = 0.02       # spike every 2% of epoch
 
 # AMP
 USE_AMP = True
@@ -279,7 +279,7 @@ def main():
     all_results = []
     prev_ckpt_dir = None
 
-    for stage_idx in range(3):
+    for stage_idx in range(1):
         stage_num = stage_idx + 1
         lr = LR_STAGES[stage_idx]
         warmup = WARMUP_STAGES[stage_idx]
