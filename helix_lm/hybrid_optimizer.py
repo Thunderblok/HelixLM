@@ -27,17 +27,15 @@ class HybridOptimizer(Optimizer):
         if not (muon_ids | adamw_ids):
             raise ValueError("HybridOptimizer: no trainable parameters assigned.")
 
-        all_params = [p for g in muon_optimizer.param_groups for p in g["params"]] + \
-                     [p for g in adamw_optimizer.param_groups for p in g["params"]]
-
-        # super().__init__() will set self.param_groups = [] internally.
-        # We let it run, then replace with references to sub-optimizer groups.
-        super().__init__([], dict(lr=0.0))
+        # Pass a param_group dict with EMPTY params list.
+        # PyTorch checks len(param_groups) > 0, not len(params) > 0.
+        # This avoids both "empty parameter list" and add_param_group() issues.
+        super().__init__([{"params": []}], dict(lr=0.0))
 
         self.muon = muon_optimizer
         self.adamw = adamw_optimizer
 
-        # Replace with live references so Scheduler LR mutations propagate
+        # Replace with live references so Scheduler LR mutations propagate in-place
         self.param_groups = []
         for g in self.muon.param_groups:
             self.param_groups.append(g)
