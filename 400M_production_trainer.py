@@ -52,7 +52,7 @@ BATCH_SIZE = 32
 GRAD_ACCUM = 2
 WEIGHT_DECAY = 0.05             # ↓ from 0.1 — alpha=5.38 said over-regularized
 GRAD_CLIP = 1.0
-LR_STAGES = [3e-3, 1.5e-3, 4.5e-4]
+LR_STAGES = [2e-3, 1e-3, 3e-4]
 WARMUP_STAGES = [100, 10, 10]
 
 # Spike LR schedule ("KITA" to nudge the optimizer out of crystallization rabbit holes)...
@@ -113,58 +113,58 @@ def make_repo_name(epoch: int, use_alt: bool = False) -> str:
 # SPIKE LR SCHEDULE
 # ═══════════════════════════════════════════════════════════════════════════
 
-def make_spike_schedule(warmup_steps: int, total_steps: int,
-                        spike_interval_steps: int, spike_width: int,
-                        spike_height: float):
-    """
-    Returns an lr_lambda function for a spike schedule.
+# def make_spike_schedule(warmup_steps: int, total_steps: int,
+#                         spike_interval_steps: int, spike_width: int,
+#                         spike_height: float):
+#     """
+#     Returns an lr_lambda function for a spike schedule.
 
-    - Warmup: linear 0 → 1.0 over warmup_steps
-    - Baseline: constant 1.0 (multiplied by base_lr)
-    - Spikes: triangular spikes reaching spike_height × base_lr,
-      lasting spike_width steps, every spike_interval_steps
-    - Terminal: returns to 1.0 at epoch end (no decay below baseline)
-    """
-    def lr_lambda(current_step: int) -> float:
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
+#     - Warmup: linear 0 → 1.0 over warmup_steps
+#     - Baseline: constant 1.0 (multiplied by base_lr)
+#     - Spikes: triangular spikes reaching spike_height × base_lr,
+#       lasting spike_width steps, every spike_interval_steps
+#     - Terminal: returns to 1.0 at epoch end (no decay below baseline)
+#     """
+#     def lr_lambda(current_step: int) -> float:
+#         if current_step < warmup_steps:
+#             return float(current_step) / float(max(1, warmup_steps))
 
-        # Position within the current spike cycle
-        cycle_step = (current_step - warmup_steps) % spike_interval_steps
+#         # Position within the current spike cycle
+#         cycle_step = (current_step - warmup_steps) % spike_interval_steps
 
-        if cycle_step < spike_width:
-            # Inside a spike: smooth triangular shape
-            progress = cycle_step / spike_width           # 0.0 → 1.0
-            if progress < 0.5:
-                # Ramp up: 1.0 → spike_height
-                factor = 1.0 + (spike_height - 1.0) * (progress * 2.0)
-            else:
-                # Ramp down: spike_height → 1.0
-                factor = 1.0 + (spike_height - 1.0) * ((1.0 - progress) * 2.0)
-            return factor
+#         if cycle_step < spike_width:
+#             # Inside a spike: smooth triangular shape
+#             progress = cycle_step / spike_width           # 0.0 → 1.0
+#             if progress < 0.5:
+#                 # Ramp up: 1.0 → spike_height
+#                 factor = 1.0 + (spike_height - 1.0) * (progress * 2.0)
+#             else:
+#                 # Ramp down: spike_height → 1.0
+#                 factor = 1.0 + (spike_height - 1.0) * ((1.0 - progress) * 2.0)
+#             return factor
 
-        # Baseline: constant 1.0
-        return 1.0
+#         # Baseline: constant 1.0
+#         return 1.0
 
-    return lr_lambda
+#     return lr_lambda
 
 
-def create_spike_scheduler(optimizer, warmup_steps: int, total_steps: int,
-                           spike_interval_pct: float, spike_width: int,
-                           spike_height: float) -> LambdaLR:
-    """Create a LambdaLR with the spike schedule."""
-    spike_interval_steps = max(1, int(total_steps * spike_interval_pct))
-    # Safety: ensure interval > width so spikes don't overlap
-    spike_interval_steps = max(spike_interval_steps, spike_width + 1)
+# def create_spike_scheduler(optimizer, warmup_steps: int, total_steps: int,
+#                            spike_interval_pct: float, spike_width: int,
+#                            spike_height: float) -> LambdaLR:
+#     """Create a LambdaLR with the spike schedule."""
+#     spike_interval_steps = max(1, int(total_steps * spike_interval_pct))
+#     # Safety: ensure interval > width so spikes don't overlap
+#     spike_interval_steps = max(spike_interval_steps, spike_width + 1)
 
-    lr_fn = make_spike_schedule(
-        warmup_steps=warmup_steps,
-        total_steps=total_steps,
-        spike_interval_steps=spike_interval_steps,
-        spike_width=spike_width,
-        spike_height=spike_height,
-    )
-    return LambdaLR(optimizer, lr_fn)
+#     lr_fn = make_spike_schedule(
+#         warmup_steps=warmup_steps,
+#         total_steps=total_steps,
+#         spike_interval_steps=spike_interval_steps,
+#         spike_width=spike_width,
+#         spike_height=spike_height,
+#     )
+#     return LambdaLR(optimizer, lr_fn)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -273,6 +273,9 @@ def main():
         seed=SEED,
         device="auto",
         amp_dtype=AMP_DTYPE,
+        lateral_p=0.8,
+        vertical_p=0.9,
+        vertical_depth=2
     )
 
     # ── Three-stage training ────────────────────────────────────────────
@@ -295,8 +298,14 @@ def main():
         cfg.eos_token_id = tokenizer.eos_token_id
         cfg.bos_token_id = tokenizer.bos_token_id
 
+        print(f"lateral_p={cfg.lateral_p}, vertical_p={cfg.vertical_p}, vertical_depth={cfg.vertical_depth}")
+        print(f"Whole config: {cfg}")
+
         # ── Create model ─────────────────────────────────────────────
         model = HelixForCausalLM(cfg)
+        model = HelixForCausalLM(cfg)
+        graph_info = model.model.recurrent.graph.get_graph_info()
+        print(f"n_edges={graph_info['n_edges']}, n_nodes={graph_info['n_nodes']}")
 
         if prev_ckpt_dir is not None:
             st_path = os.path.join(prev_ckpt_dir, "model.safetensors")
@@ -330,22 +339,23 @@ def main():
             min_tail_len=SEQ_LEN // 4,   # matches ablation default (32)
             verbose=True,
         )
+        trainer._scheduler_min_lr = 1.0
 
         # ── Inject spike LR scheduler BEFORE training ────────────────
         # Trainer creates its scheduler lazily in train_epoch() only if
         # self.scheduler is None. Pre-setting it here avoids any code
         # modification to the Trainer class.
-        steps_per_epoch = math.ceil(len(trainer.train_loader) / GRAD_ACCUM)
-        total_optim_steps = steps_per_epoch * 1  # cfg.epochs = 1
+        # steps_per_epoch = math.ceil(len(trainer.train_loader) / GRAD_ACCUM)
+        # total_optim_steps = steps_per_epoch * 1  # cfg.epochs = 1
 
-        trainer.scheduler = create_spike_scheduler(
-            optimizer=trainer.optimizer,
-            warmup_steps=warmup,
-            total_steps=total_optim_steps,
-            spike_interval_pct=SPIKE_INTERVAL_PCT,
-            spike_width=SPIKE_WIDTH,
-            spike_height=SPIKE_HEIGHT,
-        )
+        # trainer.scheduler = create_spike_scheduler(
+        #     optimizer=trainer.optimizer,
+        #     warmup_steps=warmup,
+        #     total_steps=total_optim_steps,
+        #     spike_interval_pct=SPIKE_INTERVAL_PCT,
+        #     spike_width=SPIKE_WIDTH,
+        #     spike_height=SPIKE_HEIGHT,
+        # )
 
         # ── Train one epoch ──────────────────────────────────────────
         t0 = time.time()
