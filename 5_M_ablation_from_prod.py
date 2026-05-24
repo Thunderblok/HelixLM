@@ -34,7 +34,7 @@ from helix_lm.trainer import Trainer
 # ═══════════════════════════════════════════════════════════════════════════
 # PRODUCTION CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-DATASET = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
+DATASET = "david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427" # replace with "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430" and paste over prod script
 SEED = 42
 HF_USERNAME = "david-thrower"
 
