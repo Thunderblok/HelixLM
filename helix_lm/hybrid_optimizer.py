@@ -32,7 +32,7 @@ class HybridOptimizer(Optimizer):
 
         # super().__init__() will set self.param_groups = [] internally.
         # We let it run, then replace with references to sub-optimizer groups.
-        super().__init__(all_params, dict(lr=0.0))
+        super().__init__([], dict(lr=0.0))
 
         self.muon = muon_optimizer
         self.adamw = adamw_optimizer
