@@ -274,7 +274,7 @@ def main():
         device="auto",
         amp_dtype=AMP_DTYPE,
         lateral_p=0.8,
-        vertical_p: 0.9,
+        vertical_p=0.9,
         vertical_depth=3
     )
 
