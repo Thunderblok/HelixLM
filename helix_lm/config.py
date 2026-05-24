@@ -96,6 +96,14 @@ class HelixConfig(PretrainedConfig):
         warmup_steps: int = 100,
         grad_clip: float = 1.0,
 
+        # --- Optimizer ---
+        use_muon: bool = False,
+        muon_lr_factor: float = 1.0,
+        adamw_lr_factor: float = 0.1,
+        muon_momentum: float = 0.95,
+        muon_ns_steps: int = 5,
+        adamw_betas: Tuple[float, float] = (0.9, 0.999),
+
         # --- Initialization ---
         initializer_range: float = 0.02,
         lti_init_A: float = None,  # 1/e ≈ 0.368 default (set in recurrent.py)
@@ -225,6 +233,12 @@ class HelixConfig(PretrainedConfig):
         self.epochs = epochs
         self.warmup_steps = warmup_steps
         self.grad_clip = grad_clip
+        self.use_muon = use_muon
+        self.muon_lr_factor = muon_lr_factor
+        self.adamw_lr_factor = adamw_lr_factor
+        self.muon_momentum = muon_momentum
+        self.muon_ns_steps = muon_ns_steps
+        self.adamw_betas = adamw_betas
         self.initializer_range = initializer_range
         self.device = device
         if isinstance(dtype, str):
