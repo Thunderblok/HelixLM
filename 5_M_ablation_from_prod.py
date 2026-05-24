@@ -370,6 +370,7 @@ def main():
         tokenizer.save_pretrained(canonical_ckpt)
         prev_ckpt_dir = canonical_ckpt
 
+        raise ValueError("Test ablation, don't push")
         # ── Push to HF Hub ───────────────────────────────────────────
         hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
 
