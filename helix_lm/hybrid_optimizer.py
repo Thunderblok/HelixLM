@@ -29,7 +29,6 @@ class HybridOptimizer(Optimizer):
 
         # Pass a param_group dict with EMPTY params list.
         # PyTorch checks len(param_groups) > 0, not len(params) > 0.
-        # This avoids both "empty parameter list" and add_param_group() issues.
         super().__init__([{"params": []}], dict(lr=0.0))
 
         self.muon = muon_optimizer
@@ -57,9 +56,6 @@ class HybridOptimizer(Optimizer):
     def load_state_dict(self, state_dict):
         self.muon.load_state_dict(state_dict["muon"])
         self.adamw.load_state_dict(state_dict["adamw"])
-
-    def add_param_group(self, param_group):
-        raise NotImplementedError("HybridOptimizer does not support add_param_group")
 
 
 def build_hybrid_optimizer(model, cfg):
