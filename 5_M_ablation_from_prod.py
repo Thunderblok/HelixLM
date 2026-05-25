@@ -40,10 +40,10 @@ HF_USERNAME = "david-thrower"
 
 # Architecture — scaled up
 D_MODEL = 512
-N_HEADS = D_MODEL // 64        
+N_HEADS = D_MODEL // 64
 FFN_EXPANSION = 2.0
 SEQ_LEN = 256 # 128
-N_LOOPS = 4
+N_LOOPS = 3
 DROPOUT = 0.15                  # ↑ from 0.1 — more noise against rank collapse
 GRAD_BUFFER_RATIO = 0.0         # ↓ from 1/e — isolate buffer role in modality collapse
 
