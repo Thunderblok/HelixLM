@@ -33,8 +33,8 @@ from helix_lm.trainer import Trainer
 # ═══════════════════════════════════════════════════════════════════════════
 
 # --- dataset: swap comment for 50M vs 400M ---
-# DATASET = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
-DATASET = "david-thrower/HelixLM-small-50.0Mt-91250pt-7143it-20260427"
+DATASET = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
+# DATASET = "david-thrower/HelixLM-small-50.0Mt-91250pt-7143it-20260427"
 
 SEED = 42
 HF_USERNAME = "david-thrower"
