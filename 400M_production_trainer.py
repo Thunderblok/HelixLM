@@ -339,7 +339,7 @@ def main():
             min_tail_len=SEQ_LEN // 4,   # matches ablation default (32)
             verbose=True,
         )
-        # trainer._scheduler_min_lr = 1.0
+        trainer._scheduler_min_lr = 1.0
 
         # ── Inject spike LR scheduler BEFORE training ────────────────
         # Trainer creates its scheduler lazily in train_epoch() only if
