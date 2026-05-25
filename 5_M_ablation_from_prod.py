@@ -40,7 +40,7 @@ HF_USERNAME = "david-thrower"
 
 # Architecture — scaled up
 D_MODEL = 512
-N_HEADS = d_model // 64        
+N_HEADS = D_MODEL // 64        
 FFN_EXPANSION = 2.0
 SEQ_LEN = 128
 N_LOOPS = 3
