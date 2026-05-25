@@ -43,7 +43,7 @@ D_MODEL = 512
 N_HEADS = D_MODEL // 64        
 FFN_EXPANSION = 2.0
 SEQ_LEN = 128
-N_LOOPS = 3
+N_LOOPS = 2
 DROPOUT = 0.15                  # ↑ from 0.1 — more noise against rank collapse
 GRAD_BUFFER_RATIO = 0.0         # ↓ from 1/e — isolate buffer role in modality collapse
 
@@ -52,7 +52,7 @@ BATCH_SIZE = 32
 GRAD_ACCUM = 2
 WEIGHT_DECAY = 0.05             # ↓ from 0.1 — alpha=5.38 said over-regularized
 GRAD_CLIP = 1.0
-LR_STAGES =  [1e-3, 1e-3, 2e-4]
+LR_STAGES =  [2e-3, 1e-3, 3e-4]
 WARMUP_STAGES = [100, 10, 10]
 
 # Spike LR schedule ("KITA" to nudge the optimizer out of crystallization rabbit holes)...
