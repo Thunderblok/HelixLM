@@ -39,7 +39,7 @@ SEED = 42
 HF_USERNAME = "david-thrower"
 
 # Architecture — scaled up
-D_MODEL = 384
+D_MODEL = 512
 N_HEADS = 6                     # d_model // 64
 FFN_EXPANSION = 2.0
 SEQ_LEN = 128
