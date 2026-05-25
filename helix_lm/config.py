@@ -99,7 +99,7 @@ class HelixConfig(PretrainedConfig):
         # --- Optimizer ---
         use_muon: bool = True,
         muon_lr_factor: float = 1.0,
-        adamw_lr_factor: float = 0.1,
+        adamw_lr_factor: float = 1.0,
         muon_momentum: float = 0.95,
         muon_ns_steps: int = 5,
         adamw_betas: Tuple[float, float] = (0.9, 0.999),
