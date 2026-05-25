@@ -43,7 +43,7 @@ D_MODEL = 384
 N_HEADS = 6                     # d_model // 64
 FFN_EXPANSION = 2.0
 SEQ_LEN = 128
-N_LOOPS = 2
+N_LOOPS = 3
 DROPOUT = 0.15                  # ↑ from 0.1 — more noise against rank collapse
 GRAD_BUFFER_RATIO = 0.0         # ↓ from 1/e — isolate buffer role in modality collapse
 
@@ -275,7 +275,7 @@ def main():
         amp_dtype=AMP_DTYPE,
         lateral_p=0.8,
         vertical_p=0.9,
-        vertical_depth=3
+        vertical_depth=2
     )
 
     # ── Three-stage training ────────────────────────────────────────────
