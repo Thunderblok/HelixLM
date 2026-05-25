@@ -1,14 +1,12 @@
 """
-HelixLM 400M-Token Production Training — d384, n_heads=6, ffn=2.0, seq_len=128
-Uses the official HelixLM Trainer API with a custom spike-LR schedule.
+HelixLM 50M/400M Production trainer — d512, n_heads=8, ffn=2.0, seq_len=128
+Constant LR per stage, dense topology. No spikes (KITA available if needed).
 
-Spike schedule: constant LR at each stage's baseline, with brief 8× spikes
-every ~1% of the epoch to escape local minima. No decay below baseline.
-
-Production config:
-  d_model=384, n_heads=6, ffn_expansion=2.0, seq_len=128, n_loops=2
+Config:
+  d_model=512, n_heads=8, ffn_expansion=2.0, seq_len=128, n_loops=2
   dropout=0.15, weight_decay=0.05, grad_buffer_ratio=0.0
   batch_size=32, grad_accum=2 (effective 64)
+  lateral_p=0.8, vertical_p=0.9, vertical_depth=2
   use_cca=False, use_ssm=False, use_titans_memory=False
 """
 import math
@@ -22,7 +20,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from torch.optim.lr_scheduler import LambdaLR
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from safetensors.torch import load_file as load_safetensors
@@ -32,49 +29,59 @@ from helix_lm.hf_model import HelixForCausalLM
 from helix_lm.trainer import Trainer
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PRODUCTION CONFIGURATION
+# CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-DATASET = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
+
+# --- dataset: swap comment for 50M vs 400M ---
+# DATASET = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
+DATASET = "david-thrower/HelixLM-small-50.0Mt-91250pt-7143it-20260427"
+
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-# Architecture — scaled up
-D_MODEL = 384
-N_HEADS = 6                     # d_model // 64
+# Architecture
+D_MODEL = 512
+N_HEADS = D_MODEL // 64                     # 8
 FFN_EXPANSION = 2.0
 SEQ_LEN = 128
 N_LOOPS = 2
-DROPOUT = 0.15                  # ↑ from 0.1 — more noise against rank collapse
-GRAD_BUFFER_RATIO = 0.0         # ↓ from 1/e — isolate buffer role in modality collapse
+DROPOUT = 0.15
+GRAD_BUFFER_RATIO = 0.0
 
-# Training — adjusted
+# Topology — dense (validated at 50M)
+LATERAL_P = 0.8
+VERTICAL_P = 0.9
+VERTICAL_DEPTH = 2
+
+# Training
 BATCH_SIZE = 32
-GRAD_ACCUM = 2
-WEIGHT_DECAY = 0.05             # ↓ from 0.1 — alpha=5.38 said over-regularized
+GRAD_ACCUM = 2                              # effective batch = 64
+WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
-LR_STAGES = [4e-3, 2e-3, 6e-4]
+LR_STAGES = [2e-3, 1e-3, 3e-4]
 WARMUP_STAGES = [100, 10, 10]
 
-# Spike LR schedule ("KITA" to nudge the optimizer out of crystallization rabbit holes)...
-SPIKE_HEIGHT = 6.0              # LR multiplier during spike (5–20× range)
-SPIKE_WIDTH = 100               # batches per spike (few dozen to hundred)
-SPIKE_INTERVAL_PCT = 0.02       # spike every 2% of epoch
+# KITA spike scheduler — disabled, uncomment if rabbit holes appear
+USE_KITA = False
+SPIKE_HEIGHT = 6.0
+SPIKE_WIDTH = 100
+SPIKE_INTERVAL_PCT = 0.02
 
 # AMP
 USE_AMP = True
 AMP_DTYPE = "bfloat16"
 
-# Flags — held constant
+# Flags
 USE_CCA = False
 USE_SSM = False
 USE_TITANS = False
 
-# Hub push
+# Hub
 PUSH_RETRY_ATTEMPTS = 3
 PUSH_RETRY_DELAY = 30
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SAFEGUARD 1: HF_TOKEN
+# SAFEGUARD
 # ═══════════════════════════════════════════════════════════════════════════
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
@@ -97,10 +104,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# REPO NAMING
-# ═══════════════════════════════════════════════════════════════════════════
-REPO_BASE = f"HelixLM-{RUN_TS}-d384-h6-nl2-ffn2-s128-23-7MP-400MT"
+# ── Dynamic repo naming ──────────────────────────────────────────────────
+_DS = "400MT" if "400" in DATASET else "50MT"
+REPO_BASE = (
+    f"HelixLM-{RUN_TS}-d{D_MODEL}-h{N_HEADS}-nl{N_LOOPS}"
+    f"-ffn{int(FFN_EXPANSION)}-s{SEQ_LEN}-{_DS}"
+)
 REPO_BASE_ALT = f"HelixLM-{RUN_TS}-prod"
 
 
@@ -109,69 +118,38 @@ def make_repo_name(epoch: int, use_alt: bool = False) -> str:
     return f"{HF_USERNAME}/{base}-ep{epoch}"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SPIKE LR SCHEDULE
-# ═══════════════════════════════════════════════════════════════════════════
+# ── KITA scheduler (disabled by default) ─────────────────────────────────
+if USE_KITA:
+    from torch.optim.lr_scheduler import LambdaLR
 
-# def make_spike_schedule(warmup_steps: int, total_steps: int,
-#                         spike_interval_steps: int, spike_width: int,
-#                         spike_height: float):
-#     """
-#     Returns an lr_lambda function for a spike schedule.
+    def _make_spike_schedule(warmup_steps, total_steps,
+                             spike_interval_steps, spike_width, spike_height):
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            cycle_step = (current_step - warmup_steps) % spike_interval_steps
+            if cycle_step < spike_width:
+                progress = cycle_step / spike_width
+                if progress < 0.5:
+                    return 1.0 + (spike_height - 1.0) * (progress * 2.0)
+                else:
+                    return 1.0 + (spike_height - 1.0) * ((1.0 - progress) * 2.0)
+            return 1.0
+        return lr_lambda
 
-#     - Warmup: linear 0 → 1.0 over warmup_steps
-#     - Baseline: constant 1.0 (multiplied by base_lr)
-#     - Spikes: triangular spikes reaching spike_height × base_lr,
-#       lasting spike_width steps, every spike_interval_steps
-#     - Terminal: returns to 1.0 at epoch end (no decay below baseline)
-#     """
-#     def lr_lambda(current_step: int) -> float:
-#         if current_step < warmup_steps:
-#             return float(current_step) / float(max(1, warmup_steps))
-
-#         # Position within the current spike cycle
-#         cycle_step = (current_step - warmup_steps) % spike_interval_steps
-
-#         if cycle_step < spike_width:
-#             # Inside a spike: smooth triangular shape
-#             progress = cycle_step / spike_width           # 0.0 → 1.0
-#             if progress < 0.5:
-#                 # Ramp up: 1.0 → spike_height
-#                 factor = 1.0 + (spike_height - 1.0) * (progress * 2.0)
-#             else:
-#                 # Ramp down: spike_height → 1.0
-#                 factor = 1.0 + (spike_height - 1.0) * ((1.0 - progress) * 2.0)
-#             return factor
-
-#         # Baseline: constant 1.0
-#         return 1.0
-
-#     return lr_lambda
-
-
-# def create_spike_scheduler(optimizer, warmup_steps: int, total_steps: int,
-#                            spike_interval_pct: float, spike_width: int,
-#                            spike_height: float) -> LambdaLR:
-#     """Create a LambdaLR with the spike schedule."""
-#     spike_interval_steps = max(1, int(total_steps * spike_interval_pct))
-#     # Safety: ensure interval > width so spikes don't overlap
-#     spike_interval_steps = max(spike_interval_steps, spike_width + 1)
-
-#     lr_fn = make_spike_schedule(
-#         warmup_steps=warmup_steps,
-#         total_steps=total_steps,
-#         spike_interval_steps=spike_interval_steps,
-#         spike_width=spike_width,
-#         spike_height=spike_height,
-#     )
-#     return LambdaLR(optimizer, lr_fn)
+    def _create_spike_scheduler(optimizer, warmup_steps, total_steps,
+                                spike_interval_pct, spike_width, spike_height):
+        interval = max(1, int(total_steps * spike_interval_pct))
+        interval = max(interval, spike_width + 1)
+        return LambdaLR(optimizer, _make_spike_schedule(
+            warmup_steps, total_steps, interval, spike_width, spike_height))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HUB PUSH HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def push_to_hub_safe(model, tokenizer, repo_name: str) -> bool:
+def push_to_hub_safe(model, tokenizer, repo_name):
     for attempt in range(1, PUSH_RETRY_ATTEMPTS + 1):
         try:
             logger.info("📤 Push: %s (attempt %d/%d)", repo_name, attempt, PUSH_RETRY_ATTEMPTS)
@@ -186,7 +164,7 @@ def push_to_hub_safe(model, tokenizer, repo_name: str) -> bool:
     return False
 
 
-def push_checkpoint(model, tokenizer, stage_num: int, local_dir: str) -> str:
+def push_checkpoint(model, tokenizer, stage_num, local_dir):
     repo_name = make_repo_name(stage_num, use_alt=False)
     if push_to_hub_safe(model, tokenizer, repo_name):
         return repo_name
@@ -204,18 +182,20 @@ def push_checkpoint(model, tokenizer, stage_num: int, local_dir: str) -> str:
 
 def main():
     logger.info("=" * 70)
-    logger.info("HelixLM 400M Token Production — d384 Spike-LR")
+    logger.info("HelixLM Training — d%d, dense topology, constant LR", D_MODEL)
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
     logger.info("Config:     d=%d heads=%d ffn=%.1f seq=%d loops=%d",
                 D_MODEL, N_HEADS, FFN_EXPANSION, SEQ_LEN, N_LOOPS)
+    logger.info("Topology:   lateral=%.1f vertical=%.1f depth=%d",
+                LATERAL_P, VERTICAL_P, VERTICAL_DEPTH)
     logger.info("Regularize: dropout=%.2f wd=%.2f grad_buffer=%.2f",
                 DROPOUT, WEIGHT_DECAY, GRAD_BUFFER_RATIO)
-    logger.info("Batch:      %d × %d  grad_accum=%d (effective %d)",
+    logger.info("Batch:      %d x %d  grad_accum=%d (effective %d)",
                 BATCH_SIZE, SEQ_LEN, GRAD_ACCUM, BATCH_SIZE * GRAD_ACCUM)
-    logger.info("LR stages:  %.0e → %.0e → %.0e  + spikes %.0f× every %.0f%%",
-                *LR_STAGES, SPIKE_HEIGHT, SPIKE_INTERVAL_PCT * 100)
+    logger.info("LR:         %.0e constant  |  KITA: %s",
+                LR_STAGES[0], "ON" if USE_KITA else "OFF")
     logger.info("AMP:        %s", AMP_DTYPE)
 
     # ── Seed ────────────────────────────────────────────────────────────
@@ -273,23 +253,24 @@ def main():
         seed=SEED,
         device="auto",
         amp_dtype=AMP_DTYPE,
-        lateral_p=0.8,
-        vertical_p=0.9,
-        vertical_depth=2
+        lateral_p=LATERAL_P,
+        vertical_p=VERTICAL_P,
+        vertical_depth=VERTICAL_DEPTH,
     )
 
-    # ── Three-stage training ────────────────────────────────────────────
+    # ── Training ────────────────────────────────────────────────────────
     all_results = []
     prev_ckpt_dir = None
 
-    for stage_idx in range(1):
+    for stage_idx in range(1):          # 1 epoch = Chinchilla-optimal
         stage_num = stage_idx + 1
         lr = LR_STAGES[stage_idx]
         warmup = WARMUP_STAGES[stage_idx]
 
         logger.info("\n" + "=" * 70)
-        logger.info("STAGE %d/3 | LR=%.1e | Warmup=%d | Spikes %.0f× every %.0f%%",
-                    stage_num, lr, warmup, SPIKE_HEIGHT, SPIKE_INTERVAL_PCT * 100)
+        kita_str = f"KITA {SPIKE_HEIGHT:.0f}x every {SPIKE_INTERVAL_PCT*100:.0f}%" if USE_KITA else "constant"
+        logger.info("STAGE %d/1 | LR=%.1e | Warmup=%d | %s",
+                    stage_num, lr, warmup, kita_str)
         logger.info("=" * 70)
 
         # ── Build config ────────────────────────────────────────────
@@ -298,14 +279,13 @@ def main():
         cfg.eos_token_id = tokenizer.eos_token_id
         cfg.bos_token_id = tokenizer.bos_token_id
 
-        print(f"lateral_p={cfg.lateral_p}, vertical_p={cfg.vertical_p}, vertical_depth={cfg.vertical_depth}")
-        print(f"Whole config: {cfg}")
+        logger.info("Topology check: lateral=%.1f vertical=%.1f depth=%d",
+                    cfg.lateral_p, cfg.vertical_p, cfg.vertical_depth)
 
         # ── Create model ─────────────────────────────────────────────
         model = HelixForCausalLM(cfg)
-        model = HelixForCausalLM(cfg)
         graph_info = model.model.recurrent.graph.get_graph_info()
-        print(f"n_edges={graph_info['n_edges']}, n_nodes={graph_info['n_nodes']}")
+        logger.info("Graph: %d nodes, %d edges", graph_info["n_nodes"], graph_info["n_edges"])
 
         if prev_ckpt_dir is not None:
             st_path = os.path.join(prev_ckpt_dir, "model.safetensors")
@@ -336,33 +316,34 @@ def main():
             grad_accum_steps=GRAD_ACCUM,
             use_amp=USE_AMP,
             amp_dtype=AMP_DTYPE,
-            min_tail_len=SEQ_LEN // 4,   # matches ablation default (32)
+            min_tail_len=SEQ_LEN // 4,
             verbose=True,
         )
-        # trainer._scheduler_min_lr = 1.0
 
-        # ── Inject spike LR scheduler BEFORE training ────────────────
-        # Trainer creates its scheduler lazily in train_epoch() only if
-        # self.scheduler is None. Pre-setting it here avoids any code
-        # modification to the Trainer class.
-        # steps_per_epoch = math.ceil(len(trainer.train_loader) / GRAD_ACCUM)
-        # total_optim_steps = steps_per_epoch * 1  # cfg.epochs = 1
+        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup
+        trainer._scheduler_min_lr = 1.0
 
-        # trainer.scheduler = create_spike_scheduler(
-        #     optimizer=trainer.optimizer,
-        #     warmup_steps=warmup,
-        #     total_steps=total_optim_steps,
-        #     spike_interval_pct=SPIKE_INTERVAL_PCT,
-        #     spike_width=SPIKE_WIDTH,
-        #     spike_height=SPIKE_HEIGHT,
-        # )
+        # KITA override (if enabled)
+        if USE_KITA:
+            steps_per_epoch = math.ceil(len(trainer.train_loader) / GRAD_ACCUM)
+            total_optim_steps = steps_per_epoch * 1
+            trainer.scheduler = _create_spike_scheduler(
+                optimizer=trainer.optimizer,
+                warmup_steps=warmup,
+                total_steps=total_optim_steps,
+                spike_interval_pct=SPIKE_INTERVAL_PCT,
+                spike_width=SPIKE_WIDTH,
+                spike_height=SPIKE_HEIGHT,
+            )
+            logger.info("KITA scheduler injected: %.0fx spikes, width=%d, interval=%.0f%%",
+                        SPIKE_HEIGHT, SPIKE_WIDTH, SPIKE_INTERVAL_PCT * 100)
 
-        # ── Train one epoch ──────────────────────────────────────────
+        # ── Train ────────────────────────────────────────────────────
         t0 = time.time()
         history = trainer.train(num_epochs=1)
         elapsed = time.time() - t0
 
-        # ── Extract metrics ──────────────────────────────────────────
+        # ── Metrics ──────────────────────────────────────────────────
         train_loss = history.get("train_loss", [float("nan")])[-1]
         val_loss = history.get("val_loss", [float("nan")])[-1]
         train_ppl = math.exp(min(train_loss, 20)) if not math.isnan(train_loss) else float("nan")
@@ -371,13 +352,13 @@ def main():
         logger.info("Stage %d complete — Train PPL: %.2f | Val PPL: %.2f | Time: %.0fs (%.2f h)",
                     stage_num, train_ppl, val_ppl, elapsed, elapsed / 3600)
 
-        # ── Save canonical checkpoint ────────────────────────────────
+        # ── Save ─────────────────────────────────────────────────────
         canonical_ckpt = str(OUTPUT_DIR / f"ckpt_stage{stage_num}")
         model.save_pretrained(canonical_ckpt)
         tokenizer.save_pretrained(canonical_ckpt)
         prev_ckpt_dir = canonical_ckpt
 
-        # ── Push to HF Hub ───────────────────────────────────────────
+        # ── Push ─────────────────────────────────────────────────────
         hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
 
         # ── Track ────────────────────────────────────────────────────
@@ -399,19 +380,18 @@ def main():
         with open(RESULTS_JSON, "w") as f:
             json.dump(all_results, f, indent=2)
 
-        del trainer
-        del model
+        del trainer, model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     # ═══════════════════════════════════════════════════════════════════
-    # FINAL SUMMARY
+    # SUMMARY
     # ═══════════════════════════════════════════════════════════════════
     total_time_h = sum(r["time_s"] for r in all_results) / 3600
     best_stage = min(all_results, key=lambda r: r["val_ppl"])
 
     logger.info("\n" + "=" * 70)
-    logger.info("🎉 PRODUCTION TRAINING COMPLETE")
+    logger.info("🎉 TRAINING COMPLETE")
     logger.info("=" * 70)
     for r in all_results:
         logger.info("  Stage %d | LR=%.0e | Val PPL=%7.2f | Time=%5.2f h | %s",
@@ -428,10 +408,9 @@ def main():
             "d_model": D_MODEL, "n_heads": N_HEADS, "ffn_expansion": FFN_EXPANSION,
             "seq_len": SEQ_LEN, "n_loops": N_LOOPS, "dropout": DROPOUT,
             "weight_decay": WEIGHT_DECAY, "grad_buffer_ratio": GRAD_BUFFER_RATIO,
+            "lateral_p": LATERAL_P, "vertical_p": VERTICAL_P, "vertical_depth": VERTICAL_DEPTH,
             "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
-            "lr_stages": LR_STAGES,
-            "spike_height": SPIKE_HEIGHT, "spike_width": SPIKE_WIDTH,
-            "spike_interval_pct": SPIKE_INTERVAL_PCT,
+            "lr": LR_STAGES[0], "kita": USE_KITA,
         },
         "total_time_h": total_time_h,
         "best_val_ppl": best_stage["val_ppl"],
