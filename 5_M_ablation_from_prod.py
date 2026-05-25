@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 # REPO NAMING
 # ═══════════════════════════════════════════════════════════════════════════
-REPO_BASE = f"HelixLM-{RUN_TS}-d384-h6-nl2-ffn2-s128-23-7MP-400MT"
+REPO_BASE = f"HelixLM-{RUN_TS}-abl-d384-h6-nl3-ffn2-s128-23-7MP-50MT"
 REPO_BASE_ALT = f"HelixLM-{RUN_TS}-prod"
 
 
@@ -377,7 +377,6 @@ def main():
         tokenizer.save_pretrained(canonical_ckpt)
         prev_ckpt_dir = canonical_ckpt
 
-        raise ValueError("Test ablation, don't push")
         # ── Push to HF Hub ───────────────────────────────────────────
         hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
 
