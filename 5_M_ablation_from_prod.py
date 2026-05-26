@@ -1,13 +1,6 @@
 """
-HelixLM 50M/400M Token Ablation — d512, n_heads=8, ffn=2.0, seq_len=128
-Constant LR per stage, dense topology. No spikes (KITA available if needed).
+HelixLM 50M/400M Token Ablation 
 
-Config:
-  d_model=512, n_heads=8, ffn_expansion=2.0, seq_len=128, n_loops=2
-  dropout=0.15, weight_decay=0.05, grad_buffer_ratio=0.0
-  batch_size=32, grad_accum=2 (effective 64)
-  lateral_p=0.8, vertical_p=0.9, vertical_depth=2
-  use_cca=False, use_ssm=False, use_titans_memory=False
 """
 import math
 import json
@@ -40,8 +33,8 @@ SEED = 42
 HF_USERNAME = "david-thrower"
 
 # Architecture
-D_MODEL = 512
-N_HEADS = D_MODEL // 64                     # 8
+D_MODEL = 384
+N_HEADS = D_MODEL // 64                     
 FFN_EXPANSION = 2.0
 SEQ_LEN = 128
 N_LOOPS = 2
