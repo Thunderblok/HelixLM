@@ -81,6 +81,7 @@ class Trainer:
         generated_example_length: int = 15,
         grad_accum_steps: int = 1,
         use_amp: bool = False,
+        amp_dtype: Optional[str] = None,
         min_tail_len: Optional[int] = None,
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
@@ -100,6 +101,7 @@ class Trainer:
             generated_example_length: Number of tokens to generate for samples.
             grad_accum_steps: Gradient accumulation steps (default: 1).
             use_amp: Whether to use torch.amp automatic mixed precision.
+            amp_dtype: AMP autocast dtype: "float16" or "bfloat16" (default: "float16").
             min_tail_len: Minimum tail length for DocumentAwareDataset.
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
@@ -112,6 +114,8 @@ class Trainer:
         os.makedirs(output_dir, exist_ok=True)
         self.grad_accum_steps = max(1, grad_accum_steps)
         self.use_amp = use_amp and torch.cuda.is_available()
+        _amp_dtype = amp_dtype if amp_dtype is not None else getattr(cfg, "amp_dtype", "float16")
+        self.amp_dtype = getattr(torch, _amp_dtype) if isinstance(_amp_dtype, str) else _amp_dtype
         self.verbose = verbose
 
         if example_prompts:
@@ -181,14 +185,15 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.history = {"train_loss": [], "val_loss": [], "perplexity": []}
 
-        # GradScaler for AMP (only if use_amp=True and CUDA available)
+        # GradScaler for AMP (only if use_amp=True and CUDA available and dtype is float16)
+        # BFloat16 does not need/ support GradScaler — it has sufficient range natively.
         self.scaler = None
-        if self.use_amp:
+        if self.use_amp and self.amp_dtype == torch.float16:
             try:
                 from torch.amp import GradScaler
                 self.scaler = GradScaler("cuda")
             except Exception:
-                self.use_amp = False
+                pass  # scaler stays None, AMP still works without scaling
 
     def _get_device(self) -> torch.device:
         """Get device from config."""
@@ -256,15 +261,33 @@ class Trainer:
             labels = batch["labels"].to(self.device)
             tokens_seen += input_ids.numel()
 
-            # Forward pass
-            if self.use_amp and self.scaler is not None:
+            # Get attention_mask from batch
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            # Build cca_step from global optimizer step (not batch index)
+            cca_step = None
+            if getattr(self.cfg, "use_cca", False):
+                cca_step = self.global_step
+
+            # Forward pass — autocast whenever AMP is enabled (independent of scaler)
+            if self.use_amp:
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16
+                    device_type="cuda", dtype=self.amp_dtype
                 ):
-                    outputs = self.model(input_ids, labels=labels)
+                    outputs = self.model(
+                        input_ids, labels=labels,
+                        attention_mask=attention_mask,
+                        cca_step=cca_step,
+                    )
                     loss = outputs["loss"]
             else:
-                outputs = self.model(input_ids, labels=labels)
+                outputs = self.model(
+                    input_ids, labels=labels,
+                    attention_mask=attention_mask,
+                    cca_step=cca_step,
+                )
                 loss = outputs["loss"]
 
             # Skip NaN/Inf losses (numerical instability)
@@ -287,8 +310,8 @@ class Trainer:
                     divisor = self.grad_accum_steps
                 loss = loss / divisor
 
-            # Backward pass
-            if self.use_amp and self.scaler is not None:
+            # Backward pass — scale only if scaler exists
+            if self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
@@ -300,7 +323,7 @@ class Trainer:
             # Optimizer step after accumulation
             is_last = (batch_idx + 1) == len(self.train_loader)
             if accum_count >= self.grad_accum_steps or is_last:
-                if self.use_amp and self.scaler is not None:
+                if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.cfg.grad_clip
@@ -356,14 +379,17 @@ class Trainer:
         for batch in pbar:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
 
-            if self.use_amp and self.scaler is not None:
+            if self.use_amp:
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16
+                    device_type="cuda", dtype=self.amp_dtype
                 ):
-                    outputs = self.model(input_ids, labels=labels)
+                    outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
             else:
-                outputs = self.model(input_ids, labels=labels)
+                outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
 
             loss = outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):

@@ -10,6 +10,7 @@ import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import pandas as pd
 import torch
 from datasets import load_dataset
@@ -82,6 +83,7 @@ def build_cfg(vocab_size):
         epochs=N_EPOCHS,
         warmup_steps=50,
         grad_clip=1.0,
+        grad_buffer_ratio=0.0
     )
 
 
@@ -147,6 +149,12 @@ def test_long_stride_equivalence(texts, tokenizer):
 
     # Fresh config copy for Run B (defensive against mutation from save_pretrained)
     cfg_b = copy.deepcopy(cfg_a)
+
+    # FIX: Reset global RNG seeds before model_b init so HelixGraph topology
+    # matches model_a (same seed=42 used in HelixGraph.__init__)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
 
     # Run B: 50 % overlap
     print("\n>>> Run B: stride=16 (50% overlap)", flush=True)

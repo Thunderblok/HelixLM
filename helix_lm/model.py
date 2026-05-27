@@ -2,8 +2,10 @@
 HelixLM Core model: embeddings, recurrent heterogeneous graph, output head, generation.
 """
 import math
+import random
 from typing import Optional, List, Dict, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,6 +25,14 @@ class HelixLMCore(nn.Module):
     def __init__(self, cfg: HelixConfig, tie_weights: bool = True, create_output_head: bool = True):
         super().__init__()
         self.cfg = cfg
+
+        # --- Fix A: Global RNG self-seeding ---
+        if getattr(cfg, 'seed', None) is not None:
+            torch.manual_seed(cfg.seed)
+            np.random.seed(cfg.seed)
+            random.seed(cfg.seed)
+            print(f"[HelixLM] Global RNG seed set to {cfg.seed} "
+                  f"(set HelixConfig(seed=None) to disable auto-seeding)")
 
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.recurrent = HelixRecurrentBlock(cfg)
@@ -60,9 +70,9 @@ class HelixLMCore(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=self.cfg.initializer_range)
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, token_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, cca_step: Optional[int] = None) -> torch.Tensor:
         e = self.embed(token_ids)
-        h = self.recurrent(e, e.detach())
+        h = self.recurrent(e, e, attention_mask=attention_mask, cca_step=cca_step)
         if self.head is not None:
             logits = self.head(self.out_norm(h))
         else:

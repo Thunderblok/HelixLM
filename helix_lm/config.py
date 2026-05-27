@@ -4,6 +4,8 @@ HelixLM Configuration with HuggingFace PretrainedConfig integration.
 Scales from tiny smoke-test models (128 d_model) up to multi-billion
 parameter production models via a single dataclass.
 """
+
+from math import e
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
 import torch
@@ -47,6 +49,7 @@ class HelixConfig(PretrainedConfig):
         n_heads: int = 4,
         k_proj_dim: int = 32,
         dropout: float = 0.05,
+        attn_dropout: float = 0.1,  # Higher dropout specifically for attention nodes
 
         # --- Linear Attention ---
         linear_feature_dim: int = 64,
@@ -95,10 +98,12 @@ class HelixConfig(PretrainedConfig):
 
         # --- Initialization ---
         initializer_range: float = 0.02,
+        lti_init_A: float = None,  # 1/e ≈ 0.368 default (set in recurrent.py)
 
         # --- Device ---
         device: str = "auto",
         dtype: str = "float32",
+        amp_dtype: str = "float16",  # AMP autocast dtype: "float16" | "bfloat16"
 
         # --- Tokenizer ---
         tokenizer_name: str = "gpt2",  # "char", "gpt2", "qwen", "custom"
@@ -132,8 +137,18 @@ class HelixConfig(PretrainedConfig):
         # memory
         memory_efficient_forward: bool = False,
         
+        # --- Curriculum Component Activation ---
+        use_cca: bool = False,
+        cca_warmup_steps: int = 5000,
+        cca_ramp_mode: str = "quadratic",  # "quadratic" | "cubic_ease" | "linear"
+        cca_min_scale: float = 0.05,  # Minimum attention contribution (prevents FFN-only collapse)
+
+        # --- RNG seeding ---
+        seed: Optional[int] = 42,  # None = user manages RNG manually
+
         # --- Misc ---
         tie_word_embeddings: bool = True,
+        grad_buffer_ratio: float = None,  # Gradient buffer for safe weight tying (0=standard tying, 1=max buffer)
         **kwargs,
     ):
         # --- HF PretrainedConfig expects these ---
@@ -142,6 +157,10 @@ class HelixConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id or 0
         self.bos_token_id = bos_token_id or 0
         self.tie_word_embeddings = tie_word_embeddings
+        self.grad_buffer_ratio = grad_buffer_ratio
+        self.seed = seed
+        if self.grad_buffer_ratio is None:
+            self.grad_buffer_ratio = 1.0 / e
 
         # --- Core dims ---
         self.seq_len = seq_len
@@ -156,7 +175,14 @@ class HelixConfig(PretrainedConfig):
         self.n_heads = n_heads
         self.k_proj_dim = k_proj_dim
         self.dropout = dropout
+        self.attn_dropout = attn_dropout
         self.linear_feature_dim = linear_feature_dim
+
+        # --- CCA ---
+        self.use_cca = use_cca
+        self.cca_warmup_steps = cca_warmup_steps
+        self.cca_ramp_mode = cca_ramp_mode
+        self.cca_min_scale = cca_min_scale
 
         # --- SSM ---
         self.use_ssm = use_ssm
@@ -202,9 +228,15 @@ class HelixConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.device = device
         if isinstance(dtype, str):
-            self.dtype = getattr(torch, dtype.replace("torch.", ""))
+            dtype_str = dtype.replace("torch.", "")
+            if dtype_str in ("None", "none"):
+                self.dtype = None
+            else:
+                self.dtype = getattr(torch, dtype_str)
         else:
             self.dtype = dtype
+
+        self.amp_dtype = amp_dtype
 
         # --- Tokenizer ---
         self.tokenizer_name = tokenizer_name
@@ -219,7 +251,10 @@ class HelixConfig(PretrainedConfig):
 
         # --- Chat ---
         self.chat_template = chat_template
-        self.stop_strings = stop_strings or ["<|endoftext|>", "<|im_end|>", "</s>"]
+        # Default to None — stop strings should be set explicitly by the user.
+        # Having defaults here breaks model.generate() in HF 5.8 because
+        # generate() requires a tokenizer when stop strings are present.
+        self.stop_strings = stop_strings
 
         # --- VLM ---
         self.is_vlm = is_vlm
@@ -248,14 +283,30 @@ class HelixConfig(PretrainedConfig):
                 npc = npc[:self.n_columns]
             self.nodes_per_column = npc
 
-        # --- HF compat ---
+        # --- HF compat: attributes required by GenerationMixin and utilities ---
         self.use_cache = kwargs.get("use_cache", True)
+        # num_hidden_layers is required by HF GenerationMixin for cache shape inference
+        # For HelixLM, this is the effective depth: n_columns * n_loops
+        self.num_hidden_layers = kwargs.get("num_hidden_layers", self.n_columns * self.n_loops)
+        # Required by HF for encoder-decoder detection
+        self.is_encoder_decoder = kwargs.get("is_encoder_decoder", False)
+        # hidden_size is an attribute (not just property) so it serializes in to_dict()
+        self.hidden_size = d_model
+        # num_attention_heads is checked by some HF utilities
+        self.num_attention_heads = n_heads
+
+        # Pass dtype explicitly so PretrainedConfig.__init__ doesn't
+        # override it with its default None.
+        dtype_for_super = self.dtype
+        if isinstance(dtype_for_super, torch.dtype):
+            dtype_for_super = str(dtype_for_super).replace("torch.", "")
 
         super().__init__(
             pad_token_id=self.pad_token_id,
             eos_token_id=self.eos_token_id,
             bos_token_id=self.bos_token_id,
             tie_word_embeddings=self.tie_word_embeddings,
+            dtype=dtype_for_super,
             **kwargs,
         )
 
@@ -275,12 +326,18 @@ class HelixConfig(PretrainedConfig):
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
-        d["dtype"] = str(self.dtype).replace("torch.", "")
+        # Serialize dtype as string for JSON compatibility
+        if hasattr(self, "dtype") and self.dtype is not None:
+            d["dtype"] = str(self.dtype).replace("torch.", "")
+        else:
+            d["dtype"] = None
+        # Ensure seed is serialized
+        d["seed"] = getattr(self, "seed", None)
         return d
 
     @classmethod
     def tiny(cls, **kwargs):
-        """~0.5M parameters — smoke test / debugging."""
+        """~0.5M parameters -- smoke test / debugging."""
         defaults = dict(
             d_model=128, n_columns=2, nodes_per_column=(2, 2),
             n_heads=4, n_loops=1, seq_len=256, use_ssm=False,
@@ -290,7 +347,7 @@ class HelixConfig(PretrainedConfig):
 
     @classmethod
     def small(cls, **kwargs):
-        """~5M parameters — experiments and small-scale training."""
+        """~5M parameters -- experiments and small-scale training."""
         defaults = dict(
             d_model=256, n_columns=3, nodes_per_column=(2, 3, 2),
             n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
@@ -299,8 +356,41 @@ class HelixConfig(PretrainedConfig):
         return cls(**defaults)
 
     @classmethod
+    def micro(cls, **kwargs):
+        """~10M parameters with tied embeddings -- rapid iteration / ablations."""
+        defaults = dict(
+            d_model=192, n_columns=2, nodes_per_column=(3, 3),
+            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+            use_titans_memory=False, ffn_expansion=2.0,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
+    def mini(cls, **kwargs):
+        """~13M parameters with tied embeddings -- small-scale pretraining target."""
+        defaults = dict(
+            d_model=224, n_columns=2, nodes_per_column=(3, 3),
+            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+            use_titans_memory=False, ffn_expansion=2.0,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
+    def small_v2(cls, **kwargs):
+        """~15M parameters with tied embeddings -- Gate 2b target."""
+        defaults = dict(
+            d_model=256, n_columns=2, nodes_per_column=(3, 3),
+            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+            use_titans_memory=False, ffn_expansion=2.0,
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)
+
+    @classmethod
     def base(cls, **kwargs):
-        """~25M parameters — serious pretraining."""
+        """~25M parameters -- serious pretraining."""
         defaults = dict(
             d_model=512, n_columns=4, nodes_per_column=(3, 4, 4, 3),
             n_heads=8, n_loops=2, seq_len=1024, use_ssm=True,
@@ -310,7 +400,7 @@ class HelixConfig(PretrainedConfig):
 
     @classmethod
     def medium(cls, **kwargs):
-        """~100M parameters — production small model."""
+        """~100M parameters -- production small model."""
         defaults = dict(
             d_model=768, n_columns=5, nodes_per_column=(3, 4, 4, 4, 3),
             n_heads=12, n_loops=3, seq_len=2048, use_ssm=True,
@@ -321,7 +411,7 @@ class HelixConfig(PretrainedConfig):
 
     @classmethod
     def large(cls, **kwargs):
-        """~300M parameters — competitive with popular small LLMs."""
+        """~300M parameters -- competitive with popular small LLMs."""
         defaults = dict(
             d_model=1024, n_columns=6, nodes_per_column=(4, 5, 5, 5, 5, 4),
             n_heads=16, n_loops=3, seq_len=4096, use_ssm=True,
@@ -332,7 +422,7 @@ class HelixConfig(PretrainedConfig):
 
     @classmethod
     def xl(cls, **kwargs):
-        """~1B parameters — frontier small model."""
+        """~1B parameters -- frontier small model."""
         defaults = dict(
             d_model=1536, n_columns=6, nodes_per_column=(5, 6, 6, 6, 6, 5),
             n_heads=24, n_loops=4, seq_len=8192, use_ssm=True,
@@ -344,7 +434,7 @@ class HelixConfig(PretrainedConfig):
 
     @classmethod
     def xxl(cls, **kwargs):
-        """~4B parameters — approaching frontier territory."""
+        """~4B parameters -- approaching frontier territory."""
         defaults = dict(
             d_model=2048, n_columns=7, nodes_per_column=(5, 6, 6, 6, 6, 6, 5),
             n_heads=32, n_loops=4, seq_len=16384, use_ssm=True,

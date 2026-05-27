@@ -156,7 +156,13 @@ class HelixDataset(Dataset):
     def _make_sample(self, chunk, labels, is_natural_stop):
         input_ids = torch.tensor(chunk[:self.seq_len], dtype=torch.long)
         labels_t = torch.tensor(labels[:self.seq_len], dtype=torch.long)
-        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        # P1 FIX: Build mask from exact pad_len, NOT from pad_token_id comparison.
+        # GPT-2/Qwen set pad_id == eos_id; comparing token values masks real EOS.
+        pad_len = sum(1 for tok in reversed(labels_t.tolist()) if tok == -100)
+        attention_mask = torch.cat([
+            torch.ones(self.seq_len - pad_len, dtype=torch.long),
+            torch.zeros(pad_len, dtype=torch.long),
+        ])
         return {
             "input_ids": input_ids,
             "labels": labels_t,
@@ -211,7 +217,7 @@ class DocumentAwareDataset(Dataset):
             raise ValueError(f"stride must be in [1, seq_len], got {self.stride}")
 
         if min_tail_len is None:
-            min_tail_len = seq_len // 4
+            min_tail_len = 1  # Keep all documents; was seq_len//4 which dropped most docs at 512
         self.min_tail_len = min_tail_len
         self.add_eos = add_eos
 
@@ -326,10 +332,15 @@ class DocumentAwareDataset(Dataset):
         if pad_len > 0:
             labels[-pad_len:] = -100
 
+        # P1 FIX: Build mask from exact pad_len, NOT from pad_id comparison.
+        attention_mask = torch.cat([
+            torch.ones(self.seq_len - pad_len, dtype=torch.long),
+            torch.zeros(pad_len, dtype=torch.long),
+        ])
         return {
             "input_ids": x,
             "labels": labels,
-            "attention_mask": (x != self.pad_id).long(),
+            "attention_mask": attention_mask,
             "is_natural_stop": torch.tensor(is_natural, dtype=torch.bool),
         }
 
@@ -449,7 +460,7 @@ class HelixHFDataset(Dataset):
 
         self._doc_dataset = DocumentAwareDataset(
             self._texts, tokenizer, seq_len,
-            min_tail_len=seq_len // 4, add_eos=True, lazy=lazy, stride=stride,
+            min_tail_len=1, add_eos=True, lazy=lazy, stride=stride,
         )
 
     def __len__(self) -> int:

@@ -13,23 +13,37 @@ import torch.nn.functional as F
 from .config import HelixConfig
 from .nodes import (
     HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode
+    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode, RMSNorm
 )
 
 
 class HelixGraph(nn.Module):
     """
     Randomly wired heterogeneous graph of neural nodes.
-    
+
     - Topology: Biological-style neural columns with vertical and lateral connections
     - Aggregation: learned per-node merge (Linear bottleneck) or Gate
     - Stateful nodes (SSM/Mamba-2) expose state read/write across loops
+
+    RNG safety: global torch and numpy RNG states are saved before graph
+    construction and restored afterward.  Two HelixGraph instances built with
+    the same seed at different times will produce identical topologies.
     """
-    def __init__(self, cfg: HelixConfig, seed: int = 42):
+    def __init__(self, cfg: HelixConfig, seed: int = None):
         super().__init__()
         self.cfg = cfg
-        rng = np.random.RandomState(seed)
-        torch.manual_seed(seed)
+
+        # ── save global RNG state ──────────────────────────────────
+        _torch_rng = torch.get_rng_state()
+        _numpy_rng = np.random.get_state()
+        # ────────────────────────────────────────────────────────────
+
+        seed = getattr(cfg, 'seed', 42) if seed is None else seed
+        if seed is not None:
+            rng = np.random.RandomState(seed)
+            torch.manual_seed(seed)
+        else:
+            rng = np.random.RandomState()
 
         self.node_spec = self._build_node_spec()
         self.nodes = nn.ModuleDict()
@@ -76,16 +90,37 @@ class HelixGraph(nn.Module):
 
         # Merge layers for multi-predecessor non-gate nodes
         self.merges = nn.ModuleDict()
+        self.merge_norms = nn.ModuleDict()
         for name, preds in self.graph.items():
             if len(preds) > 1 and self.node_meta[name][2] != "gate":
                 self.merges[name] = nn.Linear(len(preds) * cfg.d_model, cfg.d_model)
+                self.merge_norms[name] = RMSNorm(cfg.d_model)
 
         self.order = self._topsort()
         self.root_nodes = [n for n in names if len(self.graph[n]) == 0 or self.node_meta[n][0] == 0]
         last_col = max(v[0] for v in self.node_meta.values())
         self.sink_nodes = [k for k, v in self.node_meta.items() if v[0] == last_col]
 
+        # Native CCA (Curriculum Component Activation) gates for attention nodes
+        self.use_cca = getattr(cfg, 'use_cca', False)
+        self.cca_warmup_steps = getattr(cfg, 'cca_warmup_steps', 5000)
+        self.cca_ramp_mode = getattr(cfg, 'cca_ramp_mode', 'quadratic')
+        self.cca_min_scale = getattr(cfg, 'cca_min_scale', 0.05)
+        if self.use_cca:
+            self.attention_gates = nn.ParameterDict()
+            for name, (ci, idx, ntype) in self.node_meta.items():
+                if ntype in ("linear_attn", "full_attn"):
+                    self.attention_gates[name] = nn.Parameter(torch.tensor(2.0))
+            self._cca_step = 0
+            self._cca_total_steps = self.cca_warmup_steps
+
+        # ── restore global RNG state ───────────────────────────────
+        torch.set_rng_state(_torch_rng)
+        np.random.set_state(_numpy_rng)
+        # ────────────────────────────────────────────────────────────
+
     def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
+        # ... (unchanged — omitted for brevity but keep the existing implementation)
         cfg = self.cfg
         spec = []
         for ci in range(cfg.n_columns):
@@ -96,15 +131,18 @@ class HelixGraph(nn.Module):
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
 
+            attn_drop = getattr(cfg, 'attn_dropout', cfg.dropout)
             if use_full_attn:
                 column.append(("full_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
+                    "attn_dropout": attn_drop,
                 }))
             else:
                 column.append(("linear_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout,
+                    "attn_dropout": attn_drop,
                 }))
 
             column.append(("swiglu", {
@@ -113,7 +151,6 @@ class HelixGraph(nn.Module):
 
             if cfg.use_ssm:
                 if hasattr(cfg, 'ssm_d_state') and cfg.ssm_d_state >= 64:
-                    # Use Mamba-2 for larger state dimensions
                     column.append(("mamba2", {
                         "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand,
@@ -128,7 +165,6 @@ class HelixGraph(nn.Module):
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand, "dropout": cfg.dropout,
                     }))
 
-            # Optional Titans Neural Memory — guaranteed at least once if enabled
             if cfg.use_titans_memory:
                 if cfg.titans_always_select and ci == 0:
                     column.append(("titans", {
@@ -187,7 +223,7 @@ class HelixGraph(nn.Module):
             raise ValueError(f"Cycle detected! Remaining: {remaining}")
         return out
 
-    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None, attention_mask: Optional[torch.Tensor] = None, cca_step: Optional[int] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if states is None:
             states = {}
         new_states = {}
@@ -195,7 +231,6 @@ class HelixGraph(nn.Module):
 
         for name in self.nodes:
             if not self.graph[name]:
-                # Stateful nodes must run forward to produce/update their state
                 if not isinstance(self.nodes[name], (SSMNode, Mamba2Node, TitansMemoryNode)):
                     cache[name] = x
 
@@ -210,22 +245,40 @@ class HelixGraph(nn.Module):
             _, _, ntype = self.node_meta[name]
 
             if ntype == "gate":
-                merged = feats if len(feats) > 0 else [x]  # GateNode always expects a list
+                merged = feats if len(feats) > 0 else [x]
             elif len(feats) == 1:
                 merged = feats[0]
             elif len(feats) == 0:
-                merged = x  # Root node with no predecessors
+                merged = x
             else:
                 merged = self.merges[name](torch.cat(feats, dim=-1))
+                if name in self.merge_norms:
+                    merged = self.merge_norms[name](merged)
 
             node = self.nodes[name]
             if isinstance(node, (SSMNode, Mamba2Node, TitansMemoryNode)):
-                out, s = node(merged, state=states.get(name))
+                out, s = node(merged, state=states.get(name), attention_mask=attention_mask)
                 new_states[name] = s
             elif isinstance(node, GateNode):
-                out, _ = node(merged)
+                out, _ = node(merged, attention_mask=attention_mask)
             else:
-                out, _ = node(merged)
+                out, _ = node(merged, attention_mask=attention_mask)
+
+            if self.use_cca and ntype in ("linear_attn", "full_attn") and name in self.attention_gates:
+                total = max(1, self._cca_total_steps)
+                step = cca_step if cca_step is not None else self._cca_step
+                progress = min(1.0, step / total)
+                if self.cca_ramp_mode == 'quadratic':
+                    scale = progress ** 2
+                elif self.cca_ramp_mode == 'cubic_ease':
+                    scale = progress ** 2 * (3 - 2 * progress)
+                else:
+                    scale = progress
+                scale = self.cca_min_scale + (1.0 - self.cca_min_scale) * scale
+                learned_gate = torch.sigmoid(self.attention_gates[name])
+                curriculum_gate = learned_gate * scale
+                out = curriculum_gate * out + (1 - curriculum_gate) * merged
+
             cache[name] = out
 
         if len(self.sink_nodes) == 1:
