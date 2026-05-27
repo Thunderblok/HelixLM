@@ -1,7 +1,7 @@
 
 # HelixLM: Recurrent Heterogeneous Graph Neural Language Model
 
-> **Why "Helix"?** A helix coils back on itself — just as our recurrent graph reuses its weights across depth iterations, refining understanding with each loop. Biological, elegant, memorable.
+> **Why "Helix"?** A helix coils back on itself, just as our recurrent graph reuses its weights across depth iterations, refining understanding with each loop. Biological, elegant, memorable.
 
 HelixLM is an optimized hybrid architecture for small-scale language modeling, designed for **hyperpersonalization** and **on-device AI**. It combines biological brain-inspired random graph wiring with modern SOTA primitives (hybrid attention, Mamba-2 SSD, RoPE, SwiGLU, RMSNorm, optional Titans neural memory) and full HuggingFace integration.
 
@@ -36,11 +36,11 @@ Recurrent loops reuse weights (depth without parameter growth). Graph wiring cre
 
 ## Use Cases
 
-1. **Hyperpersonalization** - Train a small model (from tens of milions of parameters to ~1B parameters) from cold start or from an early - stage **partially** pre-trained model checkpoint on a **personalized** corpus enriched in it's representation of content relevant to your domain knowledge, **before** it was full fine-tunes on your own data. The model becomes an expert in the one thing generic frontier models don't know: **you**, your domain knowledge, style, notes, emails, work patterns, and personal voice.
+1. **Hyperpersonalization:** Train a small model (from tens of milions of parameters to ~1B parameters) from cold start or from an early - stage **partially** pre-trained model checkpoint on a **personalized** corpus enriched in it's representation of content relevant to your domain knowledge, **before** it was full fine-tunes on your own data. The model becomes an expert in the one thing generic frontier models don't know anything about: **you**, your domain knowledge, style, notes, emails, work patterns, and personal voice. A personalized small language model drafts responses to your requests with full awareness of the entire data you encoded in its weights, including the secondary details, tertiary details, and edge cases that vector DB RAG systems usually miss because they are semantically dissimilar to the prompt. This oversight leaves the loose ends that hang you if you don't catch them. Evolve to a better adapted approach.
 
-2. **On-device AI** - Efficient inference on CPU/GPU for desktops, laptops, tablets, and mobile. Strong quality per parameter, with optional fully-local (log-free) operation for sensitive use cases.
+2. **On-device AI:** Efficient inference on CPU/GPU for desktops, laptops, tablets, and mobile. Strong quality per parameter, with optional fully-local (log-free) operation for sensitive use cases.
 
-3. **Economical and ecologically sound AI** The brute force approach that previous generation [used to be] frontier labs use cause electricity prices to surge and compromise water supplies. Take an exponential cut out of the problem with more efficient AI (a model architecture with better parameter efficinecy and that can saturate the model's weights / grock on as little as **one** epoch).
+3. **Economical and ecologically sound AI:** The brute force approach that previous generation [used to be] frontier labs use is unsustainable: It burn cash at a rate that is economically unsustainable, causes electricity prices to surge for consumers competing with them for their share of electric grid's limited capacity, and compromises water supplies. Take an exponential cut out of the problem with more efficient AI: A model architecture with better parameter efficinecy, one that can use hybrid or even flat out linear attention only, and that can saturate the model's weights / grock on as little as **one** epoch.
 
 ---
 
@@ -103,25 +103,9 @@ Logits / Loss
 
 ---
 
-## Comparison: Where does HelixLM fit?
+### HelixLM and upstream aspects from OpenMythos
 
-### The Landscape
-
-| Project | What They Do | Their Core Tech | What isn't perfect |
-|---------|-------------|-----------------|----------------|
-| **OpenMythos** | Recurrent depth for LLMs | LTI stability + ACT halting | Standard transformer blocks; no heterogeneous graph |
-| **Cerebros** | Biological brain-inspired wiring | Random DAG of dense layers | No real attention; no positional encoding; no recurrence |
-| **Phi-2 (Microsoft)** | Small but capable | Standard transformer + quality data | Nothing novel architecturally; just good data curation |
-| **Qwen2.5 (Alibaba)** | Multilingual small LLM | Standard transformer | No graph wiring; no recurrent depth; no SSM integration |
-| **Mamba-2 (Tri Dao)** | Efficient SSM | State Space Duality | Not a complete LLM architecture; needs integration |
-| **Kimi Linear** | Linear attention at scale | Hybrid linear + full attention | Not open source; no graph wiring |
-| **HelixLM (Ours)** | **All of the above, integrated** | **Graph + Recurrent + Hybrid Attention + Mamba-2 + Titans** | **Small team; needs community compute for 1B+ scaling** |
-
----
-
-### HelixLM vs. OpenMythos
-
-OpenMythos pioneered recurrent depth with LTI stability and ACT halting. HelixLM takes that insight and makes it work inside a **heterogeneous** graph that mimics neural column and random topology connectivity found in biological brains.
+OpenMythos published a recurrent depth with LTI stability and ACT halting. HelixLM takes that insight and makes it work inside a **heterogeneous** graph that mimics neural column and random topology connectivity found in biological brains.
 
 | Capability | OpenMythos | HelixLM |
 |-----------|-----------|---------|
@@ -145,53 +129,6 @@ OpenMythos pioneered recurrent depth with LTI stability and ACT halting. HelixLM
 [Cerebros](https://github.com/david-thrower/cerebros-core-algorithm-alpha/) showed that biological random hyperdense vertical and lateral topology of Dense layers could outperform rigid layer stacks. It generated text without attention on small data, but required elaborate integration and clashed with standard model-structure paradigms. HelixLM smoothly integrates that topological insight into a modern, HF-compatible LLM backbone.
 
 ---
-
-## ⚠️ Known Interaction: Stride < seq_len + Gradient Buffer
-
-### The Issue
-
-When `stride < seq_len` (overlapping chunks), `DocumentAwareDataset` masks the overlapping token positions with `labels = -100`. These "context-only" positions flow through the `TiedLMHead` buffer in the forward pass but contribute **zero gradient** in the backward pass. Over many steps, this forward/backward asymmetry can cause the buffer to drift, degrading model quality.
-
-### Impact
-
-| Training mode | Affected? | Severity |
-|--------------|-----------|----------|
-| `stride = seq_len` (default, any sequence length) | ❌ No | Safe — all positions contribute to loss |
-| `stride < seq_len` (overlap enabled) | ⚠️ Yes | Risk scales with overlap ratio. PPL degradation of ~2.5× observed at 50% overlap on tiny models |
-| `grad_buffer_ratio = 0.0` (standard tying, no buffer) | ❌ No | Always safe, at any stride |
-
-### Guidelines
-
-- **Default training (stride = seq_len):** Any `grad_buffer_ratio` is safe. No action needed.
-- **Overlap training (stride < seq_len):** Either set `grad_buffer_ratio=0.0`, or accept the quality trade-off. This combination should only be used for ablations, not production training.
-- **If you need overlap for data efficiency:** Consider using `grad_buffer_ratio=0.0` (standard weight tying without the learned buffer) or revert to untied embeddings for overlap training runs.
-
-```python
-# Safe: default stride, any buffer ratio
-cfg = HelixConfig.micro(grad_buffer_ratio=1/e)  # fine
-
-# Safe: overlap training, buffer disabled
-cfg = HelixConfig.micro(grad_buffer_ratio=0.0)
-loader = create_document_loader(texts, tokenizer, seq_len=512, stride=256)  # overlap OK
-
-# ⚠️ Risky: overlap training + buffer enabled
-cfg = HelixConfig.micro(grad_buffer_ratio=0.5)
-loader = create_document_loader(texts, tokenizer, seq_len=512, stride=256)  # avoid
-```
-Gradient buffer is generally not indicated above small ablation trials. At scale it may be best set to 0 anyway. 
-
-## ⚠️ Other caveats
-
-### Crystallization in smallest model configurations and how to work with it:
-
-On small model configurations (e.g. d_model of 256, maybe 384) you may experience crystallization (aka the optimizer gets lost in a local minima rabbit hole and overfits on subset of the data having repetitive tokens).
-
-Raising d_model to 512 + may be your cleanest fix. If you don't have the data or hardware to support increasing d_model:
-
-- Set a high learnng rate (usually 1e-3 to 2e-3)
-- Use the 'KITA' scheduler / spiking learning rate scheduler
-
-Cosine anealing does not appear effective on small data sets (400M and below, however, a contant learning rate or constant rate with periodic spikes in the rate both work well).
 
 ## Quick Start
 
@@ -318,6 +255,7 @@ generated = model.generate_ext(
 
 ### Recipe for vaible - scale training: See 400M_production_trainer.py
 
+---
 
 ## Project Structure
 
@@ -395,6 +333,58 @@ helix_lm/
 | **SwiGLU + RMSNorm + RoPE** | Llama / PaLM / GPT-NeoX | Modern SOTA primitives throughout |
 
 ---
+
+## ⚠️ Known Interaction: Stride < seq_len + Gradient Buffer
+
+### The Issue
+
+When `stride < seq_len` (overlapping chunks), `DocumentAwareDataset` masks the overlapping token positions with `labels = -100`. These "context-only" positions flow through the `TiedLMHead` buffer in the forward pass but contribute **zero gradient** in the backward pass. Over many steps, this forward/backward asymmetry can cause the buffer to drift, degrading model quality.
+
+### Impact
+
+| Training mode | Affected? | Severity |
+|--------------|-----------|----------|
+| `stride = seq_len` (default, any sequence length) | ❌ No | Safe — all positions contribute to loss |
+| `stride < seq_len` (overlap enabled) | ⚠️ Yes | Risk scales with overlap ratio. PPL degradation of ~2.5× observed at 50% overlap on tiny models |
+| `grad_buffer_ratio = 0.0` (standard tying, no buffer) | ❌ No | Always safe, at any stride |
+
+### Guidelines
+
+- **Default training (stride = seq_len):** Any `grad_buffer_ratio` is safe. No action needed.
+- **Overlap training (stride < seq_len):** Either set `grad_buffer_ratio=0.0`, or accept the quality trade-off. This combination should only be used for ablations, not production training.
+- **If you need overlap for data efficiency:** Consider using `grad_buffer_ratio=0.0` (standard weight tying without the learned buffer) or revert to untied embeddings for overlap training runs.
+
+```python
+# Safe: default stride, any buffer ratio
+cfg = HelixConfig.micro(grad_buffer_ratio=1/e)  # fine
+
+# Safe: overlap training, buffer disabled
+cfg = HelixConfig.micro(grad_buffer_ratio=0.0)
+loader = create_document_loader(texts, tokenizer, seq_len=512, stride=256)  # overlap OK
+
+# ⚠️ Risky: overlap training + buffer enabled
+cfg = HelixConfig.micro(grad_buffer_ratio=0.5)
+loader = create_document_loader(texts, tokenizer, seq_len=512, stride=256)  # avoid
+```
+Gradient buffer is generally not indicated above small ablation trials. At scale it may be best set to 0 anyway. 
+
+## ⚠️ Other caveats
+
+### Crystallization in smallest model configurations and how to work with it:
+
+On small model configurations (e.g. d_model of 256, maybe 384) you may experience crystallization (aka the optimizer gets lost in a local minima rabbit hole and overfits on subset of the data having repetitive tokens).
+
+Raising d_model to 512 + may be your cleanest fix. If you don't have the data or hardware to support increasing d_model:
+
+- Set a high learnng rate (usually 1e-3 to 2e-3)
+- Use the 'KITA' scheduler / spiking learning rate scheduler
+
+Cosine anealing does not appear optimal on small data sets (400M and below, however, a contant learning rate or constant rate with periodic spikes in the rate both work well).
+
+Muon optimizer may be structurally incompatible with this architecture.
+
+---
+
 
 ## License
 
