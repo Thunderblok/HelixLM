@@ -303,7 +303,7 @@ helix_lm/
 | Parameter | Effect | Default |
 |-----------|--------|---------|
 | `tie_word_embeddings` | Share embedding weight with LM head | `True` |
-| `grad_buffer_ratio` | Fraction of LM head gradient routed through buffer. `0.0` = standard tying. `1/e` = balanced. | `0.5` |
+| `grad_buffer_ratio` | Fraction of LM head gradient routed through buffer. `0.0` = standard tying. `1/e` = balanced. | `1 / e` |
 
 ### Training & Stability
 
