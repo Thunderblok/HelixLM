@@ -1,145 +1,0 @@
-/home/user/.local/lib/python3.12/site-packages/huggingface_hub/constants.py:277: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
-  warnings.warn(
-Loading dataset...
-Train docs: 8,942 | Val docs: 183
-Chunking:   0%|          | 0/8942 [00:00<?, ?doc/s][transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (1758 > 1024). Running this sequence through the model will result in indexing errors
-Chunking:   1%|          | 46/8942 [00:00<00:19, 456.76doc/s]Chunking:   1%|▏         | 116/8942 [00:00<00:14, 597.64doc/s]Chunking:   2%|▏         | 184/8942 [00:00<00:13, 633.91doc/s]Chunking:   3%|▎         | 250/8942 [00:00<00:14, 582.74doc/s]Chunking:   3%|▎         | 309/8942 [00:00<00:15, 567.58doc/s]Chunking:   4%|▍         | 393/8942 [00:00<00:13, 653.22doc/s]Chunking:   5%|▌         | 471/8942 [00:00<00:12, 689.82doc/s]Chunking:   6%|▌         | 541/8942 [00:00<00:14, 579.95doc/s]Chunking:   7%|▋         | 610/8942 [00:01<00:13, 606.76doc/s]Chunking:   8%|▊         | 674/8942 [00:01<00:14, 582.30doc/s]Chunking:   8%|▊         | 735/8942 [00:01<00:18, 451.54doc/s]Chunking:   9%|▉         | 799/8942 [00:01<00:16, 492.98doc/s]Chunking:  10%|▉         | 854/8942 [00:01<00:16, 485.61doc/s]Chunking:  10%|█         | 914/8942 [00:01<00:15, 512.68doc/s]Chunking:  11%|█         | 975/8942 [00:01<00:14, 537.82doc/s]Chunking:  12%|█▏        | 1048/8942 [00:01<00:14, 527.58doc/s]Chunking:  12%|█▏        | 1103/8942 [00:02<00:15, 496.04doc/s]Chunking:  13%|█▎        | 1154/8942 [00:02<00:16, 482.90doc/s]Chunking:  13%|█▎        | 1204/8942 [00:02<00:16, 478.91doc/s]Chunking:  14%|█▍        | 1263/8942 [00:02<00:15, 501.92doc/s]Chunking:  15%|█▍        | 1327/8942 [00:02<00:14, 538.77doc/s]Chunking:  15%|█▌        | 1382/8942 [00:02<00:14, 517.99doc/s]Chunking:  16%|█▌        | 1444/8942 [00:02<00:13, 543.58doc/s]Chunking:  17%|█▋        | 1499/8942 [00:02<00:16, 445.53doc/s]Chunking:  17%|█▋        | 1557/8942 [00:02<00:15, 477.06doc/s]Chunking:  18%|█▊        | 1637/8942 [00:03<00:13, 556.96doc/s]Chunking:  19%|█▉        | 1701/8942 [00:03<00:12, 579.10doc/s]Chunking:  20%|█▉        | 1762/8942 [00:03<00:13, 546.82doc/s]Chunking:  20%|██        | 1819/8942 [00:03<00:12, 550.68doc/s]Chunking:  21%|██        | 1876/8942 [00:03<00:12, 555.33doc/s]Chunking:  22%|██▏       | 1939/8942 [00:03<00:12, 574.57doc/s]Chunking:  22%|██▏       | 1998/8942 [00:03<00:12, 561.89doc/s]Chunking:  23%|██▎       | 2060/8942 [00:03<00:11, 577.45doc/s]Chunking:  24%|██▍       | 2130/8942 [00:03<00:11, 604.59doc/s]Chunking:  25%|██▍       | 2191/8942 [00:04<00:12, 560.29doc/s]Chunking:  25%|██▌       | 2258/8942 [00:04<00:11, 589.82doc/s]Chunking:  26%|██▌       | 2318/8942 [00:04<00:12, 530.80doc/s]Chunking:  27%|██▋       | 2373/8942 [00:04<00:12, 506.09doc/s]Chunking:  27%|██▋       | 2432/8942 [00:04<00:12, 526.97doc/s]Chunking:  28%|██▊       | 2486/8942 [00:04<00:12, 522.80doc/s]Chunking:  28%|██▊       | 2539/8942 [00:04<00:12, 497.93doc/s]Chunking:  29%|██▉       | 2596/8942 [00:04<00:12, 517.35doc/s]Chunking:  30%|██▉       | 2649/8942 [00:04<00:12, 516.09doc/s]Chunking:  30%|███       | 2718/8942 [00:05<00:11, 564.40doc/s]Chunking:  31%|███       | 2775/8942 [00:05<00:11, 514.62doc/s]Chunking:  32%|███▏      | 2828/8942 [00:05<00:12, 475.12doc/s]Chunking:  32%|███▏      | 2890/8942 [00:05<00:11, 512.02doc/s]Chunking:  33%|███▎      | 2956/8942 [00:05<00:11, 544.11doc/s]Chunking:  34%|███▍      | 3027/8942 [00:05<00:10, 588.23doc/s]Chunking:  35%|███▍      | 3087/8942 [00:05<00:10, 576.91doc/s]Chunking:  35%|███▌      | 3149/8942 [00:05<00:09, 586.47doc/s]Chunking:  36%|███▌      | 3209/8942 [00:05<00:10, 563.15doc/s]Chunking:  37%|███▋      | 3277/8942 [00:06<00:09, 594.62doc/s]Chunking:  37%|███▋      | 3340/8942 [00:06<00:09, 602.46doc/s]Chunking:  38%|███▊      | 3401/8942 [00:06<00:09, 573.33doc/s]Chunking:  39%|███▉      | 3474/8942 [00:06<00:08, 615.33doc/s]Chunking:  40%|███▉      | 3537/8942 [00:06<00:09, 583.15doc/s]Chunking:  40%|████      | 3599/8942 [00:06<00:09, 593.18doc/s]Chunking:  41%|████      | 3659/8942 [00:06<00:09, 580.85doc/s]Chunking:  42%|████▏     | 3720/8942 [00:06<00:08, 585.12doc/s]Chunking:  42%|████▏     | 3779/8942 [00:07<00:13, 396.67doc/s]Chunking:  43%|████▎     | 3838/8942 [00:07<00:11, 434.22doc/s]Chunking:  44%|████▎     | 3906/8942 [00:07<00:10, 483.55doc/s]Chunking:  44%|████▍     | 3968/8942 [00:07<00:09, 515.42doc/s]Chunking:  45%|████▌     | 4025/8942 [00:07<00:09, 508.56doc/s]Chunking:  46%|████▌     | 4095/8942 [00:07<00:14, 345.36doc/s]Chunking:  47%|████▋     | 4167/8942 [00:07<00:11, 415.51doc/s]Chunking:  47%|████▋     | 4220/8942 [00:08<00:12, 374.94doc/s]Chunking:  48%|████▊     | 4283/8942 [00:08<00:10, 426.78doc/s]Chunking:  48%|████▊     | 4334/8942 [00:08<00:10, 442.31doc/s]Chunking:  49%|████▉     | 4390/8942 [00:08<00:09, 463.99doc/s]Chunking:  50%|████▉     | 4460/8942 [00:08<00:08, 511.68doc/s]Chunking:  50%|█████     | 4515/8942 [00:08<00:08, 510.33doc/s]Chunking:  51%|█████     | 4579/8942 [00:08<00:08, 543.58doc/s]Chunking:  52%|█████▏    | 4636/8942 [00:08<00:08, 512.06doc/s]Chunking:  53%|█████▎    | 4698/8942 [00:08<00:07, 538.26doc/s]Chunking:  53%|█████▎    | 4759/8942 [00:09<00:07, 557.11doc/s]Chunking:  54%|█████▍    | 4816/8942 [00:09<00:08, 504.35doc/s]Chunking:  54%|█████▍    | 4869/8942 [00:09<00:08, 484.52doc/s]Chunking:  55%|█████▌    | 4919/8942 [00:09<00:08, 468.46doc/s]Chunking:  56%|█████▌    | 4987/8942 [00:09<00:07, 522.68doc/s]Chunking:  56%|█████▋    | 5046/8942 [00:09<00:07, 538.22doc/s]Chunking:  57%|█████▋    | 5106/8942 [00:09<00:06, 554.50doc/s]Chunking:  58%|█████▊    | 5175/8942 [00:09<00:06, 593.24doc/s]Chunking:  59%|█████▊    | 5236/8942 [00:09<00:06, 584.58doc/s]Chunking:  59%|█████▉    | 5295/8942 [00:10<00:06, 555.02doc/s]Chunking:  60%|█████▉    | 5360/8942 [00:10<00:06, 581.27doc/s]Chunking:  61%|██████    | 5419/8942 [00:10<00:06, 581.47doc/s]Chunking:  61%|██████▏   | 5484/8942 [00:10<00:05, 578.04doc/s]Chunking:  62%|██████▏   | 5543/8942 [00:10<00:07, 483.38doc/s]Chunking:  63%|██████▎   | 5597/8942 [00:10<00:06, 496.48doc/s]Chunking:  63%|██████▎   | 5649/8942 [00:10<00:06, 486.99doc/s]Chunking:  64%|██████▍   | 5709/8942 [00:10<00:06, 516.48doc/s]Chunking:  65%|██████▍   | 5769/8942 [00:10<00:05, 537.83doc/s]Chunking:  65%|██████▌   | 5840/8942 [00:11<00:05, 585.14doc/s]Chunking:  66%|██████▌   | 5900/8942 [00:11<00:05, 558.16doc/s]Chunking:  67%|██████▋   | 5962/8942 [00:11<00:05, 568.17doc/s]Chunking:  67%|██████▋   | 6020/8942 [00:11<00:05, 504.08doc/s]Chunking:  68%|██████▊   | 6073/8942 [00:11<00:05, 499.84doc/s]Chunking:  68%|██████▊   | 6125/8942 [00:11<00:05, 483.25doc/s]Chunking:  69%|██████▉   | 6187/8942 [00:11<00:05, 516.37doc/s]Chunking:  70%|██████▉   | 6240/8942 [00:11<00:05, 479.51doc/s]Chunking:  71%|███████   | 6316/8942 [00:12<00:04, 554.23doc/s]Chunking:  71%|███████▏  | 6383/8942 [00:12<00:04, 585.32doc/s]Chunking:  72%|███████▏  | 6443/8942 [00:12<00:04, 583.95doc/s]Chunking:  73%|███████▎  | 6529/8942 [00:12<00:03, 661.35doc/s]Chunking:  74%|███████▍  | 6597/8942 [00:12<00:03, 592.86doc/s]Chunking:  75%|███████▍  | 6662/8942 [00:12<00:03, 607.42doc/s]Chunking:  75%|███████▌  | 6725/8942 [00:12<00:03, 554.42doc/s]Chunking:  76%|███████▌  | 6785/8942 [00:12<00:03, 554.90doc/s]Chunking:  77%|███████▋  | 6861/8942 [00:12<00:03, 609.01doc/s]Chunking:  77%|███████▋  | 6925/8942 [00:12<00:03, 616.86doc/s]Chunking:  78%|███████▊  | 6988/8942 [00:13<00:03, 615.21doc/s]Chunking:  79%|███████▉  | 7058/8942 [00:13<00:02, 638.26doc/s]Chunking:  80%|███████▉  | 7123/8942 [00:13<00:02, 641.41doc/s]Chunking:  80%|████████  | 7193/8942 [00:13<00:02, 654.65doc/s]Chunking:  81%|████████  | 7259/8942 [00:13<00:02, 603.03doc/s]Chunking:  82%|████████▏ | 7321/8942 [00:13<00:02, 566.38doc/s]Chunking:  83%|████████▎ | 7391/8942 [00:13<00:02, 601.14doc/s]Chunking:  83%|████████▎ | 7453/8942 [00:13<00:02, 556.99doc/s]Chunking:  84%|████████▍ | 7513/8942 [00:13<00:02, 567.94doc/s]Chunking:  85%|████████▍ | 7581/8942 [00:14<00:02, 587.99doc/s]Chunking:  85%|████████▌ | 7645/8942 [00:14<00:02, 538.16doc/s]Chunking:  86%|████████▌ | 7701/8942 [00:14<00:02, 518.95doc/s]Chunking:  87%|████████▋ | 7757/8942 [00:14<00:02, 528.73doc/s]Chunking:  88%|████████▊ | 7833/8942 [00:14<00:01, 588.31doc/s]Chunking:  88%|████████▊ | 7899/8942 [00:14<00:01, 601.30doc/s]Chunking:  89%|████████▉ | 7966/8942 [00:14<00:01, 613.80doc/s]Chunking:  90%|████████▉ | 8035/8942 [00:14<00:01, 634.30doc/s]Chunking:  91%|█████████ | 8099/8942 [00:14<00:01, 627.53doc/s]Chunking:  91%|█████████▏| 8163/8942 [00:15<00:01, 587.22doc/s]Chunking:  92%|█████████▏| 8223/8942 [00:15<00:01, 536.31doc/s]Chunking:  93%|█████████▎| 8278/8942 [00:15<00:01, 539.83doc/s]Chunking:  93%|█████████▎| 8337/8942 [00:15<00:01, 552.53doc/s]Chunking:  94%|█████████▍| 8394/8942 [00:15<00:00, 556.70doc/s]Chunking:  95%|█████████▍| 8456/8942 [00:15<00:00, 572.47doc/s]Chunking:  95%|█████████▌| 8515/8942 [00:15<00:00, 574.48doc/s]Chunking:  96%|█████████▌| 8590/8942 [00:15<00:00, 625.29doc/s]Chunking:  97%|█████████▋| 8659/8942 [00:15<00:00, 644.27doc/s]Chunking:  98%|█████████▊| 8724/8942 [00:16<00:00, 587.92doc/s]Chunking:  98%|█████████▊| 8784/8942 [00:16<00:00, 571.87doc/s]Chunking:  99%|█████████▉| 8842/8942 [00:16<00:00, 564.09doc/s]Chunking: 100%|█████████▉| 8899/8942 [00:16<00:00, 521.01doc/s]Chunking: 100%|██████████| 8942/8942 [00:16<00:00, 541.36doc/s]
-Building model...
-[HelixLM] Global RNG seed set to 42 (set HelixConfig(seed=None) to disable auto-seeding)
-Parameters: 19,170,438 total, 19,170,438 trainable
-
-============================================================
-Epoch 1/3 | LR: 2.00e-03 | Effective batch: 96
-============================================================
-  batch 50/1646 | loss=8.3354 ppl=4168.76 lr=2.00e-03 tok/s=36182 skipped=0
-  batch 100/1646 | loss=8.0691 ppl=3194.31 lr=2.00e-03 tok/s=37266 skipped=0
-  batch 150/1646 | loss=7.9513 ppl=2839.38 lr=2.00e-03 tok/s=37632 skipped=0
-  batch 200/1646 | loss=7.8711 ppl=2620.47 lr=2.00e-03 tok/s=37818 skipped=0
-  batch 250/1646 | loss=7.8086 ppl=2461.68 lr=2.00e-03 tok/s=37909 skipped=0
-  batch 300/1646 | loss=7.7483 ppl=2317.61 lr=2.00e-03 tok/s=37963 skipped=0
-  batch 350/1646 | loss=7.6837 ppl=2172.66 lr=2.00e-03 tok/s=37995 skipped=0
-  batch 400/1646 | loss=7.6213 ppl=2041.28 lr=2.00e-03 tok/s=38017 skipped=0
-  batch 450/1646 | loss=7.5613 ppl=1922.43 lr=2.00e-03 tok/s=38027 skipped=0
-  batch 500/1646 | loss=7.5049 ppl=1816.85 lr=2.00e-03 tok/s=38034 skipped=0
-  batch 550/1646 | loss=7.4534 ppl=1725.66 lr=2.00e-03 tok/s=38044 skipped=0
-  batch 600/1646 | loss=7.4034 ppl=1641.63 lr=2.00e-03 tok/s=38058 skipped=0
-  batch 650/1646 | loss=7.3579 ppl=1568.51 lr=2.00e-03 tok/s=38074 skipped=0
-  batch 700/1646 | loss=7.3128 ppl=1499.34 lr=2.00e-03 tok/s=38091 skipped=0
-  batch 750/1646 | loss=7.2722 ppl=1439.67 lr=2.00e-03 tok/s=38105 skipped=0
-  batch 800/1646 | loss=7.2331 ppl=1384.48 lr=2.00e-03 tok/s=38116 skipped=0
-  batch 850/1646 | loss=7.1972 ppl=1335.75 lr=2.00e-03 tok/s=38127 skipped=0
-  batch 900/1646 | loss=7.1633 ppl=1291.16 lr=2.00e-03 tok/s=38135 skipped=0
-  batch 950/1646 | loss=7.1311 ppl=1250.28 lr=2.00e-03 tok/s=38142 skipped=0
-  batch 1000/1646 | loss=7.1012 ppl=1213.47 lr=2.00e-03 tok/s=38148 skipped=0
-  batch 1050/1646 | loss=7.0717 ppl=1178.14 lr=2.00e-03 tok/s=38151 skipped=0
-  batch 1100/1646 | loss=7.0433 ppl=1145.18 lr=2.00e-03 tok/s=38150 skipped=0
-  batch 1150/1646 | loss=7.0167 ppl=1115.10 lr=2.00e-03 tok/s=38149 skipped=0
-  batch 1200/1646 | loss=6.9914 ppl=1087.24 lr=2.00e-03 tok/s=38146 skipped=0
-  batch 1250/1646 | loss=6.9668 ppl=1060.80 lr=2.00e-03 tok/s=38140 skipped=0
-  batch 1300/1646 | loss=6.9430 ppl=1035.91 lr=2.00e-03 tok/s=38132 skipped=0
-  batch 1350/1646 | loss=6.9198 ppl=1012.13 lr=2.00e-03 tok/s=38122 skipped=0
-  batch 1400/1646 | loss=6.8980 ppl=990.30 lr=2.00e-03 tok/s=38110 skipped=0
-  batch 1450/1646 | loss=6.8758 ppl=968.59 lr=2.00e-03 tok/s=38096 skipped=0
-  batch 1500/1646 | loss=6.8544 ppl=948.04 lr=2.00e-03 tok/s=38080 skipped=0
-  batch 1550/1646 | loss=6.8330 ppl=927.92 lr=2.00e-03 tok/s=38065 skipped=0
-  batch 1600/1646 | loss=6.8124 ppl=909.05 lr=2.00e-03 tok/s=38047 skipped=0
-  batch 1646/1646 | loss=6.7929 ppl=891.51 lr=2.00e-03 tok/s=38030 skipped=0
-
-Epoch 1 Summary:
-  Train Loss: 6.7929 | Train PPL: 891.51
-  Val Loss:   6.2328 | Val PPL:   509.18
-  Time: 265.9s | Tokens: 10,113,024 | Skipped: 0
-  [BEST] Saved checkpoint to /app/sandbox_helix/best_model_5m
-
-============================================================
-Epoch 2/3 | LR: 1.00e-03 | Effective batch: 96
-============================================================
-  batch 50/1646 | loss=5.9947 ppl=401.28 lr=1.00e-03 tok/s=37522 skipped=0
-  batch 100/1646 | loss=5.9857 ppl=397.69 lr=1.00e-03 tok/s=37499 skipped=0
-  batch 150/1646 | loss=5.9694 ppl=391.29 lr=1.00e-03 tok/s=37503 skipped=0
-  batch 200/1646 | loss=5.9573 ppl=386.56 lr=1.00e-03 tok/s=37515 skipped=0
-  batch 250/1646 | loss=5.9435 ppl=381.28 lr=1.00e-03 tok/s=37521 skipped=0
-  batch 300/1646 | loss=5.9357 ppl=378.31 lr=1.00e-03 tok/s=37517 skipped=0
-  batch 350/1646 | loss=5.9210 ppl=372.79 lr=1.00e-03 tok/s=37511 skipped=0
-  batch 400/1646 | loss=5.9134 ppl=369.97 lr=1.00e-03 tok/s=37501 skipped=0
-  batch 450/1646 | loss=5.9074 ppl=367.75 lr=1.00e-03 tok/s=37497 skipped=0
-  batch 500/1646 | loss=5.8978 ppl=364.25 lr=1.00e-03 tok/s=37497 skipped=0
-  batch 550/1646 | loss=5.8890 ppl=361.03 lr=1.00e-03 tok/s=37500 skipped=0
-  batch 600/1646 | loss=5.8814 ppl=358.32 lr=1.00e-03 tok/s=37501 skipped=0
-  batch 650/1646 | loss=5.8739 ppl=355.63 lr=1.00e-03 tok/s=37497 skipped=0
-  batch 700/1646 | loss=5.8661 ppl=352.85 lr=1.00e-03 tok/s=37493 skipped=0
-  batch 750/1646 | loss=5.8577 ppl=349.93 lr=1.00e-03 tok/s=37491 skipped=0
-  batch 800/1646 | loss=5.8521 ppl=347.95 lr=1.00e-03 tok/s=37491 skipped=0
-  batch 850/1646 | loss=5.8457 ppl=345.74 lr=1.00e-03 tok/s=37490 skipped=0
-  batch 900/1646 | loss=5.8394 ppl=343.57 lr=1.00e-03 tok/s=37489 skipped=0
-  batch 950/1646 | loss=5.8330 ppl=341.38 lr=1.00e-03 tok/s=37485 skipped=0
-  batch 1000/1646 | loss=5.8265 ppl=339.17 lr=1.00e-03 tok/s=37480 skipped=0
-  batch 1050/1646 | loss=5.8210 ppl=337.32 lr=1.00e-03 tok/s=37475 skipped=0
-  batch 1100/1646 | loss=5.8155 ppl=335.46 lr=1.00e-03 tok/s=37472 skipped=0
-  batch 1150/1646 | loss=5.8101 ppl=333.65 lr=1.00e-03 tok/s=37473 skipped=0
-  batch 1200/1646 | loss=5.8048 ppl=331.89 lr=1.00e-03 tok/s=37473 skipped=0
-  batch 1250/1646 | loss=5.7978 ppl=329.56 lr=1.00e-03 tok/s=37473 skipped=0
-  batch 1300/1646 | loss=5.7932 ppl=328.06 lr=1.00e-03 tok/s=37472 skipped=0
-  batch 1350/1646 | loss=5.7875 ppl=326.20 lr=1.00e-03 tok/s=37471 skipped=0
-  batch 1400/1646 | loss=5.7827 ppl=324.63 lr=1.00e-03 tok/s=37469 skipped=0
-  batch 1450/1646 | loss=5.7778 ppl=323.06 lr=1.00e-03 tok/s=37468 skipped=0
-  batch 1500/1646 | loss=5.7732 ppl=321.56 lr=1.00e-03 tok/s=37466 skipped=0
-  batch 1550/1646 | loss=5.7677 ppl=319.80 lr=1.00e-03 tok/s=37470 skipped=0
-  batch 1600/1646 | loss=5.7633 ppl=318.40 lr=1.00e-03 tok/s=37476 skipped=0
-  batch 1646/1646 | loss=5.7581 ppl=316.73 lr=1.00e-03 tok/s=37481 skipped=0
-
-Epoch 2 Summary:
-  Train Loss: 5.7581 | Train PPL: 316.73
-  Val Loss:   5.8311 | Val PPL:   340.73
-  Time: 269.8s | Tokens: 10,113,024 | Skipped: 0
-  [BEST] Saved checkpoint to /app/sandbox_helix/best_model_5m
-
-============================================================
-Epoch 3/3 | LR: 3.00e-04 | Effective batch: 96
-============================================================
-  batch 50/1646 | loss=5.4196 ppl=225.79 lr=3.00e-04 tok/s=37729 skipped=0
-  batch 100/1646 | loss=5.4175 ppl=225.31 lr=3.00e-04 tok/s=37731 skipped=0
-  batch 150/1646 | loss=5.4211 ppl=226.13 lr=3.00e-04 tok/s=37720 skipped=0
-  batch 200/1646 | loss=5.4208 ppl=226.05 lr=3.00e-04 tok/s=37710 skipped=0
-  batch 250/1646 | loss=5.4153 ppl=224.83 lr=3.00e-04 tok/s=37688 skipped=0
-  batch 300/1646 | loss=5.4136 ppl=224.45 lr=3.00e-04 tok/s=37659 skipped=0
-  batch 350/1646 | loss=5.4109 ppl=223.84 lr=3.00e-04 tok/s=37627 skipped=0
-  batch 400/1646 | loss=5.4071 ppl=222.98 lr=3.00e-04 tok/s=37589 skipped=0
-  batch 450/1646 | loss=5.4063 ppl=222.81 lr=3.00e-04 tok/s=37556 skipped=0
-  batch 500/1646 | loss=5.4025 ppl=221.96 lr=3.00e-04 tok/s=37543 skipped=0
-  batch 550/1646 | loss=5.4010 ppl=221.63 lr=3.00e-04 tok/s=37545 skipped=0
-  batch 600/1646 | loss=5.4004 ppl=221.50 lr=3.00e-04 tok/s=37552 skipped=0
-  batch 650/1646 | loss=5.4005 ppl=221.53 lr=3.00e-04 tok/s=37560 skipped=0
-  batch 700/1646 | loss=5.3983 ppl=221.02 lr=3.00e-04 tok/s=37567 skipped=0
-  batch 750/1646 | loss=5.3970 ppl=220.75 lr=3.00e-04 tok/s=37573 skipped=0
-  batch 800/1646 | loss=5.3953 ppl=220.37 lr=3.00e-04 tok/s=37575 skipped=0
-  batch 850/1646 | loss=5.3946 ppl=220.21 lr=3.00e-04 tok/s=37573 skipped=0
-  batch 900/1646 | loss=5.3934 ppl=219.96 lr=3.00e-04 tok/s=37567 skipped=0
-  batch 950/1646 | loss=5.3919 ppl=219.63 lr=3.00e-04 tok/s=37557 skipped=0
-  batch 1000/1646 | loss=5.3913 ppl=219.48 lr=3.00e-04 tok/s=37545 skipped=0
-  batch 1050/1646 | loss=5.3905 ppl=219.31 lr=3.00e-04 tok/s=37533 skipped=0
-  batch 1100/1646 | loss=5.3908 ppl=219.37 lr=3.00e-04 tok/s=37523 skipped=0
-  batch 1150/1646 | loss=5.3889 ppl=218.96 lr=3.00e-04 tok/s=37517 skipped=0
-  batch 1200/1646 | loss=5.3885 ppl=218.88 lr=3.00e-04 tok/s=37512 skipped=0
-  batch 1250/1646 | loss=5.3867 ppl=218.49 lr=3.00e-04 tok/s=37505 skipped=0
-  batch 1300/1646 | loss=5.3853 ppl=218.17 lr=3.00e-04 tok/s=37498 skipped=0
-  batch 1350/1646 | loss=5.3846 ppl=218.02 lr=3.00e-04 tok/s=37491 skipped=0
-  batch 1400/1646 | loss=5.3837 ppl=217.82 lr=3.00e-04 tok/s=37486 skipped=0
-  batch 1450/1646 | loss=5.3833 ppl=217.73 lr=3.00e-04 tok/s=37481 skipped=0
-  batch 1500/1646 | loss=5.3829 ppl=217.66 lr=3.00e-04 tok/s=37478 skipped=0
-  batch 1550/1646 | loss=5.3809 ppl=217.21 lr=3.00e-04 tok/s=37476 skipped=0
-  batch 1600/1646 | loss=5.3798 ppl=216.99 lr=3.00e-04 tok/s=37474 skipped=0
-  batch 1646/1646 | loss=5.3783 ppl=216.66 lr=3.00e-04 tok/s=37471 skipped=0
-
-Epoch 3 Summary:
-  Train Loss: 5.3783 | Train PPL: 216.66
-  Val Loss:   5.7420 | Val PPL:   311.67
-  Time: 269.9s | Tokens: 10,113,024 | Skipped: 0
-  [BEST] Saved checkpoint to /app/sandbox_helix/best_model_5m
-
-============================================================
-Training complete. Best val PPL: 311.67 at epoch 3
-Total tokens processed: 30,339,072
-Target: val PPL <= 289.10
-============================================================
-Final model saved to /app/sandbox_helix/final_model_5m
