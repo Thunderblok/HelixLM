@@ -1254,7 +1254,7 @@ def create_unified_data_loader(
         seq_len=seq_len,
         text_column=text_column,
         stride=stride,
-        min_tail_len=min_tail_len,
+        min_tail_len=min_tail_len if min_tail_len is not None else 1,
         add_eos=add_eos,
         shuffle_buffer_size=shuffle_buffer_size if shuffle else 0,
         seed=seed,

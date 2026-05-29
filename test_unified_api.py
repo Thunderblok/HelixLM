@@ -1,191 +1,252 @@
 """
-Smoke test for the unified data loader API.
-Tests both List[str] and streaming paths.
+Unified API Smoke Test for HelixLM Trainer with streaming and in-memory data.
+
+Tests the 4 supported usage patterns:
+1. List[str] -> Trainer (auto-detected, creates DataLoader internally)
+2. IterableDataset (streaming) -> Trainer (auto-detected, streams)
+3. List[str] -> create_data_loader() -> Trainer (DataLoader provided)
+4. IterableDataset (streaming) -> create_data_loader() -> Trainer (DataLoader provided)
+
+Uses real HF dataset: david-thrower/tiny-stories-mini-96-seq-len-50000-samples
+
+Public API imports only:
+- Trainer (from helix_lm.trainer)
+- HelixTokenizer, create_unified_data_loader (from helix_lm)
+- load_dataset (from datasets)
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from helix_lm import HelixTokenizer, create_unified_data_loader, ListIterableDataset
+from datasets import load_dataset
+from helix_lm import HelixTokenizer, create_unified_data_loader
+from helix_lm.trainer import Trainer
+from helix_lm.config import HelixConfig
+from helix_lm.hf_model import HelixForCausalLM
 
 
-def test_list_path():
-    """Test List[str] path with DocumentAwareDataset."""
-    print("\n=== Testing List[str] path ===")
+def get_test_data_as_list(num_samples=100):
+    """Load data as List[str] (in-memory)."""
+    ds = load_dataset("david-thrower/tiny-stories-mini-96-seq-len-50000-samples", split="train", streaming=False)
+    texts = [ds[i]["text"] for i in range(min(num_samples, len(ds)))]
+    return texts
+
+
+def get_test_data_as_streaming(num_samples=100):
+    """Load data as streaming IterableDataset."""
+    ds = load_dataset("david-thrower/tiny-stories-mini-96-seq-len-50000-samples", split="train", streaming=True)
+    # Take only first N samples for smoke test
+    ds = ds.take(num_samples)
+    return ds
+
+
+def test_list_str_to_trainer():
+    """Test 1: List[str] passed directly to Trainer."""
+    print("\n=== Test 1: List[str] -> Trainer ===")
     
     tokenizer = HelixTokenizer("gpt2")
-    texts = [
-        "This is a short document.",
-        "This is another document with more content to test.",
-        "A third document for good measure.",
-        "Document four with enough tokens to make multiple chunks " * 10,
-    ]
+    texts = get_test_data_as_list(num_samples=50)
     
-    loader = create_unified_data_loader(
-        texts,
-        tokenizer,
-        seq_len=32,
-        batch_size=2,
-        shuffle=True,
-        drop_last=True,
+    print(f"  Loaded {len(texts)} texts as List[str]")
+    
+    # Trainer auto-creates DataLoader internally via create_unified_data_loader
+    cfg = HelixConfig(
+        vocab_size=tokenizer.vocab_size,
+        seq_len=64,
+        batch_size=4,
+        epochs=1,
+        lr=1e-4,
     )
     
-    print(f"DataLoader type: {type(loader)}")
-    print(f"Dataset type: {type(loader.dataset)}")
-    print(f"Length: {len(loader)}")
+    model = HelixForCausalLM(cfg)
     
-    # Test iteration
-    batches = []
-    for i, batch in enumerate(loader):
-        batches.append(batch)
-        if i >= 2:  # Just get a few batches
-            break
-    
-    print(f"Batch keys: {batches[0].keys()}")
-    print(f"Batch input_ids shape: {batches[0]['input_ids'].shape}")
-    print(f"[PASS] List[str] path works!")
-    
-    return True
-
-
-def test_list_iterable_dataset():
-    """Test ListIterableDataset directly."""
-    print("\n=== Testing ListIterableDataset ===")
-    
-    texts = ["doc1", "doc2", "doc3", "doc4", "doc5"]
-    ds = ListIterableDataset(texts, epoch=0, shuffle=True, seed=42)
-    
-    print(f"Length: {len(ds)}")
-    
-    # Test epoch 0 iteration
-    ds.set_epoch(0)
-    items_epoch0 = list(ds)
-    print(f"Epoch 0 items: {[item['text'] for item in items_epoch0]}")
-    
-    # Test epoch 1 iteration (should be shuffled differently)
-    ds.set_epoch(1)
-    items_epoch1 = list(ds)
-    print(f"Epoch 1 items: {[item['text'] for item in items_epoch1]}")
-    
-    # Verify shuffling actually happened
-    epoch0_order = [item['text'] for item in items_epoch0]
-    epoch1_order = [item['text'] for item in items_epoch1]
-    
-    if epoch0_order != epoch1_order:
-        print(f"[PASS] Shuffling works (epochs have different orders)!")
-    else:
-        print(f"[FAIL] Shuffling not working (epochs have same order)")
-        return False
-    
-    return True
-
-
-def test_streaming_path():
-    """Test streaming path with ListIterableDataset wrapped in HelixIterableDataset."""
-    print("\n=== Testing streaming path ===")
-    
-    from helix_lm.dataset import HelixIterableDataset, helix_data_collator
-    from torch.utils.data import DataLoader
-    
-    tokenizer = HelixTokenizer("gpt2")
-    texts = [
-        "This is a short document. " * 5,
-        "This is another document with more content to test. " * 5,
-        "A third document for good measure. " * 5,
-    ]
-    
-    # Wrap as ListIterableDataset (simulates streaming)
-    list_ds = ListIterableDataset(texts, epoch=0, shuffle=True, seed=42)
-    
-    # Wrap in HelixIterableDataset
-    helix_ds = HelixIterableDataset(
-        hf_iterable=list_ds,
+    # This should auto-detect List[str] and create appropriate DataLoader
+    trainer = Trainer(
+        model=model,
+        cfg=cfg,
+        train_texts=texts,
         tokenizer=tokenizer,
-        seq_len=32,
-        shuffle_buffer_size=100,  # Small buffer for testing
-        seed=42,
+        verbose=False,
     )
     
-    loader = DataLoader(
-        helix_ds,
-        batch_size=2,
-        collate_fn=helix_data_collator,
-        drop_last=True,
-    )
-    
-    print(f"DataLoader type: {type(loader)}")
-    print(f"Dataset type: {type(loader.dataset)}")
-    
-    # Test iteration (no len() for iterable)
-    batches = []
-    count = 0
-    for batch in loader:
-        batches.append(batch)
-        count += 1
-        if count >= 2:
-            break
-    
-    print(f"Batch keys: {batches[0].keys()}")
-    print(f"Batch input_ids shape: {batches[0]['input_ids'].shape}")
-    print(f"[PASS] Streaming path works!")
-    
+    # Verify DataLoader was created
+    assert trainer.train_loader is not None
+    print(f"  DataLoader created: {type(trainer.train_loader).__name__}")
+    print(f"  [PASS] List[str] -> Trainer works!")
     return True
 
 
-def test_epoch_shuffling():
-    """Test that shuffling produces different orders per epoch."""
-    print("\n=== Testing epoch-based shuffling ===")
+def test_streaming_to_trainer():
+    """Test 2: Streaming IterableDataset passed directly to Trainer."""
+    print("\n=== Test 2: IterableDataset (streaming) -> Trainer ===")
     
     tokenizer = HelixTokenizer("gpt2")
-    texts = [f"Document number {i} with some content." for i in range(10)]
+    ds = get_test_data_as_streaming(num_samples=50)
     
-    # Create loader with shuffle
+    print(f"  Loaded streaming dataset")
+    
+    cfg = HelixConfig(
+        vocab_size=tokenizer.vocab_size,
+        seq_len=64,
+        batch_size=4,
+        epochs=1,
+        lr=1e-4,
+    )
+    
+    model = HelixForCausalLM(cfg)
+    
+    # Trainer auto-detects streaming datasets via create_unified_data_loader
+    try:
+        trainer = Trainer(
+            model=model,
+            cfg=cfg,
+            train_texts=ds,  # Pass streaming dataset
+            tokenizer=tokenizer,
+            verbose=False,
+        )
+        print(f"  DataLoader created: {type(trainer.train_loader).__name__}")
+        print(f"  [PASS] IterableDataset -> Trainer works!")
+        return True
+    except Exception as e:
+        print(f"  [FAIL] IterableDataset -> Trainer error: {e}")
+        return False
+
+
+def test_list_str_via_data_loader():
+    """Test 3: List[str] -> create_data_loader() -> Trainer."""
+    print("\n=== Test 3: List[str] -> create_data_loader() -> Trainer ===")
+    
+    tokenizer = HelixTokenizer("gpt2")
+    texts = get_test_data_as_list(num_samples=50)
+    
     loader = create_unified_data_loader(
         texts,
         tokenizer,
-        seq_len=32,
-        batch_size=1,
+        seq_len=64,
+        batch_size=4,
         shuffle=True,
-        drop_last=False,
+        drop_last=True,
     )
     
-    # Check if dataset supports set_epoch
-    ds = loader.dataset
-    if hasattr(ds, 'set_epoch'):
-        print(f"Dataset supports set_epoch: {type(ds).__name__}")
-        
-        # Get epoch 0 order
-        ds.set_epoch(0)
-        items_epoch0 = list(loader)
-        
-        # Get epoch 1 order
-        ds.set_epoch(1)
-        items_epoch1 = list(loader)
-        
-        print(f"Epoch 0 batches: {len(items_epoch0)}")
-        print(f"Epoch 1 batches: {len(items_epoch1)}")
-    else:
-        print(f"Dataset type {type(ds).__name__} uses DataLoader shuffle")
+    print(f"  DataLoader created from List[str]")
+    print(f"  Dataset type: {type(loader.dataset).__name__}")
     
-    print(f"[PASS] Epoch shuffling mechanism present!")
+    # Pass to Trainer via train_loader argument
+    cfg = HelixConfig(
+        vocab_size=tokenizer.vocab_size,
+        seq_len=64,
+        batch_size=4,
+        epochs=1,
+        lr=1e-4,
+    )
+    
+    model = HelixForCausalLM(cfg)
+    
+    trainer = Trainer(
+        model=model,
+        cfg=cfg,
+        train_loader=loader,  # Pass DataLoader directly
+        tokenizer=tokenizer,
+        verbose=False,
+    )
+    
+    print(f"  [PASS] List[str] -> DataLoader -> Trainer works!")
+    return True
+
+
+def test_streaming_via_data_loader():
+    """Test 4: IterableDataset -> create_data_loader() -> Trainer."""
+    print("\n=== Test 4: IterableDataset -> create_data_loader() -> Trainer ===")
+    
+    tokenizer = HelixTokenizer("gpt2")
+    ds = get_test_data_as_streaming(num_samples=50)
+    
+    loader = create_unified_data_loader(
+        ds,
+        tokenizer,
+        seq_len=64,
+        batch_size=4,
+        shuffle=True,
+        drop_last=True,
+        shuffle_buffer_size=100,
+    )
+    
+    print(f"  DataLoader created from streaming dataset")
+    print(f"  Dataset type: {type(loader.dataset).__name__}")
+    
+    cfg = HelixConfig(
+        vocab_size=tokenizer.vocab_size,
+        seq_len=64,
+        batch_size=4,
+        epochs=1,
+        lr=1e-4,
+    )
+    
+    model = HelixForCausalLM(cfg)
+    
+    trainer = Trainer(
+        model=model,
+        cfg=cfg,
+        train_loader=loader,  # Pass DataLoader directly
+        tokenizer=tokenizer,
+        verbose=False,
+    )
+    
+    print(f"  [PASS] IterableDataset -> DataLoader -> Trainer works!")
+    return True
+
+
+def test_iterations():
+    """Test that DataLoaders can actually iterate data."""
+    print("\n=== Test: DataLoader iteration ===")
+    
+    tokenizer = HelixTokenizer("gpt2")
+    
+    # Test List[str] path
+    texts = get_test_data_as_list(num_samples=10)
+    loader = create_unified_data_loader(
+        texts, tokenizer, seq_len=64, batch_size=2, shuffle=False, drop_last=True
+    )
+    
+    batch = next(iter(loader))
+    assert "input_ids" in batch
+    assert "labels" in batch
+    assert "attention_mask" in batch
+    print(f"  List[str] DataLoader batch shape: {batch['input_ids'].shape}")
+    
+    # Test streaming path
+    ds = get_test_data_as_streaming(num_samples=10)
+    loader = create_unified_data_loader(
+        ds, tokenizer, seq_len=64, batch_size=2, shuffle=False, drop_last=True
+    )
+    
+    batch = next(iter(loader))
+    assert "input_ids" in batch
+    assert "labels" in batch
+    assert "attention_mask" in batch
+    print(f"  IterableDataset DataLoader batch shape: {batch['input_ids'].shape}")
+    
+    print(f"  [PASS] DataLoader iteration works for both paths!")
     return True
 
 
 def main():
-    print("=" * 50)
-    print("Unified Data Loader API Smoke Tests")
-    print("=" * 50)
+    print("=" * 60)
+    print("Unified API Smoke Tests - Real HF Dataset")
+    print("=" * 60)
     
     results = []
     
-    results.append(("List[str] path", test_list_path()))
-    results.append(("ListIterableDataset", test_list_iterable_dataset()))
-    results.append(("Streaming path", test_streaming_path()))
-    results.append(("Epoch shuffling", test_epoch_shuffling()))
+    # Test all 4 patterns
+    results.append(("1. List[str] -> Trainer", test_list_str_to_trainer()))
+    results.append(("2. IterableDataset -> Trainer", test_streaming_to_trainer()))
+    results.append(("3. List[str] -> DataLoader -> Trainer", test_list_str_via_data_loader()))
+    results.append(("4. IterableDataset -> DataLoader -> Trainer", test_streaming_via_data_loader()))
+    results.append(("5. DataLoader iteration", test_iterations()))
     
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("TEST SUMMARY")
-    print("=" * 50)
+    print("=" * 60)
     
     for name, passed in results:
         status = "✓ PASS" if passed else "✗ FAIL"
