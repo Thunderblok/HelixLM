@@ -1039,6 +1039,60 @@ def create_document_loader(
     )
 
 
+class ListIterableDataset:
+    """
+    Wrap a Python list as an HF-style iterable dataset.
+    
+    Provides set_epoch() for reshuffling support between epochs.
+    Compatible with HelixIterableDataset for seamless streaming.
+    
+    Args:
+        data: List of items to iterate over
+        epoch: Starting epoch number
+        shuffle: Whether to shuffle data on each epoch change
+        seed: Random seed for reproducible shuffling
+        text_column: Key name when yielding dicts (default: "text")
+    """
+    def __init__(
+        self,
+        data: List[Any],
+        epoch: int = 0,
+        shuffle: bool = True,
+        seed: int = 42,
+        text_column: str = "text",
+    ):
+        self.data = data
+        self._epoch = epoch
+        self.shuffle = shuffle
+        self.seed = seed
+        self.text_column = text_column
+    
+    def set_epoch(self, epoch: int):
+        """Set epoch for reshuffling. Called by Trainer between epochs."""
+        self._epoch = epoch
+    
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        """Iterate over data, shuffling if enabled."""
+        if self.shuffle:
+            rng = random.Random(self.seed + self._epoch)
+            indices = list(range(len(self.data)))
+            rng.shuffle(indices)
+            data_iter = (self.data[i] for i in indices)
+        else:
+            data_iter = iter(self.data)
+        
+        for item in data_iter:
+            if isinstance(item, dict):
+                yield item
+            elif isinstance(item, str):
+                yield {self.text_column: item}
+            else:
+                yield {self.text_column: str(item)}
+    
+    def __len__(self) -> int:
+        return len(self.data)
+
+
 def create_helix_streaming_loader(
     hf_iterable,
     tokenizer,
@@ -1087,6 +1141,133 @@ def create_helix_streaming_loader(
         add_eos=add_eos,
         shuffle_buffer_size=shuffle_buffer_size,
         seed=seed,
+    )
+
+
+def create_unified_data_loader(
+    data: Union[List[str], Any],
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    stride: Optional[int] = None,
+    shuffle: bool = True,
+    drop_last: bool = True,
+    num_workers: int = 0,
+    min_tail_len: Optional[int] = None,
+    add_eos: bool = True,
+    lazy: bool = True,
+    text_column: str = "text",
+    shuffle_buffer_size: int = 10_000,
+    seed: int = 42,
+) -> DataLoader:
+    """
+    Unified data loader factory that accepts List[str] OR any iterable/streaming dataset.
+    
+    This is the recommended API entry point. It automatically detects the data type
+    and creates the appropriate dataset + DataLoader:
+    
+    - List[str] (map-style): Uses DocumentAwareDataset with PyTorch shuffle
+    - Iterable/streaming: Uses HelixIterableDataset with reservoir shuffle
+    
+    Both paths support shuffling once per epoch:
+    - Map-style: DataLoader shuffle + Trainer's set_epoch() call
+    - Iterable: HelixIterableDataset's internal shuffle_buffer + set_epoch()
+    
+    Args:
+        data: Either a List[str] of documents, or an iterable/streaming dataset
+              (HF IterableDataset, HelixIterableDataset, etc.)
+        tokenizer: Tokenizer instance with encode() and pad/eos token attributes
+        seq_len: Target sequence length for chunks
+        batch_size: Batch size for DataLoader
+        stride: Chunk stride (default: seq_len = no overlap)
+        shuffle: Whether to shuffle data each epoch (default: True)
+        drop_last: Whether to drop incomplete final batch (default: True)
+        num_workers: DataLoader worker processes (default: 0)
+        min_tail_len: Minimum document length to keep (default: 1)
+        add_eos: Append EOS to documents (default: True)
+        lazy: Whether to use lazy tokenization for List[str] (default: True)
+        text_column: Column name for text in streaming datasets (default: "text")
+        shuffle_buffer_size: Reservoir shuffle buffer for streaming (default: 10_000)
+        seed: Random seed for reproducible shuffle
+        
+    Returns:
+        DataLoader ready for Trainer consumption
+        
+    Example:
+        # List[str] path
+        texts = ["doc1...", "doc2...", ...]
+        loader = create_unified_data_loader(
+            texts, tokenizer, seq_len=512, batch_size=8, shuffle=True
+        )
+        
+        # Streaming path
+        hf_ds = load_dataset("dataset", split="train", streaming=True)
+        loader = create_unified_data_loader(
+            hf_ds, tokenizer, seq_len=512, batch_size=8, shuffle=True
+        )
+    """
+    # Detect if data is a List[str]
+    is_list_of_strings = (
+        isinstance(data, list) and 
+        len(data) > 0 and 
+        isinstance(data[0], str)
+    )
+    
+    if is_list_of_strings:
+        # Map-style path: DocumentAwareDataset
+        return create_document_loader(
+            texts=data,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            stride=stride,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            num_workers=num_workers,
+            min_tail_len=min_tail_len,
+            add_eos=add_eos,
+            lazy=lazy,
+        )
+    
+    # Iterable/streaming path
+    # Check if it already has our streaming interface
+    is_our_iterable = hasattr(data, 'set_epoch') and hasattr(data, '__iter__')
+    is_hf_iterable = hasattr(data, '__iter__') and not hasattr(data, '__getitem__')
+    
+    # For List[str] passed as iterable, wrap it
+    if isinstance(data, list):
+        data = ListIterableDataset(
+            data=data,
+            epoch=0,
+            shuffle=shuffle,
+            seed=seed,
+            text_column=text_column,
+        )
+    elif not is_our_iterable and not is_hf_iterable:
+        # Unknown type, try to treat as iterable
+        pass
+    
+    # Create HelixIterableDataset with shuffle support
+    ds = HelixIterableDataset(
+        hf_iterable=data,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        text_column=text_column,
+        stride=stride,
+        min_tail_len=min_tail_len,
+        add_eos=add_eos,
+        shuffle_buffer_size=shuffle_buffer_size if shuffle else 0,
+        seed=seed,
+    )
+    
+    # Iterable datasets use DataLoader without shuffle (shuffling is internal)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        collate_fn=helix_data_collator,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        # shuffle=False for iterable datasets
     )
 
 

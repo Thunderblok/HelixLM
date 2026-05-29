@@ -192,12 +192,15 @@ class Trainer:
         else:
             if train_texts is None:
                 raise ValueError("Either train_loader or train_texts must be provided.")
-            self.train_loader = create_document_loader(
+            # Use unified data loader API - it auto-detects List[str] vs Iterable
+            from .dataset import create_unified_data_loader
+            self.train_loader = create_unified_data_loader(
                 train_texts,
                 tokenizer,
-                cfg.seq_len,
-                cfg.batch_size,
+                seq_len=cfg.seq_len,
+                batch_size=cfg.batch_size,
                 shuffle=True,
+                drop_last=True,
                 min_tail_len=min_tail_len,
                 lazy=True,
             )
@@ -206,11 +209,13 @@ class Trainer:
         if val_loader is not None:
             self.val_loader = val_loader
         elif val_texts is not None:
-            self.val_loader = create_document_loader(
+            # Use unified data loader API - it auto-detects List[str] vs Iterable
+            from .dataset import create_unified_data_loader
+            self.val_loader = create_unified_data_loader(
                 val_texts,
                 tokenizer,
-                cfg.seq_len,
-                cfg.batch_size,
+                seq_len=cfg.seq_len,
+                batch_size=cfg.batch_size,
                 shuffle=False,
                 drop_last=False,
                 min_tail_len=min_tail_len,
