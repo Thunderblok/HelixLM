@@ -1,24 +1,43 @@
 """
 HelixLM Dataset with rolling text chunking and natural stop detection.
 
-Key fixes in this revision
-  * DocumentAwareDataset now tracks exact pad_len in every chunk tuple.
-    It NEVER scans backwards for pad_token_id, so GPT-2 (pad_id == eos_id)
-    cannot accidentally mask a real EOS.
-  * Optional within-document overlap (stride) added to DocumentAwareDataset.
-    stride == seq_len  -> non-overlapping (default).
-    stride <  seq_len  -> overlapping windows; overlap is masked in labels.
-  * No cross-document boundaries are ever crossed.
+This module provides THREE dataset strategies for different scales:
 
-Compatible with both eager and lazy loading.
+1. **Map-style datasets** (DocumentAwareDataset, HelixDataset):
+   Best for datasets that fit in memory. Index-based random access.
+   Backward compatible — all existing code continues to work unchanged.
+
+2. **Streaming iterable dataset** (HelixIterableDataset):
+   Best for 2B+ token corpora. Uses HF IterableDataset for true streaming
+   with on-the-fly tokenization/chunking. Never materializes the full corpus.
+   Trainer detects iterable datasets and skips length-based scheduler setup.
+
+3. **Pre-chunked map dataset** (HelixPrechunkedDataset):
+   Best for fast repeatable training. Pre-chunks once with Dataset.map()
+   and saves Arrow-backed dataset to disk. Fast random access.
+
+Key fixes preserved in ALL paths:
+  * Exact pad_len tracked in every chunk tuple. NEVER scans backwards for
+    pad_token_id, so GPT-2 (pad_id == eos_id) cannot accidentally mask real EOS.
+  * Optional within-document overlap (stride) with overlap masked in labels.
+  * No cross-document boundaries are ever crossed.
+  * is_natural_stop distinguishes true document ends from artificial slices.
+  * Recurrence-safety: document boundaries preserve state reset semantics.
+
+Compatible with HF transformers v5.8.1 Trainer — both map and iterable modes.
 """
 import random
-from typing import List, Optional, Iterator, Dict, Any, Union, Tuple
+import math
+from typing import List, Optional, Iterator, Dict, Any, Union, Tuple, Callable
 
 import torch
-from torch.utils.data import IterableDataset, Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset as TorchIterableDataset
 from tqdm import tqdm
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXISTING MAP-STYLE DATASETS (backward compatible — unchanged semantics)
+# ═══════════════════════════════════════════════════════════════════════════
 
 class HelixDataset(Dataset):
     """
@@ -369,7 +388,7 @@ class HelixDatasetFromTokens(Dataset):
 
         n = len(self.tokens)
         self.indices = list(range(0, max(1, n - seq_len), self.stride))
-        if n >= seq_len and (n - seq_len) % self.stride != 0:
+        if n >= seq_len and (n - self.stride) % self.stride != 0:
             self.indices.append(n - seq_len)
 
     def __len__(self) -> int:
@@ -392,6 +411,9 @@ class HelixHFDataset(Dataset):
     """
     Wrapper for HuggingFace datasets with streaming and non-streaming support.
     Uses DocumentAwareDataset internally, so no cross-document boundaries.
+
+    NOTE: For large corpora (2B+ tokens), consider using HelixIterableDataset
+    or HelixPrechunkedDataset instead to avoid materializing all texts in memory.
     """
     def __init__(
         self,
@@ -473,6 +495,489 @@ class HelixHFDataset(Dataset):
         return self._doc_dataset.get_stats()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW: STREAMING ITERABLE DATASET (for 2B+ token corpora)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HelixIterableDataset(TorchIterableDataset):
+    """
+    Streaming iterable dataset for HelixLM — true O(1) memory scaling.
+
+    Tokenizes and chunks documents ON-THE-FLY during iteration. Never
+    materializes the full corpus. Compatible with HF transformers v5.8.1
+    Trainer which detects the lack of __len__ and iterates directly.
+
+    Design:
+      - Wraps an HF IterableDataset stream (from load_dataset(..., streaming=True))
+      - Per-document tokenization and chunk emission in __iter__
+      - Preserves ALL HelixLM invariants:
+          * is_natural_stop per document boundary
+          * -100 masking at padding positions (from exact pad_len)
+          * attention_mask from pad_len (NOT pad_token_id comparison)
+          * Overlap masking when stride < seq_len
+          * No cross-document boundary crossings
+      - set_epoch() for reshuffling between epochs
+
+    Usage with Trainer:
+        ds = load_dataset("your_dataset", split="train", streaming=True)
+        train_ds = HelixIterableDataset(
+            ds, tokenizer, seq_len=512, text_column="text"
+        )
+        # Trainer detects iterable, skips len()-based sampler setup
+        trainer = Trainer(model, cfg, train_dataset=train_ds, ...)
+
+    Args:
+        hf_iterable: HF IterableDataset or any iterable yielding dicts with text_column
+        tokenizer: Tokenizer with encode() and pad_token_id/eos_token_id attributes
+        seq_len: Target sequence length for all emitted chunks
+        text_column: Column name containing document text (default: "text")
+        stride: Chunk stride. stride < seq_len enables overlap (default: seq_len)
+        min_tail_len: Minimum document length in tokens to keep (default: 1)
+        add_eos: Whether to append EOS token to each document (default: True)
+        shuffle_buffer_size: If > 0, uses reservoir shuffle with this buffer size
+        seed: Random seed for shuffle
+    """
+
+    def __init__(
+        self,
+        hf_iterable,
+        tokenizer,
+        seq_len: int = 2048,
+        text_column: str = "text",
+        stride: Optional[int] = None,
+        min_tail_len: int = 1,
+        add_eos: bool = True,
+        shuffle_buffer_size: int = 10_000,
+        seed: int = 42,
+    ):
+        self.hf_iterable = hf_iterable
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.text_column = text_column
+        self.stride = stride if stride is not None else seq_len
+        if not (1 <= self.stride <= self.seq_len):
+            raise ValueError(f"stride must be in [1, seq_len], got {self.stride}")
+        self.min_tail_len = min_tail_len
+        self.add_eos = add_eos
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.seed = seed
+        self._epoch = 0
+
+        # Robust pad_id fallback
+        self.pad_id = getattr(tokenizer, "pad_token_id", None)
+        if self.pad_id is None:
+            self.pad_id = getattr(tokenizer, "eos_token_id", 0)
+        self.eos_id = getattr(tokenizer, "eos_token_id", None)
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for reshuffling. Trainer calls this between epochs."""
+        self._epoch = epoch
+
+    def _tokenize_doc(self, text: str) -> Optional[List[int]]:
+        """Tokenize a single document. Returns None if too short/empty."""
+        text = text.strip()
+        if not text:
+            return None
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < self.min_tail_len:
+            return None
+        if self.add_eos and self.eos_id is not None:
+            ids.append(self.eos_id)
+        return ids
+
+    def _chunk_doc(self, ids: List[int]) -> Iterator[Tuple[List[int], bool, int, int]]:
+        """
+        Emit fixed-length chunks from a single document's token ids.
+        Yields tuples: (token_ids, is_natural_stop, pad_len, overlap_mask)
+        """
+        length = len(ids)
+        stride = self.stride
+        seq_len = self.seq_len
+
+        if length >= seq_len:
+            # Sliding-window chunks fully inside the document
+            starts = list(range(0, length - seq_len + 1, stride))
+            for i, start in enumerate(starts):
+                chunk = ids[start:start + seq_len]
+                is_last_start = (i == len(starts) - 1)
+                reaches_end = (start + seq_len == length)
+
+                # Natural stop logic
+                if not is_last_start:
+                    is_natural = False
+                else:
+                    tail_len = length - (start + seq_len)
+                    has_tail = tail_len >= self.min_tail_len
+                    is_natural = reaches_end or (not has_tail)
+
+                overlap_mask = 0
+                if start > 0 and stride < seq_len:
+                    overlap_mask = seq_len - stride
+
+                yield (chunk, is_natural, 0, overlap_mask)
+
+            # Tail: tokens after the last sliding chunk
+            last_covered_end = starts[-1] + seq_len if starts else 0
+            remainder_len = length - last_covered_end
+
+            if remainder_len >= self.min_tail_len:
+                tail = ids[last_covered_end:]
+                pad_len = seq_len - remainder_len
+                tail = tail + [self.pad_id] * pad_len
+                yield (tail, True, pad_len, 0)
+            elif remainder_len > 0 and starts:
+                # Tail too short: mark last sliding chunk as doc end
+                # We need to mutate the last yielded chunk — re-yield corrected version
+                pass  # The last sliding chunk already has is_natural computed above
+        else:
+            # Short document: pad to seq_len
+            pad_len = seq_len - length
+            chunk = ids + [self.pad_id] * pad_len
+            yield (chunk, True, pad_len, 0)
+
+    def _make_sample(
+        self,
+        chunk: List[int],
+        is_natural: bool,
+        pad_len: int,
+        overlap_mask: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Convert a chunk tuple to a training sample with proper masking."""
+        x = torch.tensor(chunk, dtype=torch.long)
+        labels = x.clone()
+
+        # Mask overlapping head (stride < seq_len)
+        if overlap_mask > 0:
+            labels[:overlap_mask] = -100
+
+        # Mask trailing padding (robust to pad_id == eos_id)
+        if pad_len > 0:
+            labels[-pad_len:] = -100
+
+        # Build attention_mask from exact pad_len (NOT pad_token_id comparison)
+        attention_mask = torch.cat([
+            torch.ones(self.seq_len - pad_len, dtype=torch.long),
+            torch.zeros(pad_len, dtype=torch.long),
+        ])
+
+        return {
+            "input_ids": x,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "is_natural_stop": torch.tensor(is_natural, dtype=torch.bool),
+        }
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """
+        Iterate over the dataset, yielding training samples on-the-fly.
+
+        With shuffle_buffer_size > 0, uses reservoir shuffle for randomness.
+        set_epoch() controls the shuffle seed between epochs.
+        """
+        rng = random.Random(self.seed + self._epoch)
+
+        # Prepare the underlying iterable
+        iterable = self.hf_iterable
+        if hasattr(iterable, "set_epoch"):
+            iterable.set_epoch(self._epoch)
+        elif hasattr(iterable, "shard") and callable(getattr(iterable, "shard", None)):
+            # HF IterableDataset: no set_epoch needed, shuffle is via shuffle()
+            pass
+
+        if self.shuffle_buffer_size > 0:
+            # Reservoir shuffle: fill buffer, then yield random elements
+            buffer = []
+            for example in iterable:
+                text = example.get(self.text_column, "") if isinstance(example, dict) else str(example)
+                ids = self._tokenize_doc(text)
+                if ids is None:
+                    continue
+
+                for chunk_tuple in self._chunk_doc(ids):
+                    sample = self._make_sample(*chunk_tuple)
+                    if len(buffer) < self.shuffle_buffer_size:
+                        buffer.append(sample)
+                    else:
+                        # Replace random element with probability buffer_size / (buffer_size + 1)
+                        idx = rng.randint(0, len(buffer) - 1)
+                        yield buffer[idx]
+                        buffer[idx] = sample
+
+            # Drain remaining buffer in random order
+            rng.shuffle(buffer)
+            for sample in buffer:
+                yield sample
+        else:
+            # No shuffle: deterministic iteration
+            for example in iterable:
+                text = example.get(self.text_column, "") if isinstance(example, dict) else str(example)
+                ids = self._tokenize_doc(text)
+                if ids is None:
+                    continue
+
+                for chunk_tuple in self._chunk_doc(ids):
+                    yield self._make_sample(*chunk_tuple)
+
+    def __len__(self):
+        """
+        Iterable datasets should NOT implement __len__.
+        HF Trainer detects absence of __len__ and treats this as iterable
+        (no random sampler, no length-based step estimation).
+        """
+        raise TypeError(
+            "HelixIterableDataset has no len(). It is a streaming dataset. "
+            "Use warmup_ratio instead of warmup_steps, or estimate steps from "
+            "total_tokens / (batch_size * seq_len)."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW: PRE-CHUNKED MAP DATASET (for fast repeatable training)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HelixPrechunkedDataset(Dataset):
+    """
+    Map-style dataset from pre-chunked HF Dataset.
+
+    Preprocesses once with Dataset.map(batched=True, num_proc=...) so chunking
+    happens offline, not during training. The resulting Arrow-backed dataset
+    is memory-mapped and supports fast random access.
+
+    Best for: datasets that fit on disk but are too slow to tokenize on-the-fly.
+    Use this when profiling shows streaming tokenization can't keep GPUs fed.
+
+    Usage:
+        # One-time preprocessing
+        ds = load_dataset("your_dataset", split="train")
+        chunked = HelixPrechunkedDataset.preprocess(
+            ds, tokenizer, seq_len=512, output_dir="./prechunked", num_proc=8
+        )
+
+        # Training (fast random access)
+        train_ds = HelixPrechunkedDataset.from_disk("./prechunked")
+        trainer = Trainer(model, cfg, train_dataset=train_ds, ...)
+
+    Args:
+        chunked_dataset: HF Dataset with columns:
+            input_ids, labels, attention_mask, is_natural_stop
+    """
+
+    def __init__(self, chunked_dataset):
+        """
+        Args:
+            chunked_dataset: HF Dataset with pre-computed columns:
+                input_ids (List[int]), labels (List[int]),
+                attention_mask (List[int]), is_natural_stop (bool)
+        """
+        super().__init__()
+        self.dataset = chunked_dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.dataset[idx]
+        return {
+            "input_ids": torch.tensor(row["input_ids"], dtype=torch.long),
+            "labels": torch.tensor(row["labels"], dtype=torch.long),
+            "attention_mask": torch.tensor(row["attention_mask"], dtype=torch.long),
+            "is_natural_stop": torch.tensor(row["is_natural_stop"], dtype=torch.bool),
+        }
+
+    @classmethod
+    def preprocess(
+        cls,
+        hf_dataset,
+        tokenizer,
+        seq_len: int = 2048,
+        text_column: str = "text",
+        stride: Optional[int] = None,
+        min_tail_len: int = 1,
+        add_eos: bool = True,
+        output_dir: Optional[str] = None,
+        num_proc: int = 4,
+        batch_size: int = 1000,
+        split: Optional[str] = None,
+    ):
+        """
+        Pre-chunk an HF Dataset and optionally save to disk.
+
+        Args:
+            hf_dataset: HF Dataset (map-style) or dataset name string
+            tokenizer: Tokenizer instance
+            seq_len: Target sequence length
+            text_column: Column name for text
+            stride: Chunk stride (default: seq_len = no overlap)
+            min_tail_len: Minimum document token count to keep
+            add_eos: Append EOS to each document
+            output_dir: If provided, save the pre-chunked dataset to this directory
+            num_proc: Number of processes for parallel map
+            batch_size: Batch size for mapping
+            split: If hf_dataset is a string, which split to load
+
+        Returns:
+            HelixPrechunkedDataset instance
+        """
+        from datasets import Dataset, load_dataset
+
+        if isinstance(hf_dataset, str):
+            hf_dataset = load_dataset(hf_dataset, split=split or "train")
+        elif hasattr(hf_dataset, "keys") and "train" in hf_dataset:
+            hf_dataset = hf_dataset["train"]
+
+        stride = stride if stride is not None else seq_len
+        pad_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", 0)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+
+        def _chunk_batch(batch):
+            """Batched chunking function for Dataset.map()."""
+            all_input_ids = []
+            all_labels = []
+            all_attention_mask = []
+            all_is_natural_stop = []
+
+            texts = batch[text_column]
+            for text in texts:
+                text = text.strip() if text else ""
+                if not text:
+                    continue
+
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                if len(ids) < min_tail_len:
+                    continue
+                if add_eos and eos_id is not None:
+                    ids.append(eos_id)
+
+                length = len(ids)
+
+                if length >= seq_len:
+                    starts = list(range(0, length - seq_len + 1, stride))
+                    for i, start in enumerate(starts):
+                        chunk = ids[start:start + seq_len]
+                        is_last_start = (i == len(starts) - 1)
+                        reaches_end = (start + seq_len == length)
+
+                        if not is_last_start:
+                            is_natural = False
+                        else:
+                            tail_len = length - (start + seq_len)
+                            has_tail = tail_len >= min_tail_len
+                            is_natural = reaches_end or (not has_tail)
+
+                        overlap_mask = 0
+                        if start > 0 and stride < seq_len:
+                            overlap_mask = seq_len - stride
+
+                        labels = list(chunk)
+                        if overlap_mask > 0:
+                            labels[:overlap_mask] = [-100] * overlap_mask
+
+                        pad_len = 0
+                        attn_mask = [1] * seq_len
+
+                        all_input_ids.append(chunk)
+                        all_labels.append(labels)
+                        all_attention_mask.append(attn_mask)
+                        all_is_natural_stop.append(is_natural)
+
+                    # Tail
+                    last_covered_end = starts[-1] + seq_len if starts else 0
+                    remainder_len = length - last_covered_end
+                    if remainder_len >= min_tail_len:
+                        tail = ids[last_covered_end:]
+                        pad_len = seq_len - remainder_len
+                        tail = tail + [pad_id] * pad_len
+                        labels = list(tail)
+                        labels[-pad_len:] = [-100] * pad_len if pad_len > 0 else []
+                        attn_mask = [1] * (seq_len - pad_len) + [0] * pad_len
+
+                        all_input_ids.append(tail)
+                        all_labels.append(labels)
+                        all_attention_mask.append(attn_mask)
+                        all_is_natural_stop.append(True)
+
+                else:
+                    # Short document
+                    pad_len = seq_len - length
+                    chunk = ids + [pad_id] * pad_len
+                    labels = list(chunk)
+                    labels[-pad_len:] = [-100] * pad_len if pad_len > 0 else []
+                    attn_mask = [1] * (seq_len - pad_len) + [0] * pad_len
+
+                    all_input_ids.append(chunk)
+                    all_labels.append(labels)
+                    all_attention_mask.append(attn_mask)
+                    all_is_natural_stop.append(True)
+
+            return {
+                "input_ids": all_input_ids,
+                "labels": all_labels,
+                "attention_mask": all_attention_mask,
+                "is_natural_stop": all_is_natural_stop,
+            }
+
+        # Determine columns to remove — keep only text_column for processing
+        original_columns = list(hf_dataset.column_names)
+        remove_columns = [c for c in original_columns if c != text_column]
+
+        chunked = hf_dataset.map(
+            _chunk_batch,
+            batched=True,
+            batch_size=batch_size,
+            num_proc=num_proc,
+            remove_columns=remove_columns,
+            desc=f"Pre-chunking (seq_len={seq_len}, stride={stride})",
+        )
+
+        # Flatten any nested batch structure
+        chunked = chunked.flatten_indices()
+
+        if output_dir is not None:
+            chunked.save_to_disk(output_dir)
+            print(f"Pre-chunked dataset saved to {output_dir}")
+            print(f"Total chunks: {len(chunked):,}")
+
+        return cls(chunked)
+
+    @classmethod
+    def from_disk(cls, path: str):
+        """Load a pre-chunked dataset from disk."""
+        from datasets import load_from_disk
+        dataset = load_from_disk(path)
+        return cls(dataset)
+
+    def save_to_disk(self, path: str):
+        """Save the underlying dataset to disk."""
+        self.dataset.save_to_disk(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COLLATOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def helix_data_collator(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """
+    Collate function for all HelixLM dataset types.
+
+    Stacks tensors for input_ids, labels, attention_mask, is_natural_stop.
+    Works with both map-style and iterable datasets.
+    """
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    attention_mask = torch.stack([b["attention_mask"] for b in batch])
+    is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "is_natural_stop": is_natural_stop,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FACTORY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
 def create_helix_dataloader(
     texts: List[str],
     tokenizer,
@@ -484,25 +989,14 @@ def create_helix_dataloader(
     drop_last: bool = True,
     lazy: bool = True,
     **kwargs,
-) -> torch.utils.data.DataLoader:
+) -> DataLoader:
+    """Create a DataLoader using HelixDataset (rolling chunking)."""
     dataset = HelixDataset(texts, tokenizer, seq_len, stride, lazy=lazy, **kwargs)
 
-    def collate_fn(batch):
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        labels = torch.stack([b["labels"] for b in batch])
-        attention_mask = torch.stack([b["attention_mask"] for b in batch])
-        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "is_natural_stop": is_natural_stop,
-        }
-
-    return torch.utils.data.DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=collate_fn,
+        collate_fn=helix_data_collator,
         shuffle=shuffle,
         num_workers=num_workers,
         drop_last=drop_last,
@@ -535,24 +1029,212 @@ def create_document_loader(
         min_tail_len=min_tail_len, add_eos=add_eos, lazy=lazy, stride=stride,
     )
 
-    def collate_fn(batch):
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        labels = torch.stack([b["labels"] for b in batch])
-        attention_mask = torch.stack([b["attention_mask"] for b in batch])
-        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "is_natural_stop": is_natural_stop,
-        }
-
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=collate_fn,
+        collate_fn=helix_data_collator,
         num_workers=num_workers,
         drop_last=drop_last,
     )
-  
+
+
+def create_helix_streaming_loader(
+    hf_iterable,
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    text_column: str = "text",
+    stride: Optional[int] = None,
+    min_tail_len: int = 1,
+    add_eos: bool = True,
+    shuffle_buffer_size: int = 10_000,
+    seed: int = 42,
+    drop_last: bool = True,
+) -> "HelixIterableDataset":
+    """
+    Create a streaming HelixIterableDataset.
+
+    Returns the dataset directly (not a DataLoader). HF Trainer handles
+    iteration for iterable datasets. Use with Trainer's train_dataset arg.
+
+    For PyTorch DataLoader usage, note that IterableDataset does not support
+    shuffle=True (shuffling is handled internally via shuffle_buffer_size).
+
+    Args:
+        hf_iterable: HF IterableDataset or any iterable
+        tokenizer: Tokenizer instance
+        seq_len: Target sequence length
+        batch_size: Batch size (stored for reference; Trainer uses it)
+        text_column: Document text column name
+        stride: Chunk stride (default: seq_len)
+        min_tail_len: Minimum document length to keep (default: 1)
+        add_eos: Append EOS to documents (default: True)
+        shuffle_buffer_size: Reservoir shuffle buffer (default: 10_000)
+        seed: Random seed for shuffle
+        drop_last: Whether to drop incomplete final batch
+
+    Returns:
+        HelixIterableDataset instance
+    """
+    return HelixIterableDataset(
+        hf_iterable=hf_iterable,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        text_column=text_column,
+        stride=stride,
+        min_tail_len=min_tail_len,
+        add_eos=add_eos,
+        shuffle_buffer_size=shuffle_buffer_size,
+        seed=seed,
+    )
+
+
+def create_helix_prechunked_loader(
+    hf_dataset,
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    text_column: str = "text",
+    stride: Optional[int] = None,
+    min_tail_len: int = 1,
+    add_eos: bool = True,
+    output_dir: Optional[str] = None,
+    num_proc: int = 4,
+    map_batch_size: int = 1000,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    drop_last: bool = True,
+    split: Optional[str] = None,
+) -> DataLoader:
+    """
+    Create a DataLoader from a pre-chunked dataset.
+
+    Preprocesses the dataset once with parallel chunking, then returns
+    a fast map-style DataLoader.
+
+    Args:
+        hf_dataset: HF Dataset (map-style), dataset name string, or path to saved pre-chunked data
+        tokenizer: Tokenizer instance
+        seq_len: Target sequence length
+        batch_size: DataLoader batch size
+        text_column: Document text column name
+        stride: Chunk stride (default: seq_len)
+        min_tail_len: Minimum document length (default: 1)
+        add_eos: Append EOS to documents (default: True)
+        output_dir: Directory to save/load pre-chunked dataset
+        num_proc: Parallel processes for chunking
+        map_batch_size: Batch size for Dataset.map()
+        shuffle: Whether to shuffle batches
+        num_workers: DataLoader worker processes
+        drop_last: Whether to drop incomplete final batch
+        split: Dataset split if hf_dataset is a string name
+
+    Returns:
+        DataLoader with HelixPrechunkedDataset
+    """
+    # If hf_dataset is a path string that exists, load from disk
+    import os
+    if isinstance(hf_dataset, str) and os.path.exists(hf_dataset):
+        dataset = HelixPrechunkedDataset.from_disk(hf_dataset)
+    elif isinstance(hf_dataset, str) and output_dir and os.path.exists(output_dir):
+        # Pre-chunked data already exists
+        dataset = HelixPrechunkedDataset.from_disk(output_dir)
+    else:
+        # Preprocess from scratch
+        dataset = HelixPrechunkedDataset.preprocess(
+            hf_dataset=hf_dataset,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            text_column=text_column,
+            stride=stride,
+            min_tail_len=min_tail_len,
+            add_eos=add_eos,
+            output_dir=output_dir,
+            num_proc=num_proc,
+            batch_size=map_batch_size,
+            split=split,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=helix_data_collator,
+        num_workers=num_workers,
+        drop_last=drop_last,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITY: Offline shard preprocessing (two-stage pipeline)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def preprocess_to_shards(
+    hf_dataset,
+    tokenizer,
+    output_dir: str,
+    seq_len: int = 2048,
+    text_column: str = "text",
+    stride: Optional[int] = None,
+    min_tail_len: int = 1,
+    add_eos: bool = True,
+    num_proc: int = 4,
+    map_batch_size: int = 1000,
+    max_shard_size: str = "500MB",
+    split: Optional[str] = None,
+):
+    """
+    Preprocess a dataset into sharded files for streaming during training.
+
+    This implements the two-stage pipeline recommended for 2B+ token corpora:
+      1. Pre-chunk offline (expensive tokenization happens once)
+      2. Stream shards during training (cheap IO, fast batching)
+
+    Args:
+        hf_dataset: HF Dataset or dataset name string
+        tokenizer: Tokenizer instance
+        output_dir: Directory to write sharded files
+        seq_len: Target sequence length
+        text_column: Document text column
+        stride: Chunk stride
+        min_tail_len: Minimum document length
+        add_eos: Append EOS
+        num_proc: Parallel processes
+        map_batch_size: Batch size for mapping
+        max_shard_size: Max shard file size (passed to Dataset.save_to_disk)
+        split: Dataset split if hf_dataset is a string
+
+    Returns:
+        Path to output directory
+    """
+    from datasets import load_dataset
+    import os
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    if isinstance(hf_dataset, str):
+        hf_dataset = load_dataset(hf_dataset, split=split or "train")
+    elif hasattr(hf_dataset, "keys") and "train" in hf_dataset:
+        hf_dataset = hf_dataset["train"]
+
+    # Pre-chunk
+    dataset = HelixPrechunkedDataset.preprocess(
+        hf_dataset=hf_dataset,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        text_column=text_column,
+        stride=stride,
+        min_tail_len=min_tail_len,
+        add_eos=add_eos,
+        num_proc=num_proc,
+        batch_size=map_batch_size,
+    )
+
+    # Save as sharded dataset
+    dataset.dataset.save_to_disk(output_dir, max_shard_size=max_shard_size)
+
+    total_chunks = len(dataset)
+    print(f"Shard preprocessing complete: {total_chunks:,} chunks -> {output_dir}")
+    return output_dir
+ 
