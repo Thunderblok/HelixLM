@@ -278,10 +278,6 @@ def test_equivalence(train_texts, val_texts, tokenizer):
     
     results = {}
     
-    # Run list[str] path (baseline)
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
     
     cfg_a = build_cfg(len(tokenizer))
     cfg_a.pad_token_id = tokenizer.pad_token_id
@@ -292,10 +288,6 @@ def test_equivalence(train_texts, val_texts, tokenizer):
         model_a, cfg_a, tokenizer, train_texts, val_texts, "baseline"
     )
     
-    # Run streaming path
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
     
     cfg_b = copy.deepcopy(cfg_a)
     model_b = HelixForCausalLM(cfg_b)
