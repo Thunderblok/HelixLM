@@ -104,28 +104,13 @@ def _is_iterable_dataset(dataset):
     return False
 
 
-def _estimate_steps_from_tokens(
-    total_tokens: int,
-    batch_size: int,
-    seq_len: int,
-    grad_accum_steps: int,
-    epochs: int = 1,
-) -> int:
-    """
-    Estimate optimizer steps from total token count.
-    Used for iterable datasets where exact length is unknown.
-    """
-    samples_per_epoch = total_tokens // seq_len
-    steps_per_epoch = max(1, samples_per_epoch // (batch_size * grad_accum_steps))
-    return steps_per_epoch * epochs
-
-
 class Trainer:
     """Trainer for HelixLM with gradient accumulation, AMP, and progress bars.
 
     Supports both map-style and iterable datasets:
       - Map-style: uses len() for scheduler setup, supports shuffle
-      - Iterable: auto-detected, iterates directly, uses warmup_ratio or estimates
+      - Iterable: auto-detected, iterates directly, uses automatic silent count
+                   or warmup_ratio for scheduler setup
     """
 
     def __init__(
@@ -146,7 +131,6 @@ class Trainer:
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
         warmup_ratio: Optional[float] = None,
-        estimated_total_tokens: Optional[int] = None,
     ):
         """
         Initialize Trainer.
@@ -170,10 +154,6 @@ class Trainer:
             warmup_ratio: If provided, overrides cfg.warmup_steps as a ratio of total steps.
                           Useful for iterable datasets where exact step count is unknown.
                           E.g., warmup_ratio=0.1 means 10% of total steps are warmup.
-            estimated_total_tokens: Estimated total tokens in training corpus.
-                                   Used with iterable datasets to estimate step count
-                                   for scheduler setup. If None and dataset is iterable,
-                                   warmup_ratio mode is used instead.
         """
         self.model = model
         self.cfg = cfg
@@ -186,7 +166,9 @@ class Trainer:
         self.amp_dtype = getattr(torch, _amp_dtype) if isinstance(_amp_dtype, str) else _amp_dtype
         self.verbose = verbose
         self.warmup_ratio = warmup_ratio
-        self.estimated_total_tokens = estimated_total_tokens
+        
+        # Cache for iterable dataset count
+        self._cached_dataset_length: Optional[int] = None
 
         if example_prompts:
             self.example_prompts = example_prompts
@@ -270,6 +252,65 @@ class Trainer:
             except Exception:
                 pass  # scaler stays None, AMP still works without scaling
 
+    def _count_iterable_dataset(self, iterable_ds) -> int:
+        """
+        Efficiently count batches in an iterable dataset without materializing.
+        Uses a counting pass that iterates through the DataLoader to get actual batch count.
+        
+        Args:
+            iterable_ds: DataLoader wrapping an iterable dataset
+        
+        Returns:
+            Total batch count
+        """
+        if self.verbose:
+            print("  [Trainer] Counting iterable dataset batches...")
+        
+        count = 0
+        start_time = time.time()
+        
+        # Iterate through DataLoader to count actual batches
+        # This handles drop_last=True correctly
+        for _ in iterable_ds:
+            count += 1
+        
+        elapsed = time.time() - start_time
+        if self.verbose:
+            print(f"  [Trainer] Counted {count:,} batches in {format_time(elapsed)}")
+        
+        return count
+
+    def _compute_total_steps(self) -> int:
+        """
+        Compute total optimizer steps for scheduler setup.
+        
+        For map-style datasets: uses len(train_loader).
+        For iterable datasets: performs a counting pass and caches the result.
+        """
+        if self._is_iterable:
+            # Iterable dataset: count batches once and cache
+            if self._cached_dataset_length is None:
+                self._cached_dataset_length = self._count_iterable_dataset(self.train_loader)
+            
+            total_batches = self._cached_dataset_length
+            total_steps = max(1, total_batches // self.grad_accum_steps)
+            
+            # Adjust for multi-epoch training
+            total_steps *= self.cfg.epochs
+            
+            return total_steps
+        else:
+            # Map-style dataset: len() is cheap and accurate
+            steps_per_epoch = math.ceil(len(self.train_loader) / self.grad_accum_steps)
+            return steps_per_epoch * self.cfg.epochs
+
+    def _reset_iterable_dataset(self):
+        """Reset iterable dataset to prepare for actual training after counting pass."""
+        inner_ds = getattr(self.train_loader, "dataset", None)
+        if inner_ds is not None and hasattr(inner_ds, "set_epoch"):
+            # Reset to epoch 0 for start of training
+            inner_ds.set_epoch(0)
+
     def _get_device(self) -> torch.device:
         """Get device from config."""
         if self.cfg.device == "auto":
@@ -301,80 +342,54 @@ class Trainer:
         Initialize scheduler. Called lazily on first train_epoch() call.
 
         For map-style datasets: uses len(train_loader) to compute steps.
-        For iterable datasets: uses warmup_ratio mode or estimates from tokens.
+        For iterable datasets: performs counting pass for accurate step count.
         """
         if self.scheduler is not None:
             return
 
+        # Compute total steps (handles both map-style and iterable datasets)
+        total_steps = self._compute_total_steps()
+        
         if self._is_iterable:
-            # Iterable dataset: we don't know exact length
+            # Reset the iterable dataset after counting pass
+            self._reset_iterable_dataset()
+            
             if self.warmup_ratio is not None:
-                # Warmup ratio mode: we'll re-init each epoch or use a large estimate
-                # Use estimated total steps if available, otherwise a conservative default
-                if self.estimated_total_tokens is not None:
-                    estimated_steps = _estimate_steps_from_tokens(
-                        self.estimated_total_tokens,
-                        self.cfg.batch_size,
-                        self.cfg.seq_len,
-                        self.grad_accum_steps,
-                        epochs=self.cfg.epochs,
+                # Warmup ratio mode: warmup is % of total steps
+                if self.verbose:
+                    print(
+                        f"  [Trainer] Scheduler: {total_steps:,} total steps, "
+                        f"warmup_ratio={self.warmup_ratio}"
                     )
-                else:
-                    # Conservative fallback: assume 1B tokens per epoch
-                    # This gives a reasonable schedule shape even without exact count
-                    assumed_tokens = 1_000_000_000
-                    estimated_steps = _estimate_steps_from_tokens(
-                        assumed_tokens,
-                        self.cfg.batch_size,
-                        self.cfg.seq_len,
-                        self.grad_accum_steps,
-                        epochs=self.cfg.epochs,
-                    )
-                    if self.verbose:
-                        print(
-                            f"  [Trainer] No token estimate provided. Assuming {assumed_tokens:,} "
-                            f"tokens total. Scheduler: {estimated_steps:,} estimated steps, "
-                            f"warmup_ratio={self.warmup_ratio}"
-                        )
-
                 self.scheduler = get_cosine_schedule_with_warmup_ratio(
                     self.optimizer,
                     num_warmup_ratio=self.warmup_ratio,
-                    num_training_steps=estimated_steps,
+                    num_training_steps=total_steps,
                     num_cycles=self._scheduler_cycles,
                     min_lr_ratio=self._scheduler_min_lr,
                 )
             else:
-                # Fall back to step-based warmup with the configured warmup_steps
-                # Use a large estimated step count for the cosine tail
-                if self.estimated_total_tokens is not None:
-                    estimated_steps = _estimate_steps_from_tokens(
-                        self.estimated_total_tokens,
-                        self.cfg.batch_size,
-                        self.cfg.seq_len,
-                        self.grad_accum_steps,
-                        epochs=self.cfg.epochs,
+                # Step-based warmup with accurate count
+                if self.verbose:
+                    print(
+                        f"  [Trainer] Scheduler: {total_steps:,} total steps, "
+                        f"warmup_steps={self._scheduler_warmup}"
                     )
-                else:
-                    estimated_steps = 100_000  # Conservative default
-
                 self.scheduler = get_cosine_schedule_with_warmup(
                     self.optimizer,
                     num_warmup_steps=self._scheduler_warmup,
-                    num_training_steps=estimated_steps,
+                    num_training_steps=total_steps,
                     num_cycles=self._scheduler_cycles,
                     min_lr_ratio=self._scheduler_min_lr,
                 )
         else:
-            # Map-style dataset: len() is cheap and accurate
-            steps_per_epoch = math.ceil(
-                len(self.train_loader) / self.grad_accum_steps
-            )
-            total_optimizer_steps = steps_per_epoch * self.cfg.epochs
+            # Map-style dataset
+            if self.verbose:
+                print(f"  [Trainer] Scheduler: {total_steps:,} total steps")
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
                 num_warmup_steps=self._scheduler_warmup,
-                num_training_steps=total_optimizer_steps,
+                num_training_steps=total_steps,
                 num_cycles=self._scheduler_cycles,
                 min_lr_ratio=self._scheduler_min_lr,
             )
@@ -527,11 +542,16 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
 
+        # Check if val_loader uses iterable dataset (no len())
+        val_is_iterable = _is_iterable_dataset(getattr(self.val_loader, "dataset", None))
+        
+        # Use total=None for iterable datasets to avoid len() call
         pbar = tqdm(
             self.val_loader,
             desc="Validation",
             unit="batch",
             disable=not self.verbose,
+            total=None if val_is_iterable else (len(self.val_loader) if hasattr(self.val_loader, "__len__") else None),
         )
         for batch in pbar:
             input_ids = batch["input_ids"].to(self.device)
@@ -612,8 +632,8 @@ class Trainer:
                 print(f"Dataset: iterable (streaming)")
                 if self.warmup_ratio is not None:
                     print(f"Warmup: {self.warmup_ratio} (ratio mode)")
-                if self.estimated_total_tokens is not None:
-                    print(f"Est. tokens: {self.estimated_total_tokens:,}")
+                if self._cached_dataset_length is not None:
+                    print(f"Counted batches: {self._cached_dataset_length:,}")
             print(f"{'='*60}\n")
 
         for epoch in range(1, epochs + 1):
@@ -635,7 +655,8 @@ class Trainer:
             self.history["train_loss"].append(train_metrics["loss"])
             self.history["perplexity"].append(train_metrics["perplexity"])
 
-            if self.val_loader and epoch % eval_every == 0:
+            val_loader_exists = self.val_loader is not None
+            if val_loader_exists and epoch % eval_every == 0:
                 val_metrics = self.evaluate()
                 if self.verbose:
                     print(
