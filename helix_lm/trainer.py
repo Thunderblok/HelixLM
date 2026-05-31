@@ -131,6 +131,12 @@ class Trainer:
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
         warmup_ratio: Optional[float] = None,
+        # Sharding parameters for iterable datasets
+        shard_cache_dir: Optional[str] = None,
+        preprocess_num_proc: Optional[int] = None,
+        preprocess_batch_size: int = 1000,
+        max_shard_size: str = "500MB",
+        cleanup_shards: bool = True,
     ):
         """
         Initialize Trainer.
@@ -139,7 +145,9 @@ class Trainer:
             model: HelixForCausalLM instance.
             cfg: HelixConfig with training hyperparameters.
             train_texts: List of training document texts (used if train_loader not provided).
+                         Can also be an IterableDataset/IterableColumn for streaming.
             val_texts: List of validation document texts (used if val_loader not provided).
+                       Can also be an IterableDataset/IterableColumn for streaming.
             tokenizer: Tokenizer instance.
             output_dir: Directory to save checkpoints.
             example_prompts: Prompts for generation samples during training.
@@ -154,6 +162,13 @@ class Trainer:
             warmup_ratio: If provided, overrides cfg.warmup_steps as a ratio of total steps.
                           Useful for iterable datasets where exact step count is unknown.
                           E.g., warmup_ratio=0.1 means 10% of total steps are warmup.
+            shard_cache_dir: Directory to cache preprocessed shards for streaming datasets.
+                          Default: ../datasets/helix-ds-shards/timestamp
+            preprocess_num_proc: Number of parallel processes for tokenization preprocessing.
+                                Default: min(4, NUM_CPU-5) if positive, else 1.
+            preprocess_batch_size: Batch size for preprocessing (default: 1000).
+            max_shard_size: Max size per shard file (default: "500MB").
+            cleanup_shards: Whether to delete shards after training (default: True).
         """
         self.model = model
         self.cfg = cfg
@@ -186,6 +201,11 @@ class Trainer:
         # Validate config
         self.validate_config()
 
+        # Store sharding parameters for cleanup
+        self._shard_cache_dir = shard_cache_dir
+        self._cleanup_shards = cleanup_shards
+        self._shard_paths = []  # Track paths for cleanup
+        
         # Data loaders: use injected loaders if provided, otherwise build from texts
         if train_loader is not None:
             self.train_loader = train_loader
@@ -203,7 +223,15 @@ class Trainer:
                 drop_last=True,
                 min_tail_len=min_tail_len,
                 lazy=True,
+                shard_cache_dir=shard_cache_dir,
+                preprocess_num_proc=preprocess_num_proc,
+                preprocess_batch_size=preprocess_batch_size,
+                max_shard_size=max_shard_size,
+                cleanup_shards=cleanup_shards,
             )
+            # Track shard path for cleanup
+            if hasattr(self.train_loader, '_helix_shard_path'):
+                self._shard_paths.append(self.train_loader._helix_shard_path)
 
         self.val_loader = None
         if val_loader is not None:
@@ -220,7 +248,15 @@ class Trainer:
                 drop_last=False,
                 min_tail_len=min_tail_len,
                 lazy=True,
+                shard_cache_dir=shard_cache_dir,
+                preprocess_num_proc=preprocess_num_proc,
+                preprocess_batch_size=preprocess_batch_size,
+                max_shard_size=max_shard_size,
+                cleanup_shards=cleanup_shards,
             )
+            # Track shard path for cleanup
+            if hasattr(self.val_loader, '_helix_shard_path'):
+                self._shard_paths.append(self.val_loader._helix_shard_path)
 
         # Detect if train_loader uses an iterable dataset
         inner_ds = getattr(self.train_loader, "dataset", None)
@@ -702,6 +738,28 @@ class Trainer:
                 print()
 
         self.save_checkpoint(epochs, "final_model")
+        
+        # Cleanup shards after training
+        self._cleanup_training_shards()
+        
         if self.verbose:
             print(f"\nTraining complete!")
         return self.history
+    
+    def _cleanup_training_shards(self):
+        """Clean up temporary shard directories after training."""
+        if not self._cleanup_shards:
+            return
+        
+        import shutil
+        for shard_path in self._shard_paths:
+            if shard_path and os.path.exists(shard_path):
+                try:
+                    # Check if this is a helix-created temp directory
+                    if 'helix-ds-shards' in shard_path or self._shard_cache_dir is None:
+                        shutil.rmtree(shard_path)
+                        if self.verbose:
+                            print(f"  [Trainer] Cleaned up shards: {shard_path}")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  [Trainer] Warning: Could not clean up shards at {shard_path}: {e}")

@@ -26,6 +26,7 @@ Key fixes preserved in ALL paths:
 
 Compatible with HF transformers v5.8.1 Trainer — both map and iterable modes.
 """
+import os
 import random
 import math
 from typing import List, Optional, Iterator, Dict, Any, Union, Tuple, Callable
@@ -1144,6 +1145,158 @@ def create_helix_streaming_loader(
     )
 
 
+def _get_default_num_proc() -> int:
+    """Get default preprocess_num_proc based on system CPUs."""
+    import os
+    num_cpus = os.cpu_count() or 4
+    default_proc = min(4, num_cpus - 5)
+    return max(1, default_proc)
+
+
+def _is_iterable_column(data) -> bool:
+    """Check if data is an IterableColumn/IterableDataset."""
+    # Check for HF IterableDataset
+    from datasets import IterableDataset
+    if isinstance(data, IterableDataset):
+        return True
+    # Check for any iterable that lacks __getitem__ (duck typing)
+    if hasattr(data, '__iter__') and not hasattr(data, '__getitem__'):
+        return True
+    # Check for our HelixIterableDataset - has __getitem__ but raises TypeError
+    if hasattr(data, '__len__'):
+        try:
+            len(data)
+        except (TypeError, NotImplementedError):
+            return True
+    return False
+
+
+def _get_shard_cache_dir(shard_cache_dir: Optional[str] = None) -> str:
+    """Get default or user-specified shard cache directory."""
+    import os
+    from datetime import datetime
+    
+    if shard_cache_dir is not None:
+        os.makedirs(shard_cache_dir, exist_ok=True)
+        return shard_cache_dir
+    
+    # Default: ../datasets/helix-ds-shards/timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "datasets", "helix-ds-shards", timestamp
+    )
+    os.makedirs(default_dir, exist_ok=True)
+    return default_dir
+
+
+def _handle_streaming_iterable(
+    iterable,
+    text_column: str,
+    tokenizer,
+    seq_len: int,
+    batch_size: int,
+    shard_cache_dir: Optional[str],
+    preprocess_num_proc: int,
+    preprocess_batch_size: int,
+    max_shard_size: str,
+    cleanup_shards: bool,
+    stride: Optional[int],
+    shuffle: bool,
+    num_workers: int,
+    drop_last: bool,
+    min_tail_len: int,
+    add_eos: bool,
+) -> DataLoader:
+    """
+    Handle IterableDataset by streaming to shards first.
+    
+    This is the ONLY path for streaming data - no threshold guessing.
+    
+    Strategy:
+    1. Convert iterable to map-style Dataset by streaming it
+    2. Pre-tokenize and chunk using Dataset.map() with num_proc
+    3. Save as Arrow shards for fast random access
+    4. Return DataLoader from shards (exact __len__ known)
+    """
+    import os
+    from datasets import Dataset
+    
+    # Determine shard cache location
+    cache_dir = _get_shard_cache_dir(shard_cache_dir)
+    
+    # Stage 1: Stream iterable to temporary Dataset
+    print(f"[HelixLM] Streaming data to temporary Dataset...")
+    print(f"  Cache: {cache_dir}")
+    
+    try:
+        # Materialize the iterable into a Dataset
+        # This is necessary because Dataset.map() requires __getitem__
+        texts = []
+        for item in iterable:
+            if isinstance(item, dict):
+                text = item.get(text_column, "")
+            else:
+                text = str(item)
+            if text:
+                texts.append(text)
+        
+        if len(texts) == 0:
+            raise ValueError("No valid text data found in iterable")
+        
+        # Convert to Dataset for parallel processing
+        ds = Dataset.from_dict({text_column: texts})
+        print(f"[HelixLM] Materialized {len(ds):,} documents")
+        
+    except Exception as e:
+        print(f"[HelixLM] ERROR during streaming/materialization: {e}")
+        raise
+    
+    # Stage 2: Pre-tokenize and chunk with parallel processing
+    print(f"[HelixLM] Pre-tokenizing with {preprocess_num_proc} workers...")
+    
+    try:
+        dataset = HelixPrechunkedDataset.preprocess(
+            hf_dataset=ds,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            text_column=text_column,
+            stride=stride,
+            min_tail_len=min_tail_len,
+            add_eos=add_eos,
+            output_dir=cache_dir,
+            num_proc=preprocess_num_proc,
+            batch_size=preprocess_batch_size,
+        )
+        
+        # Save as sharded dataset  
+        dataset.dataset.save_to_disk(cache_dir, max_shard_size=max_shard_size)
+        total_chunks = len(dataset)
+        print(f"[HelixLM] Shard preprocessing complete: {total_chunks:,} chunks -> {cache_dir}")
+        
+    except Exception as e:
+        print(f"[HelixLM] ERROR during shard preprocessing: {e}")
+        raise
+    
+    # Stage 3: Create fast loader from shards
+    dataset = HelixPrechunkedDataset.from_disk(cache_dir)
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=helix_data_collator,
+        num_workers=num_workers,
+        drop_last=drop_last,
+    )
+    
+    # Attach cleanup info
+    loader._helix_shard_path = cache_dir
+    loader._helix_cleanup_shards = cleanup_shards
+    
+    return loader
+
+
 def create_unified_data_loader(
     data: Union[List[str], Any],
     tokenizer,
@@ -1159,6 +1312,12 @@ def create_unified_data_loader(
     text_column: str = "text",
     shuffle_buffer_size: int = 10_000,
     seed: int = 42,
+    # Sharding options (for IterableDataset path)
+    preprocess_num_proc: Optional[int] = None,
+    preprocess_batch_size: int = 1000,
+    shard_cache_dir: Optional[str] = None,
+    max_shard_size: str = "500MB",
+    cleanup_shards: bool = True,
 ) -> DataLoader:
     """
     Unified data loader factory that accepts List[str] OR any iterable/streaming dataset.
@@ -1193,23 +1352,32 @@ def create_unified_data_loader(
         text_column: Column name for text in streaming datasets (default: "text")
         shuffle_buffer_size: Reservoir shuffle buffer for streaming (default: 10_000)
         seed: Random seed for reproducible shuffle
+        preprocess_num_proc: Parallel workers for preprocessing (default: auto-detect)
+        preprocess_batch_size: Batch size for preprocessing map (default: 1000)
+        shard_cache_dir: Directory to cache shards (default: ../datasets/helix-ds-shards/timestamp)
+        max_shard_size: Max size per shard file (default: "500MB")
+        cleanup_shards: Whether to delete shards after training (default: True)
         
     Returns:
         DataLoader ready for Trainer consumption
         
     Example:
-        # List[str] path
+        # List[str] path (unchanged)
         texts = ["doc1...", "doc2...", ...]
         loader = create_unified_data_loader(
             texts, tokenizer, seq_len=512, batch_size=8, shuffle=True
         )
         
-        # Streaming path
+        # Iterable/streaming path - automatically shards to disk
         hf_ds = load_dataset("dataset", split="train", streaming=True)
         loader = create_unified_data_loader(
-            hf_ds, tokenizer, seq_len=512, batch_size=8, shuffle=True
+            hf_ds["text"], tokenizer, seq_len=512, batch_size=8, shuffle=True
         )
     """
+    # Set default preprocess_num_proc if not provided
+    if preprocess_num_proc is None:
+        preprocess_num_proc = _get_default_num_proc()
+    
     # Detect if data is a List[str]
     is_list_of_strings = (
         isinstance(data, list) and 
@@ -1218,7 +1386,7 @@ def create_unified_data_loader(
     )
     
     if is_list_of_strings:
-        # Map-style path: DocumentAwareDataset
+        # Map-style path: DocumentAwareDataset (historical behavior)
         return create_document_loader(
             texts=data,
             tokenizer=tokenizer,
@@ -1233,45 +1401,56 @@ def create_unified_data_loader(
             lazy=lazy,
         )
     
-    # Iterable/streaming path
-    # Check if it already has our streaming interface
-    is_our_iterable = hasattr(data, 'set_epoch') and hasattr(data, '__iter__')
-    is_hf_iterable = hasattr(data, '__iter__') and not hasattr(data, '__getitem__')
+    # Check if it's an iterable/streaming dataset
+    is_hf_iterable = _is_iterable_column(data)
     
-    # For List[str] passed as iterable, wrap it
-    if isinstance(data, list):
-        data = ListIterableDataset(
-            data=data,
-            epoch=0,
-            shuffle=shuffle,
-            seed=seed,
+    # Check if it's a HF Dataset (map-style) - extract the column
+    from datasets import Dataset
+    if isinstance(data, Dataset):
+        # Extract the text column as a list for processing
+        if text_column in data.column_names:
+            texts = [row[text_column] for row in data]
+            return create_document_loader(
+                texts=texts,
+                tokenizer=tokenizer,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                stride=stride,
+                shuffle=shuffle,
+                drop_last=drop_last,
+                num_workers=num_workers,
+                min_tail_len=min_tail_len,
+                add_eos=add_eos,
+                lazy=lazy,
+            )
+        else:
+            raise ValueError(f"Dataset does not have column '{text_column}'")
+    
+    # Iterable/streaming path: Shard to disk first
+    if is_hf_iterable or (hasattr(data, '__iter__') and not isinstance(data, (list, Dataset))):
+        return _handle_streaming_iterable(
+            iterable=data,
             text_column=text_column,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            shard_cache_dir=shard_cache_dir,
+            preprocess_num_proc=preprocess_num_proc,
+            preprocess_batch_size=preprocess_batch_size,
+            max_shard_size=max_shard_size,
+            cleanup_shards=cleanup_shards,
+            stride=stride,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            drop_last=drop_last,
+            min_tail_len=min_tail_len if min_tail_len is not None else 1,
+            add_eos=add_eos,
         )
-    elif not is_our_iterable and not is_hf_iterable:
-        # Unknown type, try to treat as iterable
-        pass
     
-    # Create HelixIterableDataset with shuffle support
-    ds = HelixIterableDataset(
-        hf_iterable=data,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-        text_column=text_column,
-        stride=stride,
-        min_tail_len=min_tail_len if min_tail_len is not None else 1,
-        add_eos=add_eos,
-        shuffle_buffer_size=shuffle_buffer_size if shuffle else 0,
-        seed=seed,
-    )
-    
-    # Iterable datasets use DataLoader without shuffle (shuffling is internal)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        collate_fn=helix_data_collator,
-        num_workers=num_workers,
-        drop_last=drop_last,
-        # shuffle=False for iterable datasets
+    # Unknown data type
+    raise ValueError(
+        f"Unsupported data type: {type(data)}. "
+        "Expected List[str], datasets.Dataset, or IterableDataset/IterableColumn."
     )
 
 
