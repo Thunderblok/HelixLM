@@ -1214,72 +1214,91 @@ def _handle_streaming_iterable(
     This is the ONLY path for streaming data - no threshold guessing.
     
     Strategy:
-    1. Convert iterable to map-style Dataset by streaming it
-    2. Pre-tokenize and chunk using Dataset.map() with num_proc
-    3. Save as Arrow shards for fast random access
+    1. Stream data in batches to temporary Dataset shards
+    2. Pre-tokenize each shard with parallel processing
+    3. Save as Arrow shards on disk (memory bounded by batch size)
     4. Return DataLoader from shards (exact __len__ known)
+    
+    Memory: O(batch_size) during streaming, not O(corpus).
     """
-    import os
     from datasets import Dataset
     
     # Determine shard cache location
     cache_dir = _get_shard_cache_dir(shard_cache_dir)
     
-    # Stage 1: Stream iterable to temporary Dataset
-    print(f"[HelixLM] Streaming data to temporary Dataset...")
+    print(f"[HelixLM] Streaming data to shards...")
     print(f"  Cache: {cache_dir}")
+    print(f"  Shard batch size: {preprocess_batch_size}")
+    
+    stride = stride if stride is not None else seq_len
+    pad_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", 0)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
     
     try:
-        # Materialize the iterable into a Dataset
-        # This is necessary because Dataset.map() requires __getitem__
-        texts = []
-        for item in iterable:
+        # Process iterable in streaming batches - never materialize full corpus
+        batch_texts = []
+        batch_count = 0
+        all_chunked_data = []
+        
+        for item in tqdm(iterable, desc="Streaming to shards"):
             if isinstance(item, dict):
                 text = item.get(text_column, "")
             else:
                 text = str(item)
             if text:
-                texts.append(text)
+                batch_texts.append(text)
+            
+            # Process batch when it reaches threshold
+            if len(batch_texts) >= preprocess_batch_size:
+                _process_and_shard_batch(
+                    batch_texts, cache_dir, batch_count,
+                    tokenizer, seq_len, stride, min_tail_len, add_eos, 
+                    pad_id, eos_id, preprocess_num_proc, text_column
+                )
+                all_chunked_data.append(batch_count)
+                batch_texts = []
+                batch_count += 1
         
-        if len(texts) == 0:
+        # Process remaining texts
+        if batch_texts:
+            _process_and_shard_batch(
+                batch_texts, cache_dir, batch_count,
+                tokenizer, seq_len, stride, min_tail_len, add_eos,
+                pad_id, eos_id, preprocess_num_proc, text_column
+            )
+            all_chunked_data.append(batch_count)
+            batch_count += 1
+        
+        if batch_count == 0:
             raise ValueError("No valid text data found in iterable")
         
-        # Convert to Dataset for parallel processing
-        ds = Dataset.from_dict({text_column: texts})
-        print(f"[HelixLM] Materialized {len(ds):,} documents")
+        print(f"[HelixLM] Created {batch_count} shard batches")
         
-    except Exception as e:
-        print(f"[HelixLM] ERROR during streaming/materialization: {e}")
-        raise
-    
-    # Stage 2: Pre-tokenize and chunk with parallel processing
-    print(f"[HelixLM] Pre-tokenizing with {preprocess_num_proc} workers...")
-    
-    try:
-        dataset = HelixPrechunkedDataset.preprocess(
-            hf_dataset=ds,
-            tokenizer=tokenizer,
-            seq_len=seq_len,
-            text_column=text_column,
-            stride=stride,
-            min_tail_len=min_tail_len,
-            add_eos=add_eos,
-            output_dir=cache_dir,
-            num_proc=preprocess_num_proc,
-            batch_size=preprocess_batch_size,
-        )
+        # Reload all shards and concatenate into single dataset
+        from datasets import load_from_disk, concatenate_datasets
         
-        # Save as sharded dataset  
-        dataset.dataset.save_to_disk(cache_dir, max_shard_size=max_shard_size)
-        total_chunks = len(dataset)
-        print(f"[HelixLM] Shard preprocessing complete: {total_chunks:,} chunks -> {cache_dir}")
+        shard_datasets = []
+        for i in range(batch_count):
+            shard_path = os.path.join(cache_dir, f"shard_{i:05d}")
+            ds = load_from_disk(shard_path)
+            shard_datasets.append(ds)
+        
+        # Concatenate all shards
+        full_dataset = concatenate_datasets(shard_datasets)
+        
+        # Save final sliced dataset with proper max_shard_size
+        final_path = os.path.join(cache_dir, "final")
+        full_dataset.save_to_disk(final_path, max_shard_size=max_shard_size)
+        
+        total_chunks = len(full_dataset)
+        print(f"[HelixLM] Shard preprocessing complete: {total_chunks:,} chunks -> {final_path}")
         
     except Exception as e:
         print(f"[HelixLM] ERROR during shard preprocessing: {e}")
         raise
     
-    # Stage 3: Create fast loader from shards
-    dataset = HelixPrechunkedDataset.from_disk(cache_dir)
+    # Create loader from final sharded dataset
+    dataset = HelixPrechunkedDataset(full_dataset)
     
     loader = DataLoader(
         dataset,
@@ -1295,6 +1314,113 @@ def _handle_streaming_iterable(
     loader._helix_cleanup_shards = cleanup_shards
     
     return loader
+
+
+def _process_and_shard_batch(
+    batch_texts, cache_dir, batch_id,
+    tokenizer, seq_len, stride, min_tail_len, add_eos,
+    pad_id, eos_id, num_proc, text_column
+):
+    """Process a batch of texts and save as a shard."""
+    from datasets import Dataset
+    import os
+    
+    # Create temporary dataset for this batch
+    ds = Dataset.from_dict({text_column: batch_texts})
+    
+    # Process with parallel tokenization (single-threaded for now - num_proc doesn't help on small batches)
+    def _chunk_batch(batch):
+        all_input_ids = []
+        all_labels = []
+        all_attention_mask = []
+        all_is_natural_stop = []
+        
+        texts = batch[text_column]
+        for text in texts:
+            text = text.strip() if text else ""
+            if not text:
+                continue
+            
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(ids) < min_tail_len:
+                continue
+            if add_eos and eos_id is not None:
+                ids.append(eos_id)
+            
+            length = len(ids)
+            
+            if length >= seq_len:
+                starts = list(range(0, length - seq_len + 1, stride))
+                for i, start in enumerate(starts):
+                    chunk = ids[start:start + seq_len]
+                    is_last_start = (i == len(starts) - 1)
+                    reaches_end = (start + seq_len == length)
+                    
+                    if not is_last_start:
+                        is_natural = False
+                    else:
+                        tail_len = length - (start + seq_len)
+                        has_tail = tail_len >= min_tail_len
+                        is_natural = reaches_end or (not has_tail)
+                    
+                    overlap_mask = 0
+                    if start > 0 and stride < seq_len:
+                        overlap_mask = seq_len - stride
+                    
+                    labels = list(chunk)
+                    if overlap_mask > 0:
+                        labels[:overlap_mask] = [-100] * overlap_mask
+                    
+                    pad_len = 0
+                    attn_mask = [1] * seq_len
+                    
+                    all_input_ids.append(chunk)
+                    all_labels.append(labels)
+                    all_attention_mask.append(attn_mask)
+                    all_is_natural_stop.append(is_natural)
+                
+                # Tail
+                last_covered_end = starts[-1] + seq_len if starts else 0
+                remainder_len = length - last_covered_end
+                if remainder_len >= min_tail_len:
+                    tail = ids[last_covered_end:]
+                    pad_len = seq_len - remainder_len
+                    tail = tail + [pad_id] * pad_len
+                    labels = list(tail)
+                    labels[-pad_len:] = [-100] * pad_len if pad_len > 0 else []
+                    attn_mask = [1] * (seq_len - pad_len) + [0] * pad_len
+                    
+                    all_input_ids.append(tail)
+                    all_labels.append(labels)
+                    all_attention_mask.append(attn_mask)
+                    all_is_natural_stop.append(True)
+            else:
+                pad_len = seq_len - length
+                chunk = ids + [pad_id] * pad_len
+                labels = list(chunk)
+                labels[-pad_len:] = [-100] * pad_len if pad_len > 0 else []
+                attn_mask = [1] * (seq_len - pad_len) + [0] * pad_len
+                
+                all_input_ids.append(chunk)
+                all_labels.append(labels)
+                all_attention_mask.append(attn_mask)
+                all_is_natural_stop.append(True)
+        
+        return {
+            "input_ids": all_input_ids,
+            "labels": all_labels,
+            "attention_mask": all_attention_mask,
+            "is_natural_stop": all_is_natural_stop,
+        }
+    
+    chunked = ds.map(_chunk_batch, batched=True, remove_columns=[text_column])
+    chunked = chunked.flatten_indices()
+    
+    # Save this shard
+    shard_path = os.path.join(cache_dir, f"shard_{batch_id:05d}")
+    chunked.save_to_disk(shard_path)
+    
+    return len(chunked)
 
 
 def create_unified_data_loader(
