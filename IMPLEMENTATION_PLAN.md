@@ -12,9 +12,18 @@ Trainer handles each appropriately without user concern.
 
 ## Key Requirements
 
-1. **Stream**: Support IterableColumn without materializing full corpus
-2. **Exact steps**: Deterministic batch count for scheduler/progress bar
-3. **No bottleneck**: Parallel tokenization preprocessing avoids CPU starvation
+1. **Stream**: Support IterableColumn without materializing full corpus at once
+2. **Exact steps**: Deterministic batch count for scheduler/progress bar  
+3. **No bottleneck**: Parallel tokenization preprocessing via sharding avoids CPU starvation
+4. **Simple API**: Sharding by default - no memory threshold guessing
+
+## Design Decision: Sharding by Default
+
+**All iterables go through the shard pipeline.** This:
+- Eliminates "what's the threshold?" complexity
+- Guarantees O(shard) memory bound regardless of corpus size
+- Enables parallel processing for everything via `num_proc`
+- Gives exact step counts before training starts
 
 ## Design
 
@@ -34,22 +43,23 @@ def create_helix_data_loader(
     stride: Optional[int] = None,
     streaming_buffer_size: int = 10_000,
     seed: int = 42,
-    # Preprocessing options for iterables
+    # Sharding options (for IterableDataset path)
     preprocess_num_proc: int = 4,
     preprocess_batch_size: int = 1000,
-    max_memory_gb: float = 8.0,  # Threshold for auto-materialize
+    shard_cache_dir: Optional[str] = None,  # Where to save shards, auto if None
+    max_shard_size: str = "500MB",
+    cleanup_shards: bool = True,  # Remove after training
 ) -> DataLoader:
     """
     Single entry point for all data types.
     
     Auto-detects input type:
     - List[str] or duck-typed list-like → DocumentAwareDataset (historical)
-    - datasets.Dataset (map-style) → HelixHFDataset with optional materialization
-    - datasets.IterableDataset/streaming → Preprocess with map(num_proc) + count
+    - datasets.Dataset (map-style) → DocumentAwareDataset after extraction
+    - datasets.IterableDataset/streaming → Sharded preprocessing pipeline
     
-    For streaming datasets, determines strategy based on size estimate:
-    - Small (< max_memory_gb): Materialize + map(num_proc) for parallelism
-    - Large (>= max_memory_gb): Stream with preprocess_to_shards() pipeline
+    For streaming datasets: ALWAYS uses preprocess_to_shards() pipeline.
+    This gives O(shard) memory + parallel processing + exact counts.
     """
 ```
 
@@ -72,106 +82,102 @@ if isinstance(data, datasets.Dataset):
 
 ## Path 3: IterableDataset / IterableColumn (The New Work)
 
-This is where the new implementation lives.
+**All streaming data goes through the shard pipeline.**
 
 ### The Strategy
 
-**Step 1: Size Estimation**
+**Stream → Shards → Fast Loader**
 
-Peek at first N samples to estimate total tokens:
+1. Stream from source (HF hub, local files, etc.)
+2. Pre-tokenize and chunk into Arrow shards on disk (parallel via `num_proc`)
+3. Load shards as fast map-style dataset with exact `__len__`
+4. Cleanup shards after training (optional)
 
-```python
-def _estimate_iterable_size(iterable, sample_size: int = 100):
-    """Estimate total documents and tokens from stream peek."""
-    samples = []
-    total = 0
-    for item in iterable:
-        samples.append(item)
-        total += len(item.get(text_column, ""))
-        if len(samples) >= sample_size:
-            break
-    
-    # Estimate: avg_chars_per_doc * estimated_docs
-    # If estimated < threshold: materialize
-    # If estimated > threshold: shard-based preprocessing
-```
-
-**Step 2: Two Sub-Paths**
-
-| Size | Strategy | Parallel | Memory |
-|------|----------|----------|--------|
-| Small (< threshold) | Materialize + `Dataset.map(num_proc)` | ✅ Yes | O(n) |
-| Large (>= threshold) | `preprocess_to_shards()` two-stage | ✅ Yes | O(shard) |
-
-### Small Streaming Datasets (Auto-Materialize)
+### Implementation
 
 ```python
-def _handle_small_iterable(iterable, text_column, tokenizer, seq_len, ...):
+def _handle_streaming_iterable(
+    iterable,
+    text_column: str,
+    tokenizer,
+    seq_len: int,
+    shard_cache_dir: Optional[str],
+    preprocess_num_proc: int,
+    batch_size: int,
+    max_shard_size: str,
+    **kwargs
+) -> DataLoader:
     """
-    For small iterables, materialize then use parallel map.
-    """
-    # Materialize texts
-    texts = [item.get(text_column, "") for item in iterable if item.get(text_column, "")]
+    Handle IterableDataset by streaming to shards first.
     
-    # Convert to Dataset for parallel processing
-    from datasets import Dataset
-    ds = Dataset.from_dict({"text": texts})
-    
-    # Use Dataset.map with num_proc for tokenization
-    tokenized = ds.map(
-        lambda batch: {"input_ids": [tokenizer.encode(t) for t in batch["text"]]},
-        batched=True,
-        batch_size=1000,
-        num_proc=num_proc,  # ✅ Parallel!
-    )
-    
-    # Now use HelixPrechunkedDataset or convert to List[str]
-    return create_helix_data_loader(texts, ...)  # Or optimized path
-```
-
-### Large Streaming Datasets (Shard Pipeline)
-
-```python
-def _handle_large_iterable(iterable, text_column, tokenizer, seq_len, output_dir, ...):
+    This is the ONLY path for streaming data - no threshold guessing.
     """
-    For large iterables, use two-stage preprocessing:
-    1. Stream to shards (pre-tokenized)
-    2. Load shards as fast map-style dataset
-    """
-    # Stage 1: Preprocess to disk shards
-    shard_dir = preprocess_to_shards(
+    import tempfile
+    import os
+    
+    # Determine shard cache location
+    if shard_cache_dir is None:
+        shard_cache_dir = tempfile.mkdtemp(prefix="helixlm_training_shards_")
+    else:
+        os.makedirs(shard_cache_dir, exist_ok=True)
+    
+    # Stage 1: Stream to shards with parallel tokenization
+    print(f"[HelixLM] Preprocessing streaming data to shards...")
+    print(f"  Cache: {shard_cache_dir}")
+    print(f"  Workers: {preprocess_num_proc}")
+    
+    shard_path = preprocess_to_shards(
         iterable,
         tokenizer,
-        output_dir=output_dir,
+        output_dir=shard_cache_dir,
         seq_len=seq_len,
-        num_proc=num_proc,  # ✅ Parallel!
-        max_shard_size="500MB",
+        text_column=text_column,
+        num_proc=preprocess_num_proc,
+        batch_size=preprocess_batch_size,  # Batch for map(), not training
+        max_shard_size=max_shard_size,
     )
     
-    # Stage 2: Create loader from shards
-    return create_helix_prechunked_loader(
-        shard_dir,
-        tokenizer,  # Not needed for pre-tokenized
+    # Stage 2: Create fast loader from shards
+    loader = _create_prechunked_loader(
+        shard_path,
         batch_size=batch_size,
         shuffle=shuffle,
-        ...
+        num_workers=num_workers,  # For DataLoader batch collation
+        drop_last=drop_last,
     )
+    
+    # Attach cleanup info (optional)
+    loader._helix_shard_path = shard_path
+    loader._helix_cleanup = cleanup_shards
+    
+    return loader
 ```
 
-## The Exact Steps Problem
+### Why Sharding is Better
 
-For **both** sub-paths, we now have exact counts:
+| Aspect | Materialize-then-process | Sharding-by-default |
+|--------|--------------------------|---------------------|
+| Memory bound | O(corpus size) | O(shard size) |
+| Parallel processing | Only if materialized | Always via `num_proc` |
+| Step counting | After materialization | Exact before training |
+| Complexity | Threshold guessing | Simple: always shard |
+| Disk usage | Temporary materialization | Persistent shards (cleaned) |
+| Restart/recovery | Re-download | Reuse existing shards |
 
-| Path | How we get exact batch count |
-|------|------------------------------|
-| Small materialized | `len(dataset)` after preprocessing |
-| Large sharded | Sum of samples across all shards |
+## The Exact Steps Problem (SOLVED)
+
+With sharding-by-default, we always have exact counts from the preprocessed shards:
 
 ```python
 def _count_preprocessed(preprocessed_ds):
     """Get exact sample count from preprocessed dataset."""
-    return len(preprocessed_ds)  # Now fast for both paths
+    return len(preprocessed_ds)  # Fast for sharded data
 ```
+
+The preprocessing step (before training) gives us:
+1. Total samples across all shards
+2. Exact batch count: `ceil(samples / batch_size)` if `drop_last=False`, else floor
+3. Total optimizer steps: `batches // grad_accum_steps * epochs`
 
 ## Progress Bar Integration
 
@@ -203,13 +209,13 @@ if is_preprocessed:
 ```python
 # All of these work the same way:
 
-# 1. List[str] - historical
+# 1. List[str] - historical (unchanged)
 from helix_lm import create_helix_data_loader
 train_loader = create_helix_data_loader(
     texts, tokenizer, seq_len=512, batch_size=8
 )
 
-# 2. Map-style dataset Column
+# 2. Map-style dataset Column (extracts texts, then Path 1)
 from datasets import load_dataset
 ds = load_dataset("my_data", split="train")
 loader = create_helix_data_loader(
@@ -217,28 +223,32 @@ loader = create_helix_data_loader(
 )
 
 # 3. Streaming dataset Column  ← NEW!
+# ALWAYS uses sharded preprocessing for consistent behavior
 ds = load_dataset("my_data", split="train", streaming=True)
 loader = create_helix_data_loader(
     ds["text"], tokenizer, seq_len=512, batch_size=8,
-    preprocess_num_proc=4, max_memory_gb=8.0
+    preprocess_num_proc=4,  # Parallel tokenization workers
+    shard_cache_dir="/tmp/my_training_shards",  # Optional
+    cleanup_shards=True,  # Remove after training
 )
-# Automatically chooses materialize vs shard based on size
+# Outputs: Fast map-style loader with exact __len__
 ```
 
 ## Testing Plan
 
-1. **Small iterable** (< 8GB): Verify auto-materialize path works
-2. **Large iterable** (> 8GB): Verify shard pipeline works  
+1. **Small iterable** (5M tokens): Verify shard pipeline works fast
+2. **Large iterable** (500M+ tokens): Verify shard pipeline works  
 3. **Exact steps**: Verify progress bar shows percentage
 4. **No bottleneck**: Verify GPU utilization stays high (>80%)
-5. **Backward compat**: Verify List[str] still works unchanged
+5. **Shard cleanup**: Verify temp shards are removed
+6. **Backward compat**: Verify List[str] still works unchanged
 
 ## Open Questions
 
-1. **Threshold**: Is 8GB a good default? Make configurable?
-2. **Temp storage**: Where do shards go? User-specified or `/tmp`?
-3. **Resume**: Do we need checkpoint/resume for streaming paths?
-4. **Validation**: Same preprocessing for validation data?
+1. ✅ **Temp storage**: `shard_cache_dir` parameter - auto-temp if None, user-specified otherwise
+2. **Resume**: Skip preprocessing if shards exist? (`overwrite_shards=False` option)
+3. **Validation**: Same sharding preprocessing for validation data - keep shards separate?
+4. **Shard size**: Is 500MB a good default? Should it scale with `seq_len`?
 
 ## Implementation Order
 
