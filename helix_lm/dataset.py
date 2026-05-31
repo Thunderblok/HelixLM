@@ -1173,6 +1173,10 @@ def create_unified_data_loader(
     - Map-style: DataLoader shuffle + Trainer's set_epoch() call
     - Iterable: HelixIterableDataset's internal shuffle_buffer + set_epoch()
     
+    For best performance with large datasets (2B+ tokens), consider using
+    preprocess_to_shards() to pre-tokenize data, then create_helix_prechunked_loader()
+    to load the pre-tokenized data. This avoids CPU bottlenecks during training.
+    
     Args:
         data: Either a List[str] of documents, or an iterable/streaming dataset
               (HF IterableDataset, HelixIterableDataset, etc.)

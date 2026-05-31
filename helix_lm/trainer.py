@@ -419,11 +419,17 @@ class Trainer:
         if inner_ds is not None and hasattr(inner_ds, "set_epoch"):
             inner_ds.set_epoch(epoch)
 
+        # For iterable datasets with known batch count, enable progress bar with total
+        pbar_total = None
+        if self._is_iterable and self._cached_dataset_length is not None:
+            pbar_total = self._cached_dataset_length
+
         pbar = tqdm(
             self.train_loader,
             desc=f"Epoch {epoch}",
             unit="batch",
             disable=not self.verbose,
+            total=pbar_total,
         )
 
         for batch_idx, batch in enumerate(pbar):
