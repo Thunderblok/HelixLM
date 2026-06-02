@@ -438,7 +438,8 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch with gradient accumulation and progress bar."""
         self.model.train()
-        total_loss = 0.0
+        total_loss_sum = 0.0
+        total_valid_tokens = 0
         raw_count = 0
         accum_count = 0
         skipped_batches = 0
@@ -533,7 +534,10 @@ class Trainer:
                 loss.backward()
 
             accum_count += 1
-            total_loss += loss.item() * divisor
+            # Convert batch-mean loss back to sum for proper corpus-level averaging
+            valid_tokens = (labels != -100).sum().item()
+            total_loss_sum += loss.item() * valid_tokens
+            total_valid_tokens += valid_tokens
             raw_count += 1
 
             # Optimizer step after accumulation
@@ -561,7 +565,7 @@ class Trainer:
                 self.global_step += 1
 
             # Live progress bar update
-            avg = total_loss / max(raw_count, 1)
+            avg = total_loss_sum / max(total_valid_tokens, 1)
             lr = self.scheduler.get_last_lr()[0]
             elapsed = time.time() - epoch_start
             tok_per_sec = tokens_seen / max(elapsed, 1e-6)
@@ -572,7 +576,7 @@ class Trainer:
                 "tok/s": f"{tok_per_sec:,.0f}",
             })
 
-        avg_loss = total_loss / max(raw_count, 1)
+        avg_loss = total_loss_sum / max(total_valid_tokens, 1)
         return {
             "loss": avg_loss,
             "perplexity": compute_perplexity(avg_loss),
@@ -586,8 +590,8 @@ class Trainer:
         if self.val_loader is None:
             return {}
         self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
+        total_loss_sum = 0.0
+        total_valid_tokens = 0
 
         # Check if val_loader uses iterable dataset (no len())
         val_is_iterable = _is_iterable_dataset(getattr(self.val_loader, "dataset", None))
@@ -617,15 +621,17 @@ class Trainer:
 
             loss = outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):
-                total_loss += loss.item()
-                num_batches += 1
-                avg = total_loss / max(num_batches, 1)
+                # Convert batch-mean loss back to sum for proper corpus-level averaging
+                valid_tokens = (labels != -100).sum().item()
+                total_loss_sum += loss.item() * valid_tokens
+                total_valid_tokens += valid_tokens
+                avg = total_loss_sum / max(total_valid_tokens, 1)
                 pbar.set_postfix({
                     "loss": f"{avg:.4f}",
                     "ppl": f"{compute_perplexity(avg):.2f}",
                 })
 
-        avg_loss = total_loss / max(num_batches, 1)
+        avg_loss = total_loss_sum / max(total_valid_tokens, 1)
         return {"loss": avg_loss, "perplexity": compute_perplexity(avg_loss)}
 
     @torch.no_grad()
