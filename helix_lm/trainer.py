@@ -587,7 +587,7 @@ class Trainer:
             return {}
         self.model.eval()
         total_loss = 0.0
-        total_tokens = 0
+        num_batches = 0
 
         # Check if val_loader uses iterable dataset (no len())
         val_is_iterable = _is_iterable_dataset(getattr(self.val_loader, "dataset", None))
@@ -617,18 +617,15 @@ class Trainer:
 
             loss = outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):
-                # Token-weighted loss: convert batch-mean back to sum for proper corpus avg
-                valid_tokens = (labels != -100).sum().item()
-                total_loss += loss.item() * valid_tokens
-                total_tokens += valid_tokens
-                avg = total_loss / max(total_tokens, 1)
+                total_loss += loss.item()
+                num_batches += 1
+                avg = total_loss / max(num_batches, 1)
                 pbar.set_postfix({
                     "loss": f"{avg:.4f}",
                     "ppl": f"{compute_perplexity(avg):.2f}",
-                    "tok": f"{total_tokens:,}",
                 })
 
-        avg_loss = total_loss / max(total_tokens, 1)
+        avg_loss = total_loss / max(num_batches, 1)
         return {"loss": avg_loss, "perplexity": compute_perplexity(avg_loss)}
 
     @torch.no_grad()
