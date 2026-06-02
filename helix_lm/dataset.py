@@ -176,13 +176,10 @@ class HelixDataset(Dataset):
     def _make_sample(self, chunk, labels, is_natural_stop):
         input_ids = torch.tensor(chunk[:self.seq_len], dtype=torch.long)
         labels_t = torch.tensor(labels[:self.seq_len], dtype=torch.long)
-        # P1 FIX: Build mask from exact pad_len, NOT from pad_token_id comparison.
-        # GPT-2/Qwen set pad_id == eos_id; comparing token values masks real EOS.
-        pad_len = sum(1 for tok in reversed(labels_t.tolist()) if tok == -100)
-        attention_mask = torch.cat([
-            torch.ones(self.seq_len - pad_len, dtype=torch.long),
-            torch.zeros(pad_len, dtype=torch.long),
-        ])
+        # BUG FIX: attention_mask must reflect ANY position that is -100
+        # (both padding AND overlap head masking). Previously only counted
+        # trailing -100 (padding), missing the overlap head region.
+        attention_mask = (labels_t != -100).long()
         return {
             "input_ids": input_ids,
             "labels": labels_t,
@@ -874,7 +871,10 @@ class HelixPrechunkedDataset(Dataset):
                             labels[:overlap_mask] = [-100] * overlap_mask
 
                         pad_len = 0
+                        # BUG FIX: attention_mask must reflect BOTH overlap head and padding
                         attn_mask = [1] * seq_len
+                        if overlap_mask > 0:
+                            attn_mask[:overlap_mask] = [0] * overlap_mask
 
                         all_input_ids.append(chunk)
                         all_labels.append(labels)
@@ -1372,7 +1372,10 @@ def _process_and_shard_batch(
                         labels[:overlap_mask] = [-100] * overlap_mask
                     
                     pad_len = 0
+                    # BUG FIX: attention_mask must reflect BOTH overlap head and padding
                     attn_mask = [1] * seq_len
+                    if overlap_mask > 0:
+                        attn_mask[:overlap_mask] = [0] * overlap_mask
                     
                     all_input_ids.append(chunk)
                     all_labels.append(labels)
