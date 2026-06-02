@@ -349,11 +349,10 @@ class DocumentAwareDataset(Dataset):
         if pad_len > 0:
             labels[-pad_len:] = -100
 
-        # P1 FIX: Build mask from exact pad_len, NOT from pad_id comparison.
-        attention_mask = torch.cat([
-            torch.ones(self.seq_len - pad_len, dtype=torch.long),
-            torch.zeros(pad_len, dtype=torch.long),
-        ])
+        # BUG FIX: attention_mask must reflect ANY position that is -100
+        # (both padding AND overlap head masking). Previously only counted
+        # trailing padding, missing the overlap head region.
+        attention_mask = (labels != -100).long()
         return {
             "input_ids": x,
             "labels": labels,
