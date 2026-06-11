@@ -156,13 +156,9 @@ class HelixDataset(Dataset):
     def _make_sample(self, chunk, labels, is_natural_stop):
         input_ids = torch.tensor(chunk[:self.seq_len], dtype=torch.long)
         labels_t = torch.tensor(labels[:self.seq_len], dtype=torch.long)
-        # P1 FIX: Build mask from exact pad_len, NOT from pad_token_id comparison.
-        # GPT-2/Qwen set pad_id == eos_id; comparing token values masks real EOS.
-        pad_len = sum(1 for tok in reversed(labels_t.tolist()) if tok == -100)
-        attention_mask = torch.cat([
-            torch.ones(self.seq_len - pad_len, dtype=torch.long),
-            torch.zeros(pad_len, dtype=torch.long),
-        ])
+        # BUG FIX: Derive attention_mask from ANY -100 position (both padding AND overlap)
+        # This ensures attention_mask is consistent with labels
+        attention_mask = (labels_t != -100).long()
         return {
             "input_ids": input_ids,
             "labels": labels_t,
@@ -332,11 +328,9 @@ class DocumentAwareDataset(Dataset):
         if pad_len > 0:
             labels[-pad_len:] = -100
 
-        # P1 FIX: Build mask from exact pad_len, NOT from pad_id comparison.
-        attention_mask = torch.cat([
-            torch.ones(self.seq_len - pad_len, dtype=torch.long),
-            torch.zeros(pad_len, dtype=torch.long),
-        ])
+        # BUG FIX: Derive attention_mask from ANY -100 position (both padding AND overlap)
+        # This ensures attention_mask is consistent with labels
+        attention_mask = (labels != -100).long()
         return {
             "input_ids": x,
             "labels": labels,
@@ -555,4 +549,444 @@ def create_document_loader(
         num_workers=num_workers,
         drop_last=drop_last,
     )
+
+
+# =============================================================================
+# Streaming Dataset Support (New API for 87M/3B Token Scale-Up)
+# =============================================================================
+
+def _is_iterable_column(data) -> bool:
+    """
+    Detect IterableColumn vs List[str] vs Column[str].
+    
+    IterableColumn comes from streaming datasets (load_dataset(..., streaming=True))
+    and has __iter__ but no __getitem__.
+    """
+    # Method 1: Check for HF IterableDataset type
+    try:
+        from datasets import IterableDataset
+        if isinstance(data, IterableDataset):
+            return True
+    except ImportError:
+        pass
+    
+    # Method 2: Duck typing - has __iter__ but no __getitem__
+    if hasattr(data, '__iter__') and not hasattr(data, '__getitem__'):
+        return True
+    
+    # Method 3: Has __len__ that raises TypeError (streaming pattern)
+    if hasattr(data, '__len__'):
+        try:
+            len(data)
+        except (TypeError, NotImplementedError):
+            return True
+    
+    return False
+
+
+def _chunk_text_streaming(
+    texts_iter: Iterator[str],
+    tokenizer,
+    seq_len: int,
+    stride: Optional[int] = None,
+    min_tail_len: int = 1,
+    add_eos: bool = True,
+) -> Iterator[Tuple[List[int], bool, int, int]]:
+    """
+    Streaming text chunker that yields (token_ids, is_natural_stop, pad_len, overlap_mask).
+    
+    Memory bounded: processes one document at a time.
+    """
+    stride = stride if stride is not None else seq_len
+    if not (1 <= stride <= seq_len):
+        raise ValueError(f"stride must be in [1, seq_len], got {stride}")
+    
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", 0)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    
+    for text in texts_iter:
+        text = text.strip() if text else ""
+        if not text:
+            continue
+        
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < min_tail_len:
+            continue
+        
+        if add_eos and eos_id is not None:
+            ids.append(eos_id)
+        
+        length = len(ids)
+        
+        if length >= seq_len:
+            # Sliding-window chunks
+            starts = list(range(0, length - seq_len + 1, stride))
+            for i, start in enumerate(starts):
+                chunk = ids[start:start + seq_len]
+                is_last_start = (i == len(starts) - 1)
+                reaches_end = (start + seq_len == length)
+                
+                if not is_last_start:
+                    is_natural = False
+                else:
+                    tail_len = length - (start + seq_len)
+                    has_tail = tail_len >= min_tail_len
+                    is_natural = reaches_end or (not has_tail)
+                
+                overlap_mask = 0
+                if start > 0 and stride < seq_len:
+                    overlap_mask = seq_len - stride
+                
+                yield (chunk, is_natural, 0, overlap_mask)
+            
+            # Tail handling
+            last_covered_end = starts[-1] + seq_len if starts else 0
+            remainder_len = length - last_covered_end
+            
+            if remainder_len >= min_tail_len:
+                tail = ids[last_covered_end:]
+                pad_len = seq_len - remainder_len
+                tail = tail + [pad_id] * pad_len
+                yield (tail, True, pad_len, 0)
+            elif remainder_len > 0 and starts:
+                # Tail too short: last chunk becomes natural stop
+                # (handled by setting is_natural=True in last yielded)
+                pass
+        else:
+            # Short document
+            pad_len = seq_len - length
+            chunk = ids + [pad_id] * pad_len
+            yield (chunk, True, pad_len, 0)
+
+
+class HelixPrechunkedDataset(Dataset):
+    """
+    Dataset from pre-chunked token sequences (for sharded preprocessing).
+    
+    Each sample is a tuple: (token_ids, is_natural_stop, pad_len, overlap_mask)
+    """
+    def __init__(self, chunks: List[Tuple[List[int], bool, int, int]], seq_len: int):
+        super().__init__()
+        self.chunks = chunks
+        self.seq_len = seq_len
+    
+    def __len__(self) -> int:
+        return len(self.chunks)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        chunk, is_natural, pad_len, overlap_mask = self.chunks[idx]
+        
+        x = torch.tensor(chunk, dtype=torch.long)
+        labels = x.clone()
+        
+        # Mask overlapping head (stride < seq_len)
+        if overlap_mask > 0:
+            labels[:overlap_mask] = -100
+        
+        # Mask trailing padding
+        if pad_len > 0:
+            labels[-pad_len:] = -100
+        
+        # Derive attention_mask from labels (any -100 position)
+        attention_mask = (labels != -100).long()
+        
+        return {
+            "input_ids": x,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "is_natural_stop": torch.tensor(is_natural, dtype=torch.bool),
+        }
+
+
+def _process_and_shard_batch(
+    texts: List[str],
+    tokenizer,
+    seq_len: int,
+    stride: Optional[int] = None,
+    min_tail_len: int = 1,
+    add_eos: bool = True,
+) -> List[Tuple[List[int], bool, int, int]]:
+    """
+    Process a batch of texts and return pre-chunked samples.
+    
+    This is used during streaming preprocessing to build shards.
+    """
+    chunks = []
+    stride = stride if stride is not None else seq_len
+    
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", 0)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    
+    for text in texts:
+        text = text.strip() if text else ""
+        if not text:
+            continue
+        
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < min_tail_len:
+            continue
+        
+        if add_eos and eos_id is not None:
+            ids.append(eos_id)
+        
+        length = len(ids)
+        
+        if length >= seq_len:
+            # Sliding-window chunks
+            starts = list(range(0, length - seq_len + 1, stride))
+            for i, start in enumerate(starts):
+                chunk = ids[start:start + seq_len]
+                is_last_start = (i == len(starts) - 1)
+                reaches_end = (start + seq_len == length)
+                
+                if not is_last_start:
+                    is_natural = False
+                else:
+                    tail_len = length - (start + seq_len)
+                    has_tail = tail_len >= min_tail_len
+                    is_natural = reaches_end or (not has_tail)
+                
+                # BUG FIX: Calculate overlap_mask correctly
+                overlap_mask = 0
+                if start > 0 and stride < seq_len:
+                    overlap_mask = seq_len - stride
+                
+                chunks.append((chunk, is_natural, 0, overlap_mask))
+            
+            # Tail handling
+            last_covered_end = starts[-1] + seq_len if starts else 0
+            remainder_len = length - last_covered_end
+            
+            if remainder_len >= min_tail_len:
+                tail = ids[last_covered_end:]
+                pad_len = seq_len - remainder_len
+                tail = tail + [pad_id] * pad_len
+                chunks.append((tail, True, pad_len, 0))
+        else:
+            # Short document
+            pad_len = seq_len - length
+            chunk = ids + [pad_id] * pad_len
+            chunks.append((chunk, True, pad_len, 0))
+    
+    return chunks
+
+
+def _handle_streaming_iterable(
+    iterable,
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    stride: Optional[int] = None,
+    shuffle: bool = True,
+    drop_last: bool = True,
+    num_workers: int = 0,
+    min_tail_len: Optional[int] = None,
+    add_eos: bool = True,
+    seed: int = 42,
+    text_column: str = "text",
+    shard_cache_dir: Optional[str] = None,
+    preprocess_num_proc: Optional[int] = None,
+    preprocess_batch_size: int = 1000,
+    max_shard_size: str = "500MB",
+    cleanup_shards: bool = True,
+) -> Tuple[DataLoader, Optional[str]]:
+    """
+    Handle streaming IterableColumn by preprocessing to sharded Dataset.
+    
+    Strategy: Stream -> Shards -> Fast Loader
+    1. Stream data in batches to shards on disk
+    2. Pre-tokenize each shard
+    3. Return DataLoader from concatenated shards
+    
+    Returns:
+        Tuple of (DataLoader, shard_cache_dir)
+        shard_cache_dir should be cleaned up after training.
+    """
+    import tempfile
+    import os
+    import pickle
+    from datetime import datetime
+    
+    if min_tail_len is None:
+        min_tail_len = 1
+    
+    # Create cache directory
+    if shard_cache_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shard_cache_dir = os.path.join(tempfile.gettempdir(), f"helix_shards_{timestamp}")
+    os.makedirs(shard_cache_dir, exist_ok=True)
+    
+    # Determine text extraction method
+    def extract_text(example):
+        if isinstance(example, dict):
+            return example.get(text_column, "")
+        return str(example)
+    
+    # Stream and shard
+    all_chunks = []
+    shard_idx = 0
+    batch = []
+    
+    for example in iterable:
+        text = extract_text(example)
+        if text:
+            batch.append(text)
+        
+        if len(batch) >= preprocess_batch_size:
+            # Process batch
+            chunks = _process_and_shard_batch(
+                batch, tokenizer, seq_len, stride, min_tail_len, add_eos
+            )
+            all_chunks.extend(chunks)
+            batch = []
+            
+            # Save shard if it gets large
+            if len(all_chunks) >= 10000:  # ~10k sequences per shard
+                shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
+                with open(shard_path, 'wb') as f:
+                    pickle.dump(all_chunks, f)
+                all_chunks = []
+                shard_idx += 1
+    
+    # Process remaining batch
+    if batch:
+        chunks = _process_and_shard_batch(
+            batch, tokenizer, seq_len, stride, min_tail_len, add_eos
+        )
+        all_chunks.extend(chunks)
+    
+    # Save final shard
+    if all_chunks:
+        shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
+        with open(shard_path, 'wb') as f:
+            pickle.dump(all_chunks, f)
+    
+    # Load all shards and concatenate
+    loaded_chunks = []
+    for i in range(shard_idx + 1):
+        shard_path = os.path.join(shard_cache_dir, f"shard_{i:04d}.pkl")
+        if os.path.exists(shard_path):
+            with open(shard_path, 'rb') as f:
+                loaded_chunks.extend(pickle.load(f))
+    
+    # Create dataset and dataloader
+    dataset = HelixPrechunkedDataset(loaded_chunks, seq_len)
+    
+    def collate_fn(batch):
+        input_ids = torch.stack([b["input_ids"] for b in batch])
+        labels = torch.stack([b["labels"] for b in batch])
+        attention_mask = torch.stack([b["attention_mask"] for b in batch])
+        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "is_natural_stop": is_natural_stop,
+        }
+    
+    # Shuffle if requested
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        # Use a simple shuffle by random sampling indices
+        indices = torch.randperm(len(dataset), generator=generator).tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,  # Already shuffled above if requested
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        drop_last=drop_last,
+    )
+    
+    return loader, shard_cache_dir
+
+
+def create_unified_data_loader(
+    data: Union[List[str], Any],
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    stride: Optional[int] = None,
+    shuffle: bool = True,
+    drop_last: bool = True,
+    num_workers: int = 0,
+    min_tail_len: Optional[int] = None,
+    add_eos: bool = True,
+    lazy: bool = True,
+    seed: int = 42,
+    text_column: str = "text",
+    # Sharding options (for IterableColumn path)
+    shard_cache_dir: Optional[str] = None,
+    preprocess_num_proc: Optional[int] = None,
+    preprocess_batch_size: int = 1000,
+    max_shard_size: str = "500MB",
+    cleanup_shards: bool = True,
+) -> Union[DataLoader, Tuple[DataLoader, Optional[str]]]:
+    """
+    Create DataLoader that automatically detects data type:
+    - List[str] -> DocumentAwareDataset
+    - Column[str] (with __getitem__) -> DocumentAwareDataset  
+    - IterableColumn[str] (streaming) -> Sharded preprocessing -> HelixPrechunkedDataset
+    
+    For streaming data, returns (DataLoader, shard_cache_dir) tuple.
+    The caller should clean up shard_cache_dir after training.
+    
+    Args:
+        data: Input data - List[str], Column[str], or IterableColumn[str]
+        tokenizer: Tokenizer instance
+        seq_len: Sequence length for model
+        batch_size: Batch size for DataLoader
+        stride: If < seq_len, enables within-document overlap
+        shuffle: Whether to shuffle the data
+        drop_last: Whether to drop last incomplete batch
+        num_workers: Number of worker processes for DataLoader
+        min_tail_len: Minimum tail length for document handling
+        add_eos: Whether to add EOS token
+        lazy: Whether to use lazy loading for DocumentAwareDataset
+        seed: Random seed for shuffling
+        text_column: Column name for text extraction from dicts
+        shard_cache_dir: Directory for temporary shard storage (streaming only)
+        preprocess_num_proc: Number of processes for preprocessing (streaming only)
+        preprocess_batch_size: Batch size for streaming preprocessing
+        max_shard_size: Maximum shard size (for compatibility)
+        cleanup_shards: Whether to auto-cleanup shards (for compatibility)
+    
+    Returns:
+        DataLoader for List[str]/Column[str] inputs
+        Tuple[DataLoader, str] for IterableColumn inputs (includes shard_cache_dir for cleanup)
+    """
+    # Detect data type
+    if _is_iterable_column(data):
+        # Streaming path
+        return _handle_streaming_iterable(
+            data, tokenizer, seq_len, batch_size, stride,
+            shuffle=shuffle, drop_last=drop_last, num_workers=num_workers,
+            min_tail_len=min_tail_len, add_eos=add_eos, seed=seed,
+            text_column=text_column,
+            shard_cache_dir=shard_cache_dir,
+            preprocess_num_proc=preprocess_num_proc,
+            preprocess_batch_size=preprocess_batch_size,
+            max_shard_size=max_shard_size,
+            cleanup_shards=cleanup_shards,
+        )
+    
+    # List[str] or Column[str] path
+    # Convert Column to list if needed (for non-iterable columns with __getitem__)
+    if hasattr(data, '__getitem__') and hasattr(data, '__len__') and not isinstance(data, list):
+        data = list(data)
+    
+    loader = create_document_loader(
+        data, tokenizer, seq_len, batch_size,
+        shuffle=shuffle, drop_last=drop_last, num_workers=num_workers,
+        min_tail_len=min_tail_len, add_eos=add_eos, lazy=lazy, stride=stride,
+    )
+    
+    return loader
   
