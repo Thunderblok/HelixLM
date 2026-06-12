@@ -1,38 +1,31 @@
 #!/usr/bin/env python3
 """
-Test: Verify List[str] and IterableColumn produce IDENTICAL chunks.
+Test: Verify List[str] and IterableColumn produce identical training results.
 
-This test validates:
-1. DocumentAwareDataset with List[str] (Case 1)
-2. Streaming dataset path with IterableColumn (Case 2)
-3. Both produce identical chunks, labels, and attention masks
+This test validates 3 cases with texts longer than seq_len:
+1. List[str] (materialized) passed to Trainer
+2. Streaming IterableColumn passed to Trainer with stride=seq_len  
+3. Streaming IterableColumn passed to Trainer with stride=seq_len//2
 
 Uses dataset: david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427
-- 200 train samples (pretrain_train)
+- 200 train samples (pretrain_train), ~500 tokens avg (longer than seq_len)
 - 30 eval samples (pretrain_val)
 
-Model: 96 seq_len (as in quick_demo_cpu.py)
-Dataset samples: ~500 seq_len tokens on average
-This tests sliding window with overlap masking.
+Model: small_v2 (~15M params) with seq_len=96
+Expected:
+- Case 1 and 2 produce IDENTICAL results (since we fixed shuffle)
+- Case 3 has PPL equal or better (more training data with overlap)
 """
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
-
 import random
 import numpy as np
 import torch
 from datasets import load_dataset
 
-from helix_lm import (
-    HelixTokenizer,
-    DocumentAwareDataset,
-    create_unified_data_loader,
-    _is_iterable_column,
-)
+from helix_lm import HelixTokenizer, HelixConfig, HelixForCausalLM, Trainer
 
 
-# Constants for test
 MAX_SEQ_LEN = 96
 NUM_TRAIN = 200
 NUM_VAL = 30
@@ -40,243 +33,135 @@ RANDOM_SEED = 42
 
 
 def set_seeds(seed=42):
-    """Set all random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def load_data_as_list():
-    """
-    Case 1: Load data as List[str] (materialized).
-    Returns (train_texts, val_texts) as lists.
-    """
+    """Load data as List[str] (materialized)."""
     ds = load_dataset("david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427")
-    
-    # Get train and val texts
     train_texts = list(ds['pretrain_train']['text'])[:NUM_TRAIN]
     val_texts = list(ds['pretrain_val']['text'])[:NUM_VAL]
-    
     return train_texts, val_texts
 
 
 def load_data_as_iterable_column():
-    """
-    Case 2: Load data as IterableColumn (streaming).
-    Returns (train_texts, val_texts) as IterableColumn (no materialization).
-    """
+    """Load data as IterableColumn (streaming)."""
     ds = load_dataset("david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427", streaming=True)
-    
-    # Get iterable columns - do NOT convert to list before passing to API
     train_iterable = ds['pretrain_train'].take(NUM_TRAIN)
     val_iterable = ds['pretrain_val'].take(NUM_VAL)
-    
-    # Extract just the text column as iterable
-    # For HF streaming, we get dicts, so we need to extract 'text'
     train_texts = (item['text'] for item in train_iterable)
     val_texts = (item['text'] for item in val_iterable)
-    
     return train_texts, val_texts
 
 
-def compare_datasets(dataset1, dataset2, name="Dataset"):
-    """
-    Compare two datasets for identical samples.
-    
-    Returns: (is_equal, message, details)
-    """
-    len1 = len(dataset1)
-    len2 = len(dataset2)
-    
-    if len1 != len2:
-        return False, f"{name} length mismatch: {len1} vs {len2}", None
-    
-    mismatches = []
-    for i in range(len1):
-        s1 = dataset1[i]
-        s2 = dataset2[i]
-        
-        # Compare input_ids
-        if not torch.equal(s1['input_ids'], s2['input_ids']):
-            mismatches.append(f"Sample {i}: input_ids mismatch")
-            continue
-        
-        # Compare labels
-        if not torch.equal(s1['labels'], s2['labels']):
-            mismatches.append(f"Sample {i}: labels mismatch")
-            continue
-        
-        # Compare attention_mask
-        if not torch.equal(s1['attention_mask'], s2['attention_mask']):
-            mismatches.append(f"Sample {i}: attention_mask mismatch")
-            continue
-        
-        # Compare is_natural_stop
-        if not torch.equal(s1['is_natural_stop'], s2['is_natural_stop']):
-            mismatches.append(f"Sample {i}: is_natural_stop mismatch")
-            continue
-    
-    if mismatches:
-        return False, f"{name} has {len(mismatches)} mismatches", mismatches[:5]
-    
-    return True, f"{name} is IDENTICAL ({len1} samples)", None
-
-
-def test_case1_list_str():
-    """
-    Test Case 1: List[str] path.
-    Uses DocumentAwareDataset directly.
-    """
-    print("\n" + "="*60)
-    print("CASE 1: List[str] (Materialized)")
-    print("="*60)
-    
-    set_seeds(RANDOM_SEED)
-    tokenizer = HelixTokenizer("gpt2")
-    
-    train_texts, val_texts = load_data_as_list()
-    print(f"Loaded {len(train_texts)} train samples, {len(val_texts)} val samples")
-    
-    # Create datasets
-    train_ds = DocumentAwareDataset(
-        train_texts, tokenizer, MAX_SEQ_LEN,
-        min_tail_len=1, add_eos=True, lazy=True,
+def run_training(train_texts, val_texts, stride, cfg, tokenizer, output_dir):
+    """Run training using ONLY the Trainer API."""
+    model = HelixForCausalLM(cfg)
+    trainer = Trainer(
+        model=model,
+        cfg=cfg,
+        train_texts=train_texts,
+        val_texts=val_texts,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        stride=stride,
+        verbose=False,
     )
-    val_ds = DocumentAwareDataset(
-        val_texts, tokenizer, MAX_SEQ_LEN,
-        min_tail_len=1, add_eos=True, lazy=True,
-    )
+    history = trainer.train(num_epochs=1)
     
-    print(f"Train dataset: {len(train_ds)} chunks")
-    print(f"Val dataset: {len(val_ds)} chunks")
-    
-    # Check attention_mask correctness
-    sample = train_ds[0]
-    print(f"\nSample 0 stats:")
-    print(f"  input_ids shape: {sample['input_ids'].shape}")
-    print(f"  labels shape: {sample['labels'].shape}")
-    print(f"  attention_mask shape: {sample['attention_mask'].shape}")
-    print(f"  is_natural_stop: {sample['is_natural_stop']}")
-    
-    # Verify attention_mask = (labels != -100).long()
-    expected_mask = (sample['labels'] != -100).long()
-    if torch.equal(sample['attention_mask'], expected_mask):
-        print("  ✓ attention_mask correctly derived from labels")
-    else:
-        print("  ✗ attention_mask mismatch!")
-        diff = (sample['attention_mask'] != expected_mask).nonzero()
-        print(f"    Differences at: {diff}")
-    
-    return train_ds, val_ds
-
-
-def test_case2_iterable_column():
-    """
-    Test Case 2: IterableColumn path.
-    Uses streaming dataset with create_unified_data_loader.
-    """
-    print("\n" + "="*60)
-    print("CASE 2: IterableColumn (Streaming)")
-    print("="*60)
-    
-    set_seeds(RANDOM_SEED)
-    tokenizer = HelixTokenizer("gpt2")
-    
-    # Load as streaming iterables
-    train_texts, val_texts = load_data_as_iterable_column()
-    
-    # Verify this is detected as iterable
-    print(f"train_texts is iterable column: {_is_iterable_column(train_texts)}")
-    
-    # This would trigger streaming path - but we need to materialize
-    # for comparison, so let's use the _process_and_shard_batch directly
-    train_list = list(train_texts)
-    val_list = list(val_texts)
-    print(f"Loaded {len(train_list)} train samples, {len(val_list)} val samples (materialized for test)")
-    
-    # Create datasets using the streaming preprocessing logic
-    from helix_lm.dataset import _process_and_shard_batch
-    
-    train_chunks = _process_and_shard_batch(
-        train_list, tokenizer, MAX_SEQ_LEN, stride=None, min_tail_len=1, add_eos=True
-    )
-    val_chunks = _process_and_shard_batch(
-        val_list, tokenizer, MAX_SEQ_LEN, stride=None, min_tail_len=1, add_eos=True
-    )
-    
-    from helix_lm.dataset import HelixPrechunkedDataset
-    train_ds = HelixPrechunkedDataset(train_chunks, MAX_SEQ_LEN)
-    val_ds = HelixPrechunkedDataset(val_chunks, MAX_SEQ_LEN)
-    
-    print(f"Train dataset: {len(train_ds)} chunks")
-    print(f"Val dataset: {len(val_ds)} chunks")
-    
-    # Check attention_mask correctness
-    sample = train_ds[0]
-    print(f"\nSample 0 stats:")
-    print(f"  input_ids shape: {sample['input_ids'].shape}")
-    print(f"  labels shape: {sample['labels'].shape}")
-    print(f"  attention_mask shape: {sample['attention_mask'].shape}")
-    print(f"  is_natural_stop: {sample['is_natural_stop']}")
-    
-    # Verify attention_mask = (labels != -100).long()
-    expected_mask = (sample['labels'] != -100).long()
-    if torch.equal(sample['attention_mask'], expected_mask):
-        print("  ✓ attention_mask correctly derived from labels")
-    else:
-        print("  ✗ attention_mask mismatch!")
-        diff = (sample['attention_mask'] != expected_mask).nonzero()
-        print(f"    Differences at: {diff}")
-    
-    return train_ds, val_ds
+    return {
+        'train_loss': history['train_loss'][-1],
+        'val_loss': history['val_loss'][-1] if history['val_loss'] else float('inf'),
+        'val_ppl': history['perplexity'][-1] if history['perplexity'] else float('inf'),
+    }
 
 
 def main():
-    """Run the equivalence test."""
     print("="*60)
-    print("HelixLM Streaming Dataset Equivalence Test")
+    print("HelixLM Streaming Dataset Equivalence & Stride Test")
     print("="*60)
     print(f"Dataset: david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427")
-    print(f"Train samples: {NUM_TRAIN}")
-    print(f"Val samples: {NUM_VAL}")
+    print(f"Train samples: {NUM_TRAIN}, Val samples: {NUM_VAL}")
     print(f"Seq len: {MAX_SEQ_LEN}")
-    print(f"Seed: {RANDOM_SEED}")
     
-    # Run both cases
-    train_ds_case1, val_ds_case1 = test_case1_list_str()
-    train_ds_case2, val_ds_case2 = test_case2_iterable_column()
+    set_seeds(RANDOM_SEED)
+    tokenizer = HelixTokenizer("gpt2")
     
-    # Compare results
+    cfg = HelixConfig.small_v2(
+        vocab_size=len(tokenizer),
+        seq_len=MAX_SEQ_LEN,
+        tokenizer_name="gpt2",
+        use_titans_memory=False,
+        epochs=1,
+        batch_size=8,
+        lr=0.001,
+        seed=RANDOM_SEED,
+    )
+    cfg.pad_token_id = tokenizer.pad_token_id
+    cfg.eos_token_id = tokenizer.eos_token_id
+    cfg.bos_token_id = tokenizer.bos_token_id
+    
+    train_list, val_list = load_data_as_list()
+    train_iter, val_iter = load_data_as_iterable_column()
+    
+    # Case 1: List[str]
+    print("\n--- Case 1: List[str] ---")
+    set_seeds(RANDOM_SEED)
+    metrics1 = run_training(train_list, val_list, MAX_SEQ_LEN, cfg, tokenizer, "./c1")
+    print(f"Train Loss: {metrics1['train_loss']:.4f}, Val PPL: {metrics1['val_ppl']:.2f}")
+    
+    # Case 2: IterableColumn with stride=seq_len
+    print("\n--- Case 2: IterableColumn stride=seq_len ---")
+    set_seeds(RANDOM_SEED)
+    metrics2 = run_training(train_iter, val_iter, MAX_SEQ_LEN, cfg, tokenizer, "./c2")
+    print(f"Train Loss: {metrics2['train_loss']:.4f}, Val PPL: {metrics2['val_ppl']:.2f}")
+    
+    # Re-create iterators for Case 3
+    train_iter, val_iter = load_data_as_iterable_column()
+    
+    # Case 3: IterableColumn with stride=seq_len//2
+    print("\n--- Case 3: IterableColumn stride=seq_len//2 ---")
+    set_seeds(RANDOM_SEED)
+    metrics3 = run_training(train_iter, val_iter, MAX_SEQ_LEN // 2, cfg, tokenizer, "./c3")
+    print(f"Train Loss: {metrics3['train_loss']:.4f}, Val PPL: {metrics3['val_ppl']:.2f}")
+    
+    # Verification
     print("\n" + "="*60)
-    print("COMPARISON: Case 1 vs Case 2")
+    print("VERIFICATION")
     print("="*60)
     
-    # Compare train datasets
-    is_equal_train, msg_train, details_train = compare_datasets(
-        train_ds_case1, train_ds_case2, "Train Dataset"
-    )
-    print(f"\nTrain: {msg_train}")
-    if details_train:
-        print(f"  First 5 mismatches: {details_train}")
+    all_passed = True
     
-    # Compare val datasets
-    is_equal_val, msg_val, details_val = compare_datasets(
-        val_ds_case1, val_ds_case2, "Val Dataset"
-    )
-    print(f"Val: {msg_val}")
-    if details_val:
-        print(f"  First 5 mismatches: {details_val}")
-    
-    # Final result
-    print("\n" + "="*60)
-    if is_equal_train and is_equal_val:
-        print("✓ SUCCESS: List[str] and IterableColumn produce IDENTICAL results!")
-        print("="*60)
-        return 0
+    # Check Case 1 == Case 2 (identical)
+    print("\n1. Case 1 vs Case 2 (should be IDENTICAL):")
+    if metrics1['train_loss'] == metrics2['train_loss']:
+        print(f"   ✓ Train Loss identical: {metrics1['train_loss']:.4f}")
     else:
-        print("✗ FAILURE: Results differ between List[str] and IterableColumn!")
-        print("="*60)
-        return 1
+        print(f"   ✗ Train Loss differs: {metrics1['train_loss']:.4f} vs {metrics2['train_loss']:.4f}")
+        all_passed = False
+    
+    if metrics1['val_ppl'] == metrics2['val_ppl']:
+        print(f"   ✓ Val PPL identical: {metrics1['val_ppl']:.2f}")
+    else:
+        print(f"   ✗ Val PPL differs: {metrics1['val_ppl']:.2f} vs {metrics2['val_ppl']:.2f}")
+        all_passed = False
+    
+    # Check Case 3 <= Case 2 (better or equal)
+    print("\n2. Case 3 vs Case 2 (PPL should be <=):")
+    if metrics3['val_ppl'] <= metrics2['val_ppl']:
+        improvement = (metrics2['val_ppl'] - metrics3['val_ppl']) / metrics2['val_ppl'] * 100
+        print(f"   ✓ Val PPL improved: {metrics3['val_ppl']:.2f} <= {metrics2['val_ppl']:.2f} ({improvement:.1f}% better)")
+    else:
+        print(f"   ✗ Val PPL worse: {metrics3['val_ppl']:.2f} > {metrics2['val_ppl']:.2f}")
+        all_passed = False
+    
+    print("\n" + "="*60)
+    print("✓ ALL CHECKS PASSED" if all_passed else "✗ SOME CHECKS FAILED")
+    print("="*60)
+    
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":

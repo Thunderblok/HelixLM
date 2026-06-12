@@ -904,22 +904,28 @@ def _handle_streaming_iterable(
             "is_natural_stop": is_natural_stop,
         }
     
-    # Shuffle if requested
+    # Create DataLoader with proper shuffle
     if shuffle:
         generator = torch.Generator()
         generator.manual_seed(seed)
-        # Use a simple shuffle by random sampling indices
-        indices = torch.randperm(len(dataset), generator=generator).tolist()
-        dataset = torch.utils.data.Subset(dataset, indices)
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,  # Already shuffled above if requested
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        drop_last=drop_last,
-    )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            generator=generator,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            drop_last=drop_last,
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            drop_last=drop_last,
+        )
     
     return loader, shard_cache_dir
 
