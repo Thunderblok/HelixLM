@@ -105,7 +105,7 @@ if not HF_TOKEN:
 # SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-OUTPUT_DIR = Path("/app/HelixLM/production_run_87M_1024_nloops5")
+OUTPUT_DIR = Path("production_run_87M_1024_nloops5")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = OUTPUT_DIR / f"production_train_87M_1024_nl5_{RUN_TS}.log"
 RESULTS_JSON = OUTPUT_DIR / f"production_results_87M_1024_nl5_{RUN_TS}.json"
@@ -120,7 +120,7 @@ logger = logging.getLogger(__name__)
 # ── Dynamic repo naming ──────────────────────────────────────────────────
 REPO_BASE = (
     f"HelixLM-87M-nl5-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-h{N_HEADS}-nl{N_LOOPS}"
-    f"-ffn{int(FFN_EXPANSION*10)}-s{SEQ_LEN}-3BT"
+    f"-ffn{int(FFN_EXPANSION)}-s{SEQ_LEN}-3BT"
 )
 REPO_BASE_ALT = f"HelixLM-87M-nl5-{RUN_TS}-prod"
 
