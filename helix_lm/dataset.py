@@ -515,6 +515,7 @@ def create_document_loader(
     add_eos: bool = True,
     lazy: bool = True,
     stride: Optional[int] = None,
+    seed: int = 42,
 ) -> DataLoader:
     """
     Create a DataLoader using DocumentAwareDataset (no boundary crossings).
@@ -523,6 +524,7 @@ def create_document_loader(
         stride: If < seq_len, enables within-document overlap (default: seq_len).
                 This restores more optimizer steps per epoch without ever
                 crossing document boundaries.
+        seed: RNG seed for shuffling (uses torch.Generator for determinism).
     """
     ds = DocumentAwareDataset(
         texts, tokenizer, seq_len,
@@ -541,14 +543,28 @@ def create_document_loader(
             "is_natural_stop": is_natural_stop,
         }
 
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        drop_last=drop_last,
-    )
+    # Use torch.Generator for deterministic shuffling with given seed
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            drop_last=drop_last,
+            generator=generator,
+        )
+    else:
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            drop_last=drop_last,
+        )
 
 
 # =============================================================================

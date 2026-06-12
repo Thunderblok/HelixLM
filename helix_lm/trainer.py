@@ -169,6 +169,7 @@ class Trainer:
                     shuffle=True,
                     drop_last=True,
                     min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     shard_cache_dir=shard_cache_dir,
                     preprocess_num_proc=preprocess_num_proc,
                     preprocess_batch_size=preprocess_batch_size,
@@ -187,6 +188,7 @@ class Trainer:
                     cfg.batch_size,
                     shuffle=True,
                     min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,
                 )
                 self._train_shard_dir = None
@@ -206,6 +208,7 @@ class Trainer:
                     shuffle=False,
                     drop_last=False,
                     min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     shard_cache_dir=shard_cache_dir,
                     preprocess_num_proc=preprocess_num_proc,
                     preprocess_batch_size=preprocess_batch_size,
@@ -225,6 +228,7 @@ class Trainer:
                     shuffle=False,
                     drop_last=False,
                     min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,
                 )
                 self._val_shard_dir = None
