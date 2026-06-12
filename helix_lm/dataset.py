@@ -573,43 +573,34 @@ def create_document_loader(
 
 def _is_iterable_column(data) -> bool:
     """
-    Detect IterableColumn vs List[str] vs Column[str].
+    Detect if data should use streaming path (vs materialized List[str]).
     
-    IterableColumn comes from streaming datasets (load_dataset(..., streaming=True))
-    and has __iter__ but no __len__.
+    Streaming data:
+        - Has __iter__ (can be iterated)
+        - Does NOT have working __len__ (len() raises or doesn't exist)
+    
+    Materialized data:
+        - Has working __len__ (len() returns a number)
+    
+    Examples:
+        - List[str]: materialized (has len)
+        - IterableColumn: streaming (no len, has iter)
+        - Generator: streaming (no len, has iter)
     """
-    # Method 1: Check for HF IterableDataset or IterableDatasetDict type
-    try:
-        from datasets import IterableDataset
-        if isinstance(data, IterableDataset):
-            return True
-    except ImportError:
-        pass
+    # Must be iterable
+    if not hasattr(data, '__iter__'):
+        return False
     
-    # Method 2: Check for IterableColumn specifically
-    try:
-        from datasets.iterable_dataset import IterableColumn
-        if isinstance(data, IterableColumn):
-            return True
-    except ImportError:
-        pass
-    
-    # Method 3: Duck typing - has __iter__ but no __getitem__
-    if hasattr(data, '__iter__') and not hasattr(data, '__getitem__'):
-        return True
-    
-    # Method 4: Has __len__ that raises TypeError (streaming pattern)
+    # Check if len() works
     if hasattr(data, '__len__'):
         try:
-            len(data)
+            len(data)  # If this works, it's materialized
+            return False
         except (TypeError, NotImplementedError):
-            return True
+            pass  # No working len, continue to check
     
-    # Method 5: No __len__ but has __iter__ (IterableColumn pattern)
-    if hasattr(data, '__iter__') and not hasattr(data, '__len__'):
-        return True
-    
-    return False
+    # Has iter but no working len → streaming
+    return True
 
 
 def _chunk_text_streaming(
