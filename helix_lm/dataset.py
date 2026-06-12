@@ -922,27 +922,31 @@ def _handle_streaming_iterable(
     seed: int = 42,
     text_column: str = "text",
     shard_cache_dir: Optional[str] = None,
-    preprocess_num_proc: Optional[int] = None,
+    preprocess_num_proc: int = 5,
     preprocess_batch_size: int = 1000,
     max_shard_size: str = "500MB",
     cleanup_shards: bool = True,
-) -> Tuple[DataLoader, Optional[str]]:
+) -> Union[Tuple[DataLoader, None], Tuple[DataLoader, str]]:
     """
     Handle streaming IterableColumn by preprocessing to sharded Dataset.
     
     Strategy: Stream -> Shards -> Fast Loader
-    1. Stream data in batches to shards on disk
-    2. Pre-tokenize each shard
+    1. Stream data in batches to shards on disk (multi-thread preprocessing)
+    2. Pre-tokenize each shard using thread pool
     3. Return DataLoader from concatenated shards
+    4. Auto-cleanup shards if cleanup_shards=True
     
     Returns:
-        Tuple of (DataLoader, shard_cache_dir)
-        shard_cache_dir should be cleaned up after training.
+        (DataLoader, None) if cleanup_shards=True (auto-deleted temp dir)
+        (DataLoader, shard_cache_dir) if cleanup_shards=False (caller must clean up)
     """
     import tempfile
     import os
     import pickle
+    import shutil
+    import threading
     from datetime import datetime
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     
     if min_tail_len is None:
         min_tail_len = 1
@@ -959,9 +963,12 @@ def _handle_streaming_iterable(
             return example.get(text_column, "")
         return str(example)
     
-    # Stream and shard
-    all_chunks = []
-    shard_idx = 0
+    # Thread-safe batch processor function (closure captures tokenizer)
+    def process_batch(batch):
+        return _process_and_shard_batch(batch, tokenizer, seq_len, stride, min_tail_len, add_eos)
+    
+    # Stream and process batches
+    batches = []
     batch = []
     
     for example in iterable:
@@ -970,27 +977,53 @@ def _handle_streaming_iterable(
             batch.append(text)
         
         if len(batch) >= preprocess_batch_size:
-            # Process batch
-            chunks = _process_and_shard_batch(
-                batch, tokenizer, seq_len, stride, min_tail_len, add_eos
-            )
-            all_chunks.extend(chunks)
+            batches.append(batch)
             batch = []
-            
-            # Save shard if it gets large
-            if len(all_chunks) >= 10000:  # ~10k sequences per shard
-                shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
-                with open(shard_path, 'wb') as f:
-                    pickle.dump(all_chunks, f)
-                all_chunks = []
-                shard_idx += 1
     
-    # Process remaining batch
+    # Handle remaining batch
     if batch:
-        chunks = _process_and_shard_batch(
-            batch, tokenizer, seq_len, stride, min_tail_len, add_eos
-        )
+        batches.append(batch)
+    
+    # Parallel preprocessing using ThreadPoolExecutor
+    processed_batches = []
+    if preprocess_num_proc > 1 and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=preprocess_num_proc) as executor:
+            # Submit all batch processes
+            future_to_batch = {
+                executor.submit(process_batch, b): i 
+                for i, b in enumerate(batches)
+            }
+            # Collect results in order
+            results_by_idx = {}
+            for future in as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    results_by_idx[batch_idx] = future.result()
+                except Exception as e:
+                    raise RuntimeError(f"Failed to process batch {batch_idx}: {e}")
+            
+            # Reassemble in order
+            for i in range(len(batches)):
+                processed_batches.append(results_by_idx[i])
+    else:
+        # Single-thread mode
+        for b in batches:
+            processed_batches.append(process_batch(b))
+    
+    # Write shards to disk
+    all_chunks = []
+    shard_idx = 0
+    
+    for chunks in processed_batches:
         all_chunks.extend(chunks)
+        
+        # Save shard if it gets large
+        if len(all_chunks) >= 10000:  # ~10k sequences per shard
+            shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
+            with open(shard_path, 'wb') as f:
+                pickle.dump(all_chunks, f)
+            all_chunks = []
+            shard_idx += 1
     
     # Save final shard
     if all_chunks:
@@ -1045,6 +1078,9 @@ def _handle_streaming_iterable(
             drop_last=drop_last,
         )
     
+    # Cleanup_shards handled by caller after training completes.
+    # If cleanup_shards=True, caller should use the returned cache_dir
+    # and clean up after training. We return the path either way.
     return loader, shard_cache_dir
 
 
@@ -1064,7 +1100,7 @@ def create_unified_data_loader(
     text_column: str = "text",
     # Sharding options (for IterableColumn path)
     shard_cache_dir: Optional[str] = None,
-    preprocess_num_proc: Optional[int] = None,
+    preprocess_num_proc: int = 5,
     preprocess_batch_size: int = 1000,
     max_shard_size: str = "500MB",
     cleanup_shards: bool = True,
@@ -1073,10 +1109,11 @@ def create_unified_data_loader(
     Create DataLoader that automatically detects data type:
     - List[str] -> DocumentAwareDataset
     - Column[str] (with __getitem__) -> DocumentAwareDataset  
-    - IterableColumn[str] (streaming) -> Sharded preprocessing -> HelixPrechunkedDataset
+    - IterableColumn[str] (streaming) -> Sharded preprocessing -> HelixShardedDataset
     
     For streaming data, returns (DataLoader, shard_cache_dir) tuple.
-    The caller should clean up shard_cache_dir after training.
+    The caller MUST clean up shard_cache_dir after training completes.
+    Use cleanup_shards parameter as a hint for post-training cleanup.
     
     Args:
         data: Input data - List[str], Column[str], or IterableColumn[str]
@@ -1093,10 +1130,10 @@ def create_unified_data_loader(
         seed: Random seed for shuffling
         text_column: Column name for text extraction from dicts
         shard_cache_dir: Directory for temporary shard storage (streaming only)
-        preprocess_num_proc: Number of processes for preprocessing (streaming only)
+        preprocess_num_proc: Number of threads for parallel preprocessing (default: 5, streaming only)
         preprocess_batch_size: Batch size for streaming preprocessing
-        max_shard_size: Maximum shard size (for compatibility)
-        cleanup_shards: Whether to auto-cleanup shards (for compatibility)
+        max_shard_size: Maximum shard size (for compatibility, currently ignored)
+        cleanup_shards: Hint to caller that shards should be cleaned up after training
     
     Returns:
         DataLoader for List[str]/Column[str] inputs
