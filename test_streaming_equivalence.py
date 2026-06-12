@@ -49,10 +49,9 @@ def load_data_as_list():
 def load_data_as_iterable_column():
     """Load data as IterableColumn (streaming)."""
     ds = load_dataset("david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427", streaming=True)
-    train_iterable = ds['pretrain_train'].take(NUM_TRAIN)
-    val_iterable = ds['pretrain_val'].take(NUM_VAL)
-    train_texts = (item['text'] for item in train_iterable)
-    val_texts = (item['text'] for item in val_iterable)
+    # Return the actual IterableColumn, not a generator
+    train_texts = ds['pretrain_train'].take(NUM_TRAIN)['text']
+    val_texts = ds['pretrain_val'].take(NUM_VAL)['text']
     return train_texts, val_texts
 
 

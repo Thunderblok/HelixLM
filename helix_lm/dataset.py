@@ -576,9 +576,9 @@ def _is_iterable_column(data) -> bool:
     Detect IterableColumn vs List[str] vs Column[str].
     
     IterableColumn comes from streaming datasets (load_dataset(..., streaming=True))
-    and has __iter__ but no __getitem__.
+    and has __iter__ but no __len__.
     """
-    # Method 1: Check for HF IterableDataset type
+    # Method 1: Check for HF IterableDataset or IterableDatasetDict type
     try:
         from datasets import IterableDataset
         if isinstance(data, IterableDataset):
@@ -586,16 +586,28 @@ def _is_iterable_column(data) -> bool:
     except ImportError:
         pass
     
-    # Method 2: Duck typing - has __iter__ but no __getitem__
+    # Method 2: Check for IterableColumn specifically
+    try:
+        from datasets.iterable_dataset import IterableColumn
+        if isinstance(data, IterableColumn):
+            return True
+    except ImportError:
+        pass
+    
+    # Method 3: Duck typing - has __iter__ but no __getitem__
     if hasattr(data, '__iter__') and not hasattr(data, '__getitem__'):
         return True
     
-    # Method 3: Has __len__ that raises TypeError (streaming pattern)
+    # Method 4: Has __len__ that raises TypeError (streaming pattern)
     if hasattr(data, '__len__'):
         try:
             len(data)
         except (TypeError, NotImplementedError):
             return True
+    
+    # Method 5: No __len__ but has __iter__ (IterableColumn pattern)
+    if hasattr(data, '__iter__') and not hasattr(data, '__len__'):
+        return True
     
     return False
 
