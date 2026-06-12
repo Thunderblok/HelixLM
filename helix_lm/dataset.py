@@ -924,9 +924,8 @@ def _handle_streaming_iterable(
     shard_cache_dir: Optional[str] = None,
     preprocess_num_proc: int = 5,
     preprocess_batch_size: int = 1000,
-    max_shard_size: str = "500MB",
     cleanup_shards: bool = True,
-) -> Union[Tuple[DataLoader, None], Tuple[DataLoader, str]]:
+) -> Tuple[DataLoader, str]:
     """
     Handle streaming IterableColumn by preprocessing to sharded Dataset.
     
@@ -934,17 +933,14 @@ def _handle_streaming_iterable(
     1. Stream data in batches to shards on disk (multi-thread preprocessing)
     2. Pre-tokenize each shard using thread pool
     3. Return DataLoader from concatenated shards
-    4. Auto-cleanup shards if cleanup_shards=True
     
     Returns:
-        (DataLoader, None) if cleanup_shards=True (auto-deleted temp dir)
-        (DataLoader, shard_cache_dir) if cleanup_shards=False (caller must clean up)
+        Tuple of (DataLoader, shard_cache_dir). Caller is responsible for cleaning up
+        shard_cache_dir after training completes.
     """
     import tempfile
     import os
     import pickle
-    import shutil
-    import threading
     from datetime import datetime
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
@@ -1078,9 +1074,6 @@ def _handle_streaming_iterable(
             drop_last=drop_last,
         )
     
-    # Cleanup_shards handled by caller after training completes.
-    # If cleanup_shards=True, caller should use the returned cache_dir
-    # and clean up after training. We return the path either way.
     return loader, shard_cache_dir
 
 
@@ -1102,9 +1095,8 @@ def create_unified_data_loader(
     shard_cache_dir: Optional[str] = None,
     preprocess_num_proc: int = 5,
     preprocess_batch_size: int = 1000,
-    max_shard_size: str = "500MB",
     cleanup_shards: bool = True,
-) -> Union[DataLoader, Tuple[DataLoader, Optional[str]]]:
+) -> Tuple[DataLoader, str]:
     """
     Create DataLoader that automatically detects data type:
     - List[str] -> DocumentAwareDataset
@@ -1113,7 +1105,6 @@ def create_unified_data_loader(
     
     For streaming data, returns (DataLoader, shard_cache_dir) tuple.
     The caller MUST clean up shard_cache_dir after training completes.
-    Use cleanup_shards parameter as a hint for post-training cleanup.
     
     Args:
         data: Input data - List[str], Column[str], or IterableColumn[str]
@@ -1132,8 +1123,7 @@ def create_unified_data_loader(
         shard_cache_dir: Directory for temporary shard storage (streaming only)
         preprocess_num_proc: Number of threads for parallel preprocessing (default: 5, streaming only)
         preprocess_batch_size: Batch size for streaming preprocessing
-        max_shard_size: Maximum shard size (for compatibility, currently ignored)
-        cleanup_shards: Hint to caller that shards should be cleaned up after training
+        cleanup_shards: If True, caller should cleanup shards after training
     
     Returns:
         DataLoader for List[str]/Column[str] inputs
@@ -1150,7 +1140,6 @@ def create_unified_data_loader(
             shard_cache_dir=shard_cache_dir,
             preprocess_num_proc=preprocess_num_proc,
             preprocess_batch_size=preprocess_batch_size,
-            max_shard_size=max_shard_size,
             cleanup_shards=cleanup_shards,
         )
     
