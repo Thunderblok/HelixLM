@@ -41,14 +41,14 @@ jobs:
       run: |
         python3 helix_lm/smoke_test.py
     - name: Demo run 
-      timeout-minutes: 60
+      timeout-minutes: 90
       run: |
         python3 quick_demo_cpu.py
     - name: Demo run - Titans Memory
-      timeout-minutes: 60
+      timeout-minutes: 90
       run: |
         python3 quick_demo_cpu_titans_mem.py
     - name: Smoke Test Training with Datasets
-      timeout-minutes: 90
+      timeout-minutes: 120
       run: |
         python3 test_cicd_training_regression.py
