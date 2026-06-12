@@ -83,6 +83,7 @@ class Trainer:
         use_amp: bool = False,
         amp_dtype: Optional[str] = None,
         min_tail_len: Optional[int] = None,
+        stride: Optional[int] = None,
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
@@ -110,6 +111,9 @@ class Trainer:
             use_amp: Whether to use torch.amp automatic mixed precision.
             amp_dtype: AMP autocast dtype: "float16" or "bfloat16" (default: "float16").
             min_tail_len: Minimum tail length for DocumentAwareDataset.
+            stride: Chunking stride for document sliding window. If None:
+                    - Defaults to seq_len if seq_len <= 512 (no overlap)
+                    - Defaults to 512 if seq_len > 512 (~50% overlap for longer contexts)
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
             verbose: Whether to show tqdm progress bars and print logs.
@@ -118,6 +122,14 @@ class Trainer:
             preprocess_batch_size: Batch size for streaming preprocessing.
             cleanup_shards: Whether to auto-cleanup shards after training.
         """
+        # Apply intelligent stride default based on seq_len
+        if stride is None:
+            if cfg.seq_len > 512:
+                stride = 512  # Standard: 50% overlap for longer contexts
+            else:
+                stride = cfg.seq_len  # No overlap for shorter contexts
+        self._stride = stride
+
         self.model = model
         self.cfg = cfg
         self.tokenizer = tokenizer
@@ -166,6 +178,7 @@ class Trainer:
                     tokenizer,
                     cfg.seq_len,
                     cfg.batch_size,
+                    stride=stride,
                     shuffle=True,
                     drop_last=True,
                     min_tail_len=min_tail_len,
@@ -190,6 +203,7 @@ class Trainer:
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,
+                    stride=stride,
                 )
                 self._train_shard_dir = None
 
@@ -205,6 +219,7 @@ class Trainer:
                     tokenizer,
                     cfg.seq_len,
                     cfg.batch_size,
+                    stride=stride,
                     shuffle=False,
                     drop_last=False,
                     min_tail_len=min_tail_len,
@@ -230,6 +245,7 @@ class Trainer:
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,
+                    stride=stride,
                 )
                 self._val_shard_dir = None
 
