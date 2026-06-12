@@ -51,4 +51,4 @@ jobs:
     - name: Smoke Test Training with Datasets
       timeout-minutes: 90
       run: |
-        python3 train-with-dataset-cicd-test.py
+        python3 test_cicd_training_regression.py
