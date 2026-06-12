@@ -727,8 +727,12 @@ class HelixShardedDataset(Dataset):
     - Loading only one shard at a time into memory
     - Maintaining a global index across all shards
     - Random access via shard + local_index calculation
+    - Deterministic shuffle via index permutation (indices stay in memory, data on disk)
     
     Each shard file contains pickled List[Tuple[...]] saved by _handle_streaming_iterable.
+    
+    The shuffle implementation uses a Torch Generator (like List[str] path) for deterministic
+    reproducibility and identical behavior to non-streaming datasets.
     """
     def __init__(
         self,
@@ -740,57 +744,43 @@ class HelixShardedDataset(Dataset):
         super().__init__()
         self.shard_paths = shard_paths
         self.seq_len = seq_len
-        self.shuffle = shuffle
-        self.seed = seed
         
         # Build shard index: cumulative offsets for O(1) __getitem__
         self.shard_sizes = []
         self.shard_offsets = [0]
+        self._index_map = []  # (shard_idx, local_idx) for each global index
         total = 0
         
-        # Get sizes without loading full data
+        # Get sizes and build index map without loading full data into memory
         import pickle
         for path in shard_paths:
             with open(path, 'rb') as f:
                 chunks = pickle.load(f)
                 size = len(chunks)
                 self.shard_sizes.append(size)
+                # Record (shard_idx, local_idx) for each position
+                for local_idx in range(size):
+                    self._index_map.append((len(self.shard_sizes) - 1, local_idx))
                 total += size
                 self.shard_offsets.append(total)
         
         self.total_size = total
         
-        # If shuffling, build a permutation index
-        self._permutation = None
+        # Apply deterministic shuffle to index_map (only 2*int per sample, not full data)
         if shuffle:
-            self._build_permutation()
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            # Generate permutation indices
+            perm = torch.randperm(total, generator=generator).tolist()
+            # Reorder index_map according to permutation
+            self._index_map = [self._index_map[i] for i in perm]
         
         # Cache for current shard to avoid repeated disk reads
         self._cache_shard_idx: Optional[int] = None
         self._cache_shard_data: Optional[List] = None
     
-    def _build_permutation(self):
-        """Build deterministic permutation for shuffling."""
-        indices = list(range(self.total_size))
-        random.Random(self.seed).shuffle(indices)
-        self._permutation = indices
-    
     def __len__(self) -> int:
         return self.total_size
-    
-    def _global_to_local(self, idx: int) -> Tuple[int, int]:
-        """Convert global index to (shard_idx, local_idx)."""
-        # Binary search for shard
-        lo, hi = 0, len(self.shard_offsets) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if idx < self.shard_offsets[mid + 1]:
-                hi = mid
-            else:
-                lo = mid + 1
-        shard_idx = lo
-        local_idx = idx - self.shard_offsets[shard_idx]
-        return shard_idx, local_idx
     
     def _load_shard(self, shard_idx: int) -> List:
         """Load shard data with caching."""
@@ -804,7 +794,7 @@ class HelixShardedDataset(Dataset):
         return self._cache_shard_data
     
     def _item_from_chunk(self, chunk_data: Tuple) -> Dict[str, torch.Tensor]:
-        """Convert chunk tuple to sample dict."""
+        """Convert chunk tuple to sample dict (identical to HelixPrechunkedDataset and List[str] path)."""
         chunk, is_natural, pad_len, overlap_mask = chunk_data
         
         x = torch.tensor(chunk, dtype=torch.long)
@@ -835,11 +825,8 @@ class HelixShardedDataset(Dataset):
         if idx < 0 or idx >= self.total_size:
             raise IndexError(f"Index {idx} out of range [0, {self.total_size})")
         
-        # If shuffling, map to permuted index
-        if self._permutation is not None:
-            idx = self._permutation[idx]
-        
-        shard_idx, local_idx = self._global_to_local(idx)
+        # Lookup (shard_idx, local_idx) from shuffled index map
+        shard_idx, local_idx = self._index_map[idx]
         shard_data = self._load_shard(shard_idx)
         chunk_data = shard_data[local_idx]
         
@@ -1020,6 +1007,7 @@ def _handle_streaming_iterable(
             shard_paths.append(shard_path)
     
     # Create sharded dataset that reads from disk on-demand
+    # shuffle/seed control the deterministic index permutation for reproducibility
     dataset = HelixShardedDataset(shard_paths, seq_len, shuffle=shuffle, seed=seed)
     
     def collate_fn(batch):
