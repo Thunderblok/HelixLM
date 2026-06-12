@@ -719,6 +719,133 @@ class HelixPrechunkedDataset(Dataset):
         }
 
 
+class HelixShardedDataset(Dataset):
+    """
+    Dataset that reads pre-chunked token sequences from multiple shard files on disk.
+    
+    This allows handling datasets larger than memory by:
+    - Loading only one shard at a time into memory
+    - Maintaining a global index across all shards
+    - Random access via shard + local_index calculation
+    
+    Each shard file contains pickled List[Tuple[...]] saved by _handle_streaming_iterable.
+    """
+    def __init__(
+        self,
+        shard_paths: List[str],
+        seq_len: int,
+        shuffle: bool = False,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.shard_paths = shard_paths
+        self.seq_len = seq_len
+        self.shuffle = shuffle
+        self.seed = seed
+        
+        # Build shard index: cumulative offsets for O(1) __getitem__
+        self.shard_sizes = []
+        self.shard_offsets = [0]
+        total = 0
+        
+        # Get sizes without loading full data
+        import pickle
+        for path in shard_paths:
+            with open(path, 'rb') as f:
+                chunks = pickle.load(f)
+                size = len(chunks)
+                self.shard_sizes.append(size)
+                total += size
+                self.shard_offsets.append(total)
+        
+        self.total_size = total
+        
+        # If shuffling, build a permutation index
+        self._permutation = None
+        if shuffle:
+            self._build_permutation()
+        
+        # Cache for current shard to avoid repeated disk reads
+        self._cache_shard_idx: Optional[int] = None
+        self._cache_shard_data: Optional[List] = None
+    
+    def _build_permutation(self):
+        """Build deterministic permutation for shuffling."""
+        indices = list(range(self.total_size))
+        random.Random(self.seed).shuffle(indices)
+        self._permutation = indices
+    
+    def __len__(self) -> int:
+        return self.total_size
+    
+    def _global_to_local(self, idx: int) -> Tuple[int, int]:
+        """Convert global index to (shard_idx, local_idx)."""
+        # Binary search for shard
+        lo, hi = 0, len(self.shard_offsets) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if idx < self.shard_offsets[mid + 1]:
+                hi = mid
+            else:
+                lo = mid + 1
+        shard_idx = lo
+        local_idx = idx - self.shard_offsets[shard_idx]
+        return shard_idx, local_idx
+    
+    def _load_shard(self, shard_idx: int) -> List:
+        """Load shard data with caching."""
+        if self._cache_shard_idx == shard_idx:
+            return self._cache_shard_data
+        
+        import pickle
+        with open(self.shard_paths[shard_idx], 'rb') as f:
+            self._cache_shard_data = pickle.load(f)
+            self._cache_shard_idx = shard_idx
+        return self._cache_shard_data
+    
+    def _item_from_chunk(self, chunk_data: Tuple) -> Dict[str, torch.Tensor]:
+        """Convert chunk tuple to sample dict."""
+        chunk, is_natural, pad_len, overlap_mask = chunk_data
+        
+        x = torch.tensor(chunk, dtype=torch.long)
+        labels = x.clone()
+        
+        # Mask overlapping head (stride < seq_len)
+        if overlap_mask > 0:
+            labels[:overlap_mask] = -100
+        
+        # Mask trailing padding
+        if pad_len > 0:
+            labels[-pad_len:] = -100
+        
+        # Derive attention_mask from labels (any -100 position)
+        attention_mask = (labels != -100).long()
+        
+        return {
+            "input_ids": x,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "is_natural_stop": torch.tensor(is_natural, dtype=torch.bool),
+        }
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # Handle negative indices
+        if idx < 0:
+            idx = self.total_size + idx
+        if idx < 0 or idx >= self.total_size:
+            raise IndexError(f"Index {idx} out of range [0, {self.total_size})")
+        
+        # If shuffling, map to permuted index
+        if self._permutation is not None:
+            idx = self._permutation[idx]
+        
+        shard_idx, local_idx = self._global_to_local(idx)
+        shard_data = self._load_shard(shard_idx)
+        chunk_data = shard_data[local_idx]
+        
+        return self._item_from_chunk(chunk_data)
+
+
 def _process_and_shard_batch(
     texts: List[str],
     tokenizer,
@@ -883,17 +1010,17 @@ def _handle_streaming_iterable(
         shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
         with open(shard_path, 'wb') as f:
             pickle.dump(all_chunks, f)
+        shard_idx += 1
     
-    # Load all shards and concatenate
-    loaded_chunks = []
-    for i in range(shard_idx + 1):
+    # Build list of shard paths (do NOT load them into memory)
+    shard_paths = []
+    for i in range(shard_idx):
         shard_path = os.path.join(shard_cache_dir, f"shard_{i:04d}.pkl")
         if os.path.exists(shard_path):
-            with open(shard_path, 'rb') as f:
-                loaded_chunks.extend(pickle.load(f))
+            shard_paths.append(shard_path)
     
-    # Create dataset and dataloader
-    dataset = HelixPrechunkedDataset(loaded_chunks, seq_len)
+    # Create sharded dataset that reads from disk on-demand
+    dataset = HelixShardedDataset(shard_paths, seq_len, shuffle=shuffle, seed=seed)
     
     def collate_fn(batch):
         input_ids = torch.stack([b["input_ids"] for b in batch])
