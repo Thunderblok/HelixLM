@@ -89,7 +89,7 @@ class Trainer:
         verbose: bool = True,
         # Sharding options for IterableColumn stream
         shard_cache_dir: Optional[str] = None,
-        preprocess_num_proc: Optional[int] = None,
+        preprocess_num_proc: int = 5,
         preprocess_batch_size: int = 1000,
         cleanup_shards: bool = True,
     ):
