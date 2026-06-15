@@ -294,6 +294,9 @@ class HelixConfig(PretrainedConfig):
         self.hidden_size = d_model
         # num_attention_heads is checked by some HF utilities
         self.num_attention_heads = n_heads
+        # max_position_embeddings is required by HF for positional embeddings and validation
+        # It should match seq_len to suppress warnings about token sequences
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", seq_len)
 
         # Pass dtype explicitly so PretrainedConfig.__init__ doesn't
         # override it with its default None.
