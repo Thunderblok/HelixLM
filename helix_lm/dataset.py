@@ -965,37 +965,47 @@ def _handle_streaming_iterable(
     def process_batch(batch):
         return _process_and_shard_batch(batch, tokenizer, seq_len, stride, min_tail_len, add_eos)
     
-    # MEMORY-EFFICIENT: Stream and process batches incrementally
-    # Use a bounded queue approach with ThreadPoolExecutor
+    # MEMORY-EFFICIENT: Stream and process batches incrementally with DETERMINISTIC ORDER
+    # Use a bounded queue approach with ThreadPoolExecutor, but buffer results
+    # to ensure shards are written in strict submission order
     all_chunks = []
     shard_idx = 0
     batch = []
-    batches_submitted = 0
     max_pending_batches = preprocess_num_proc * 2  # Limit pending work
+    
+    # For deterministic ordering: buffer completed results and write in sequence order
+    completed_results = {}  # batch_idx -> chunks
+    next_batch_to_write = 0  # Next batch index that should be written
     
     # Process batches incrementally using a sliding window of futures
     with ThreadPoolExecutor(max_workers=preprocess_num_proc) as executor:
         pending_futures = {}
         
         def drain_completed_futures():
-            """Process completed futures and write shards if needed."""
-            nonlocal all_chunks, shard_idx
+            """Process completed futures and buffer them for ordered writing."""
+            nonlocal all_chunks, shard_idx, next_batch_to_write
             completed = [f for f in pending_futures if f.done()]
             for f in completed:
                 batch_idx = pending_futures.pop(f)
                 try:
                     chunks = f.result()
-                    all_chunks.extend(chunks)
-                    
-                    # Save shard if it gets large
-                    if len(all_chunks) >= 10000:  # ~10k sequences per shard
-                        shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
-                        with open(shard_path, 'wb') as f_save:
-                            pickle.dump(all_chunks, f_save)
-                        all_chunks = []
-                        shard_idx += 1
+                    completed_results[batch_idx] = chunks
                 except Exception as e:
                     raise RuntimeError(f"Failed to process batch {batch_idx}: {e}")
+            
+            # Write completed batches in strict order
+            while next_batch_to_write in completed_results:
+                chunks = completed_results.pop(next_batch_to_write)
+                all_chunks.extend(chunks)
+                next_batch_to_write += 1
+                
+                # Save shard if it gets large
+                if len(all_chunks) >= 10000:  # ~10k sequences per shard
+                    shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
+                    with open(shard_path, 'wb') as f_save:
+                        pickle.dump(all_chunks, f_save)
+                    all_chunks = []
+                    shard_idx += 1
         
         # Stream examples and submit batches for processing
         batch_idx = 0
@@ -1024,10 +1034,24 @@ def _handle_streaming_iterable(
                 drain_completed_futures()
             future = executor.submit(process_batch, batch)
             pending_futures[future] = batch_idx
+            batch_idx += 1
         
         # Drain remaining futures
         while pending_futures:
             drain_completed_futures()
+        
+        # Final flush: ensure all ordered results are written
+        while next_batch_to_write in completed_results:
+            chunks = completed_results.pop(next_batch_to_write)
+            all_chunks.extend(chunks)
+            next_batch_to_write += 1
+            
+            if len(all_chunks) >= 10000:
+                shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
+                with open(shard_path, 'wb') as f_save:
+                    pickle.dump(all_chunks, f_save)
+                all_chunks = []
+                shard_idx += 1
     
     # Save final shard
     if all_chunks:
