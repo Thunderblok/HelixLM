@@ -94,10 +94,12 @@ class LinearAttnNode(HeteroNode):
             v_fp32 = v_fp32 * mask
 
         kv = torch.einsum('bhTf,bhTd->bhTfd', k_fp32, v_fp32)
-        # Move T to the front and collapse the rest so cumsum runs as ONE large scan
-        kv = kv.permute(2, 0, 1, 3, 4).contiguous()          # [T, B, H, D, D]
-        kv_cum = torch.cumsum(kv, dim=0)                      # one scan, length T
-        kv_cum = kv_cum.permute(1, 2, 0, 3, 4)               # [B, H, T, D, D]
+
+        # Move T to the LAST dimension so cumsum scans contiguous memory (stride = 1)
+        kv = kv.permute(0, 1, 3, 4, 2).contiguous()   # [B, H, F, D, T]
+        kv_cum = torch.cumsum(kv, dim=-1)              # one contiguous scan per row
+        kv_cum = kv_cum.permute(0, 1, 4, 2, 3)        # [B, H, T, F, D]
+
         z = torch.cumsum(k_fp32, dim=2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
         out = torch.einsum('bhTf,bhTfd->bhTd', q_fp32, kv_cum) / z
