@@ -934,6 +934,8 @@ def _handle_streaming_iterable(
     2. Pre-tokenize each shard using thread pool
     3. Return DataLoader from concatenated shards
     
+    MEMORY-EFFICIENT: Processes batches incrementally, never materializes full dataset.
+    
     Returns:
         Tuple of (DataLoader, shard_cache_dir). Caller is responsible for cleaning up
         shard_cache_dir after training completes.
@@ -963,63 +965,69 @@ def _handle_streaming_iterable(
     def process_batch(batch):
         return _process_and_shard_batch(batch, tokenizer, seq_len, stride, min_tail_len, add_eos)
     
-    # Stream and process batches
-    batches = []
-    batch = []
-    
-    for example in iterable:
-        text = extract_text(example)
-        if text:
-            batch.append(text)
-        
-        if len(batch) >= preprocess_batch_size:
-            batches.append(batch)
-            batch = []
-    
-    # Handle remaining batch
-    if batch:
-        batches.append(batch)
-    
-    # Parallel preprocessing using ThreadPoolExecutor
-    processed_batches = []
-    if preprocess_num_proc > 1 and len(batches) > 1:
-        with ThreadPoolExecutor(max_workers=preprocess_num_proc) as executor:
-            # Submit all batch processes
-            future_to_batch = {
-                executor.submit(process_batch, b): i 
-                for i, b in enumerate(batches)
-            }
-            # Collect results in order
-            results_by_idx = {}
-            for future in as_completed(future_to_batch):
-                batch_idx = future_to_batch[future]
-                try:
-                    results_by_idx[batch_idx] = future.result()
-                except Exception as e:
-                    raise RuntimeError(f"Failed to process batch {batch_idx}: {e}")
-            
-            # Reassemble in order
-            for i in range(len(batches)):
-                processed_batches.append(results_by_idx[i])
-    else:
-        # Single-thread mode
-        for b in batches:
-            processed_batches.append(process_batch(b))
-    
-    # Write shards to disk
+    # MEMORY-EFFICIENT: Stream and process batches incrementally
+    # Use a bounded queue approach with ThreadPoolExecutor
     all_chunks = []
     shard_idx = 0
+    batch = []
+    batches_submitted = 0
+    max_pending_batches = preprocess_num_proc * 2  # Limit pending work
     
-    for chunks in processed_batches:
-        all_chunks.extend(chunks)
+    # Process batches incrementally using a sliding window of futures
+    with ThreadPoolExecutor(max_workers=preprocess_num_proc) as executor:
+        pending_futures = {}
         
-        # Save shard if it gets large
-        if len(all_chunks) >= 10000:  # ~10k sequences per shard
-            shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
-            with open(shard_path, 'wb') as f:
-                pickle.dump(all_chunks, f)
-            all_chunks = []
-            shard_idx += 1
+        def drain_completed_futures():
+            """Process completed futures and write shards if needed."""
+            nonlocal all_chunks, shard_idx, pending_futures
+            completed = [f for f in pending_futures if f.done()]
+            for f in completed:
+                batch_idx = pending_futures.pop(f)
+                try:
+                    chunks = f.result()
+                    all_chunks.extend(chunks)
+                    
+                    # Save shard if it gets large
+                    if len(all_chunks) >= 10000:  # ~10k sequences per shard
+                        shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
+                        with open(shard_path, 'wb') as f_save:
+                            pickle.dump(all_chunks, f_save)
+                        all_chunks = []
+                        shard_idx += 1
+                except Exception as e:
+                    raise RuntimeError(f"Failed to process batch {batch_idx}: {e}")
+        
+        # Stream examples and submit batches for processing
+        batch_idx = 0
+        for example in iterable:
+            text = extract_text(example)
+            if text:
+                batch.append(text)
+            
+            if len(batch) >= preprocess_batch_size:
+                # Wait if we have too many pending batches
+                while len(pending_futures) >= max_pending_batches:
+                    drain_completed_futures()
+                    if len(pending_futures) >= max_pending_batches:
+                        import time
+                        time.sleep(0.001)  # Brief yield
+                
+                # Submit batch for processing
+                future = executor.submit(process_batch, batch)
+                pending_futures[future] = batch_idx
+                batch_idx += 1
+                batch = []
+        
+        # Handle remaining batch
+        if batch:
+            while len(pending_futures) >= max_pending_batches:
+                drain_completed_futures()
+            future = executor.submit(process_batch, batch)
+            pending_futures[future] = batch_idx
+        
+        # Drain remaining futures
+        while pending_futures:
+            drain_completed_futures()
     
     # Save final shard
     if all_chunks:
