@@ -1036,8 +1036,9 @@ def _handle_streaming_iterable(
             shard_paths.append(shard_path)
     
     # Create sharded dataset that reads from disk on-demand
-    # shuffle/seed control the deterministic index permutation for reproducibility
-    dataset = HelixShardedDataset(shard_paths, seq_len, shuffle=shuffle, seed=seed)
+    # Note: We do NOT shuffle the dataset itself - shuffle is handled by DataLoader
+    # to match the List[str] path behavior exactly
+    dataset = HelixShardedDataset(shard_paths, seq_len, shuffle=False, seed=seed)
     
     def collate_fn(batch):
         input_ids = torch.stack([b["input_ids"] for b in batch])
