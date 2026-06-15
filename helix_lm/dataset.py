@@ -979,7 +979,7 @@ def _handle_streaming_iterable(
         
         def drain_completed_futures():
             """Process completed futures and write shards if needed."""
-            nonlocal all_chunks, shard_idx, pending_futures
+            nonlocal all_chunks, shard_idx
             completed = [f for f in pending_futures if f.done()]
             for f in completed:
                 batch_idx = pending_futures.pop(f)
