@@ -33,6 +33,8 @@ DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
 SEED = 42
 HF_USERNAME = "david-thrower"
 
+ATTENTION_MODE = "linear"
+
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
 N_COLUMNS = 2                               # Simple graph, faster training
@@ -270,6 +272,7 @@ def main():
         lateral_p=LATERAL_P,
         vertical_p=VERTICAL_P,
         vertical_depth=VERTICAL_DEPTH,
+        attention_mode=ATTENTION_MODE
     )
 
     # ── Training ────────────────────────────────────────────────────────
