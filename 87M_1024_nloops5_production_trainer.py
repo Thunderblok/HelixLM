@@ -52,7 +52,7 @@ NODES_PER_COLUMN = (3, 3)                   # Balanced 2-column graph
 N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
 FFN_EXPANSION = 2.7                         # Per PanGu-π
 SEQ_LEN = 1024                              # Target context length
-N_LOOPS = 5                                 # FEASIBILITY: Increased from 4
+N_LOOPS = 4                                 # FEASIBILITY: Increased from 4
 DROPOUT = 0.1                               # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
 
