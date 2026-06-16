@@ -1,20 +1,8 @@
 """
-HelixLM 87M/3B Token Production trainer — d1024, n_columns=2, ffn=2.7, seq_len=1024, n_loops=5
-Constant LR per stage, dense topology. Streaming dataset for 3B tokens.
 
-Config (n_loops=5 FEASIBILITY variant):
-  d_model=1024, n_columns=2, n_heads=16, ffn_expansion=2.7, seq_len=1024, n_loops=5
-  dropout=0.1, weight_decay=0.05, grad_buffer_ratio=0.0
-  batch_size=32, grad_accum=2 (effective 64)
-  lateral_p=0.8, vertical_p=0.9, vertical_depth=2
-  use_cca=False, use_ssm=False, use_titans_memory=False
+HelixLM 87M — 3B token pretraining, production run.
+Single training job with 3 epochs, each at a distinct learning rate.
 
-FEASIBILITY NOTES for n_loops=4:
-  + Increases recurrent depth by 25% (5 vs 4 loops)
-  + May improve long-range dependencies at 1024 context
-  + More computation per forward pass (slower training)
-  ~ Watch for: memory usage, convergence speed, training stability
-  ~ Compare PPL vs n_loops=4 baseline
 """
 import math
 import json
@@ -45,18 +33,19 @@ DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-# Architecture: Optimized configuration with n_loops=4 FEASIBILITY TEST
+# Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
 N_COLUMNS = 2                               # Simple graph, faster training
 NODES_PER_COLUMN = (3, 3)                   # Balanced 2-column graph
 N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
 FFN_EXPANSION = 2.7                         # Per PanGu-π
 SEQ_LEN = 1024                              # Target context length
-N_LOOPS = 4                                 # 5 is unstable at 1024 seq len, 4 appeared promising on a partial run.
+N_LOOPS = 4                                 # Production: 4 recurrent loops
 DROPOUT = 0.1                               # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
 
-# Topology — dense (validated at 50M)
+# Topology — dense 
+# (validated at 41M params, could potentially be optimized at this scale, but we are hitting a hardware ceiling)
 LATERAL_P = 0.8
 VERTICAL_P = 0.9
 VERTICAL_DEPTH = 2
@@ -105,10 +94,10 @@ if not HF_TOKEN:
 # SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-OUTPUT_DIR = Path("production_run_87M_1024_nloops5")
+OUTPUT_DIR = Path("production_run_87M_1024_nloops4")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = OUTPUT_DIR / f"production_train_87M_1024_nl5_{RUN_TS}.log"
-RESULTS_JSON = OUTPUT_DIR / f"production_results_87M_1024_nl5_{RUN_TS}.json"
+LOG_FILE = OUTPUT_DIR / f"production_train_87M_1024_nl4_{RUN_TS}.log"
+RESULTS_JSON = OUTPUT_DIR / f"production_results_87M_1024_nl4_{RUN_TS}.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,10 +108,10 @@ logger = logging.getLogger(__name__)
 
 # ── Dynamic repo naming ──────────────────────────────────────────────────
 REPO_BASE = (
-    f"HelixLM-87M-nl5-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-h{N_HEADS}-nl{N_LOOPS}"
+    f"HelixLM-87M-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-h{N_HEADS}-nl{N_LOOPS}"
     f"-ffn{int(FFN_EXPANSION)}-s{SEQ_LEN}-3BT"
 )
-REPO_BASE_ALT = f"HelixLM-87M-nl5-{RUN_TS}-prod"
+REPO_BASE_ALT = f"HelixLM-87M-{RUN_TS}-prod"
 
 
 def make_repo_name(epoch: int, use_alt: bool = False) -> str:
@@ -196,10 +185,9 @@ def main():
     # Calculate effective stride (Trainer will auto-apply: 512 for seq_len>512)
     effective_stride = 512 if SEQ_LEN > 512 else SEQ_LEN
     overlap_pct = (1 - effective_stride/SEQ_LEN) * 100
-    
+
     logger.info("=" * 70)
-    logger.info("HelixLM 87M Training (n_loops=N_LOOPS) — d%d, cols=%d, seq=%d", D_MODEL, N_COLUMNS, SEQ_LEN)
-    logger.info("⚠️  FEASIBILITY VARIANT: n_loops=5 (25%% more recurrent depth)")
+    logger.info("HelixLM 87M Training — d%d, cols=%d, seq=%d, n_loops=%d", D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
@@ -213,15 +201,9 @@ def main():
                 DROPOUT, WEIGHT_DECAY, GRAD_BUFFER_RATIO)
     logger.info("Batch:      %d x %d  grad_accum=%d (effective %d)",
                 BATCH_SIZE, SEQ_LEN, GRAD_ACCUM, BATCH_SIZE * GRAD_ACCUM)
-    logger.info("LR:         %.0e constant  |  KITA: %s",
-                LR_STAGES[0], "ON" if USE_KITA else "OFF")
+    logger.info("LR stages:  %s", LR_STAGES)
     logger.info("AMP:        %s", AMP_DTYPE)
     logger.info("Streaming:  %s (preprocess_batch=%d)", STREAMING, PREPROCESS_BATCH_SIZE)
-    
-    logger.info("\n📊 FEASIBILITY COMPARISON (n_loops=5 vs n_loops=4):")
-    logger.info("   Pros:   +25%% recurrent depth, better long-range deps")
-    logger.info("   Cons:   Slower training (more compute/forward pass)")
-    logger.info("   Watch:  Memory usage, convergence, stability")
 
     # ── Seed ────────────────────────────────────────────────────────────
     torch.manual_seed(SEED)
@@ -237,8 +219,6 @@ def main():
         logger.info("GPU:        %s (%.1f GB VRAM)", gpu_name, gpu_mem_gb)
         if gpu_mem_gb < 40:
             logger.warning("⚠️  GPU < 40 GB VRAM — d1024 with seq_len=1024 needs A100 (80GB).")
-        if gpu_mem_gb < 80:
-            logger.warning("⚠️  n_loops=5 increases memory usage; A100 (80GB) strongly recommended.")
 
     # ── Tokenizer ───────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -260,7 +240,7 @@ def main():
     # which uses _handle_streaming_iterable to shard/process on-the-fly
     train_iterable = hf_ds['train']['text']  # datasets.iterable_dataset.IterableColumn
     val_iterable = hf_ds['validation']['text']  # datasets.iterable_dataset.IterableColumn
-    
+
     logger.info("Train:      IterableColumn (streaming)")
     logger.info("Val:        IterableColumn (streaming)")
     logger.info("Note:       Dataset > memory; using sharded preprocessing")
@@ -296,15 +276,15 @@ def main():
     all_results = []
     prev_ckpt_dir = None
 
-    for stage_idx in range(1):          # 1 epoch = Chinchilla-optimal for 3B tokens
+    for stage_idx in range(len(LR_STAGES)):
         stage_num = stage_idx + 1
         lr = LR_STAGES[stage_idx]
         warmup = WARMUP_STAGES[stage_idx]
 
         logger.info("\n" + "=" * 70)
         kita_str = f"KITA {SPIKE_HEIGHT:.0f}x every {SPIKE_INTERVAL_PCT*100:.0f}%" if USE_KITA else "constant"
-        logger.info("STAGE %d/1 | LR=%.1e | Warmup=%d | %s",
-                    stage_num, lr, warmup, kita_str)
+        logger.info("EPOCH %d/%d | LR=%.1e | Warmup=%d | %s",
+                    stage_num, len(LR_STAGES), lr, warmup, kita_str)
         logger.info("=" * 70)
 
         # ── Build config ────────────────────────────────────────────
@@ -340,7 +320,7 @@ def main():
 
         # ── Create Trainer ───────────────────────────────────────────
         # Pass IterableColumn directly — Trainer will use streaming path
-        stage_output_dir = str(OUTPUT_DIR / f"stage{stage_num}")
+        stage_output_dir = str(OUTPUT_DIR / f"epoch{stage_num}")
         trainer = Trainer(
             model=model,
             cfg=cfg,
@@ -389,11 +369,11 @@ def main():
         train_ppl = math.exp(min(train_loss, 20)) if not math.isnan(train_loss) else float("nan")
         val_ppl = math.exp(min(val_loss, 20)) if not math.isnan(val_loss) else float("nan")
 
-        logger.info("Stage %d complete — Train PPL: %.2f | Val PPL: %.2f | Time: %.0fs (%.2f h)",
+        logger.info("Epoch %d complete — Train PPL: %.2f | Val PPL: %.2f | Time: %.0fs (%.2f h)",
                     stage_num, train_ppl, val_ppl, elapsed, elapsed / 3600)
 
         # ── Save ─────────────────────────────────────────────────────
-        canonical_ckpt = str(OUTPUT_DIR / f"ckpt_stage{stage_num}")
+        canonical_ckpt = str(OUTPUT_DIR / f"ckpt_epoch{stage_num}")
         model.save_pretrained(canonical_ckpt)
         tokenizer.save_pretrained(canonical_ckpt)
         prev_ckpt_dir = canonical_ckpt
@@ -403,7 +383,7 @@ def main():
 
         # ── Track ────────────────────────────────────────────────────
         stage_result = {
-            "stage": stage_num,
+            "epoch": stage_num,
             "lr": lr,
             "warmup_steps": warmup,
             "train_loss": train_loss,
@@ -428,26 +408,19 @@ def main():
     # SUMMARY
     # ═══════════════════════════════════════════════════════════════════
     total_time_h = sum(r["time_s"] for r in all_results) / 3600
-    best_stage = min(all_results, key=lambda r: r["val_ppl"])
+    best_epoch = min(all_results, key=lambda r: r["val_ppl"])
 
     logger.info("\n" + "=" * 70)
-    logger.info("🎉 TRAINING COMPLETE (n_loops=5 FEASIBILITY)")
+    logger.info("🎉 TRAINING COMPLETE")
     logger.info("=" * 70)
     for r in all_results:
-        logger.info("  Stage %d | LR=%.0e | Val PPL=%7.2f | Time=%5.2f h | %s",
-                    r["stage"], r["lr"], r["val_ppl"], r["time_h"],
+        logger.info("  Epoch %d | LR=%.0e | Val PPL=%7.2f | Time=%5.2f h | %s",
+                    r["epoch"], r["lr"], r["val_ppl"], r["time_h"],
                     r["hub_repo"] or "LOCAL ONLY")
     logger.info("─" * 70)
     logger.info("Total time:     %.2f hours", total_time_h)
-    logger.info("Best Val PPL:   %.2f (Stage %d)", best_stage["val_ppl"], best_stage["stage"])
-    logger.info("Best repo:      %s", best_stage["hub_repo"] or f"LOCAL: {best_stage['local_ckpt']}")
-    
-    logger.info("\n📊 FEASIBILITY SUMMARY:")
-    logger.info("   Compare against n_loops=4 baseline:")
-    logger.info("   - Training time increase: check elapsed time")
-    logger.info("   - PPL improvement: %.2f vs baseline", best_stage["val_ppl"])
-    logger.info("   - Memory overhead: check peak GPU usage")
-    logger.info("   - Convergence: compare loss curves")
+    logger.info("Best Val PPL:   %.2f (Epoch %d)", best_epoch["val_ppl"], best_epoch["epoch"])
+    logger.info("Best repo:      %s", best_epoch["hub_repo"] or f"LOCAL: {best_epoch['local_ckpt']}")
 
     final = {
         "run_ts": RUN_TS,
@@ -458,25 +431,18 @@ def main():
             "weight_decay": WEIGHT_DECAY, "grad_buffer_ratio": GRAD_BUFFER_RATIO,
             "lateral_p": LATERAL_P, "vertical_p": VERTICAL_P, "vertical_depth": VERTICAL_DEPTH,
             "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
-            "lr": LR_STAGES[0], "kita": USE_KITA,
+            "lr_stages": LR_STAGES, "kita": USE_KITA,
             "streaming": STREAMING, "preprocess_batch_size": PREPROCESS_BATCH_SIZE,
         },
-        "variant": "n_loops_5_feasibility",
-        "feasibility_notes": [
-            "25% more recurrent depth vs baseline (n_loops=4)",
-            "Expected: better long-range dependencies",
-            "Tradeoff: slower training (more compute/forward)",
-            "Watch: memory, convergence, stability"
-        ],
         "total_time_h": total_time_h,
-        "best_val_ppl": best_stage["val_ppl"],
-        "best_stage": best_stage["stage"],
-        "stages": all_results,
+        "best_val_ppl": best_epoch["val_ppl"],
+        "best_epoch": best_epoch["epoch"],
+        "epochs": all_results,
     }
     with open(RESULTS_JSON, "w") as f:
         json.dump(final, f, indent=2)
 
-    best_repo = best_stage["hub_repo"]
+    best_repo = best_epoch["hub_repo"]
     if best_repo:
         logger.info("\n📌 Load your best model:")
         logger.info('   model = AutoModelForCausalLM.from_pretrained("%s")', best_repo)
