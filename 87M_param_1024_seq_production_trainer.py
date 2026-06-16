@@ -54,7 +54,7 @@ VERTICAL_DEPTH = 2
 
 # Training
 BATCH_SIZE = 16
-GRAD_ACCUM = 2       
+GRAD_ACCUM = 4       
 WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
 LR_STAGES = [2e-3, 1e-3, 3e-4]
