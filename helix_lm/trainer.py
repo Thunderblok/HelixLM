@@ -92,6 +92,8 @@ class Trainer:
         preprocess_num_proc: int = 5,
         preprocess_batch_size: int = 1000,
         cleanup_shards: bool = True,
+        # DataLoader performance options
+        num_workers: int = 4,  # Number of DataLoader workers for prefetching
     ):
         """
         Initialize Trainer.
@@ -121,6 +123,9 @@ class Trainer:
             preprocess_num_proc: Number of processes for preprocessing (streaming only).
             preprocess_batch_size: Batch size for streaming preprocessing.
             cleanup_shards: Whether to auto-cleanup shards after training.
+            num_workers: Number of DataLoader worker processes for background data loading.
+                        Higher values enable more prefetching but use more CPU/RAM.
+                        Set to 0 for single-threaded loading (default: 4).
         """
         # Apply intelligent stride default based on seq_len
         if stride is None:
@@ -181,6 +186,7 @@ class Trainer:
                     stride=stride,
                     shuffle=True,
                     drop_last=True,
+                    num_workers=num_workers,
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     shard_cache_dir=shard_cache_dir,
@@ -200,6 +206,7 @@ class Trainer:
                     cfg.seq_len,
                     cfg.batch_size,
                     shuffle=True,
+                    num_workers=num_workers,
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,
@@ -222,6 +229,7 @@ class Trainer:
                     stride=stride,
                     shuffle=False,
                     drop_last=False,
+                    num_workers=num_workers,
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     shard_cache_dir=shard_cache_dir,
@@ -242,6 +250,7 @@ class Trainer:
                     cfg.batch_size,
                     shuffle=False,
                     drop_last=False,
+                    num_workers=num_workers,
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,

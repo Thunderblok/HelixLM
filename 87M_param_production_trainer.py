@@ -340,6 +340,7 @@ def main():
             # Streaming-specific options
             preprocess_batch_size=PREPROCESS_BATCH_SIZE,
             cleanup_shards=CLEANUP_SHARDS,
+            num_workers=4,  # DataLoader workers for prefetching
         )
 
         # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup
