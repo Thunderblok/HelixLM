@@ -30,7 +30,8 @@ from helix_lm.trainer import Trainer
 # 3B token dataset with train/val splits — STREAMING MODE
 
 DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
-# Set to None to 
+
+# Set to None to use full dataset
 NUM_SAMPLES = 1271135
 # Since an L40s is all we have to work with, gotta compromise 1.5B tokens it is...
 
@@ -252,7 +253,7 @@ def main():
 
     logger.info("Train:      IterableColumn (streaming)")
     logger.info("Val:        IterableColumn (streaming)")
-    logger.info("Note:       Dataset > memory; using sharded preprocessing")
+    logger.info("Note:       Using sharded preprocessing to validate capibility to accomodate Dataset > memory")
 
     # ── Shared config kwargs ────────────────────────────────────────────
     cfg_kwargs = dict(
@@ -349,14 +350,14 @@ def main():
             num_workers=4,  # DataLoader workers for prefetching
         )
 
-        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may be inneffective here)
+        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may not be effective here)
         # trainer._scheduler_min_lr = 1.0
 
         # KITA override (if enabled)
         if USE_KITA:
             # For streaming, estimate steps based on token count
             # 3B tokens / (64 batch * 1024 seq_len) ≈ ~45k steps
-            estimated_steps = 3_000_000_000 // (BATCH_SIZE * GRAD_ACCUM * SEQ_LEN)
+            estimated_steps = 3_000_000_000 // (BATCH_SIZE * GRAD_ACCUM * SEQ_LEN) # 3B fallback estimate
             logger.info("KITA estimated steps (3B tokens): ~%d", estimated_steps)
             trainer.scheduler = _create_spike_scheduler(
                 optimizer=trainer.optimizer,
