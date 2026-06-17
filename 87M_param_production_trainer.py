@@ -30,6 +30,9 @@ from helix_lm.trainer import Trainer
 # 3B token dataset with train/val splits — STREAMING MODE
 
 DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
+# Set to None to 
+NUM_SAMPLES = 1271135
+# Since an L40s is all we have to work with, gotta compromise 1.5B tokens it is...
 
 SEED = 42
 HF_USERNAME = "david-thrower"
@@ -41,8 +44,8 @@ D_MODEL = 1024                              # High dim > many columns
 N_COLUMNS = 2                               # Simple graph, faster training
 NODES_PER_COLUMN = (3, 3)                   # Balanced 2-column graph
 N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
-FFN_EXPANSION = 2.7                         # Per PanGu-π
-SEQ_LEN = 512                               # Target context length
+FFN_EXPANSION = 3                           # Per PanGu-π + 0.3 for architectural reasons
+SEQ_LEN = 1024                              # Target context length
 N_LOOPS = 4                                 # Production: 4 recurrent loops
 DROPOUT = 0.1                               # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
@@ -58,8 +61,8 @@ BATCH_SIZE = 16
 GRAD_ACCUM = 4       
 WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
-LR_STAGES = [2e-3, 1e-3, 3e-4]
-WARMUP_STAGES = [100, 10, 10]
+LR_STAGES = [3e-3, 1e-3, 3e-4]
+WARMUP_STAGES = [500, 100, 50]
 
 # KITA / spike scheduler disabled, uncomment if rabbit holes appear
 USE_KITA = False
@@ -241,7 +244,10 @@ def main():
     # Extract the 'text' column as IterableColumn — DO NOT MATERIALIZE
     # The Trainer will handle streaming preprocessing via create_unified_data_loader
     # which uses _handle_streaming_iterable to shard/process on-the-fly
-    train_iterable = hf_ds['train']['text']  # datasets.iterable_dataset.IterableColumn
+    if NUM_SAMPLES:
+        train_iterable = hf_ds['train'].take(NUM_SAMPLES)['text']  # datasets.iterable_dataset.IterableColumn
+    else:
+        train_iterable = hf_ds['train']['text']
     val_iterable = hf_ds['validation']['text']  # datasets.iterable_dataset.IterableColumn
 
     logger.info("Train:      IterableColumn (streaming)")
@@ -343,8 +349,8 @@ def main():
             num_workers=4,  # DataLoader workers for prefetching
         )
 
-        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup
-        trainer._scheduler_min_lr = 1.0
+        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may be inneffective here)
+        # trainer._scheduler_min_lr = 1.0
 
         # KITA override (if enabled)
         if USE_KITA:
