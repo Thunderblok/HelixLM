@@ -62,8 +62,15 @@ BATCH_SIZE = 16
 GRAD_ACCUM = 4       
 WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
-LR_STAGES = [3e-3, 1e-3, 3e-4]
+LR_STAGES = [5e-3, 2e-3, 1e-3]
 WARMUP_STAGES = [500, 100, 50]
+# Increasing n_loops apparently has a huge effect on 
+# stabilizing batches and making the loss surface
+# isotropic. Or model size ... In any case, 2e-3,
+# the 1st epoch progressed smooth as glass, only 4 bathces out of 
+# first 13520 batches had a perplexity > the last batch, and the
+# perplexity declined VERY slowly. We can probbaly tolerate a 
+# much higher LR ...
 
 # KITA / spike scheduler disabled, uncomment if rabbit holes appear
 USE_KITA = False
@@ -351,7 +358,7 @@ def main():
         )
 
         # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may not be effective here)
-        # trainer._scheduler_min_lr = 1.0
+        trainer._scheduler_min_lr = 0.3 # Balance of stability safety and high LR
 
         # KITA override (if enabled)
         if USE_KITA:
