@@ -542,11 +542,15 @@ def create_document_loader(
     collate_fn = _collate_batch
 
     # Use torch.Generator for deterministic shuffling with given seed
+    # Use 'spawn' for CUDA safety - fork after CUDA init causes deadlocks
+    import sys
+    mp_context = 'spawn' if sys.platform == 'linux' and num_workers > 0 else None
+    
     if shuffle:
         generator = torch.Generator()
         generator.manual_seed(seed)
-        return DataLoader(
-            ds,
+        loader_kwargs = dict(
+            dataset=ds,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
@@ -554,15 +558,21 @@ def create_document_loader(
             drop_last=drop_last,
             generator=generator,
         )
+        if mp_context:
+            loader_kwargs['multiprocessing_context'] = mp_context
+        return DataLoader(**loader_kwargs)
     else:
-        return DataLoader(
-            ds,
+        loader_kwargs = dict(
+            dataset=ds,
             batch_size=batch_size,
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=num_workers,
             drop_last=drop_last,
         )
+        if mp_context:
+            loader_kwargs['multiprocessing_context'] = mp_context
+        return DataLoader(**loader_kwargs)
 
 
 # =============================================================================
@@ -1163,10 +1173,11 @@ def _handle_streaming_iterable(
             prefetch_factor=prefetch_factor,
             persistent_workers=persistent_workers,
         )
-        # Linux optimization: use fork for faster worker spawning
+        # Use 'spawn' for CUDA safety - fork after CUDA init causes deadlocks
+        # See: https://pytorch.org/docs/stable/notes/multiprocessing.html#cuda-in-multiprocessing
         import sys
         if sys.platform == 'linux' and num_workers > 0:
-            loader_kwargs['multiprocessing_context'] = 'fork'
+            loader_kwargs['multiprocessing_context'] = 'spawn'
         loader = DataLoader(**loader_kwargs)
     else:
         loader_kwargs = dict(
@@ -1181,7 +1192,7 @@ def _handle_streaming_iterable(
         )
         import sys
         if sys.platform == 'linux' and num_workers > 0:
-            loader_kwargs['multiprocessing_context'] = 'fork'
+            loader_kwargs['multiprocessing_context'] = 'spawn'
         loader = DataLoader(**loader_kwargs)
     
     return loader, shard_cache_dir

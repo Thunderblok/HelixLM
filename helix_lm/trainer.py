@@ -93,7 +93,8 @@ class Trainer:
         preprocess_batch_size: int = 1000,
         cleanup_shards: bool = True,
         # DataLoader performance options
-        num_workers: int = 4,  # Number of DataLoader workers for prefetching
+        num_workers: int = 4,  # Number of DataLoader workers for prefetching (train)
+        val_num_workers: Optional[int] = None,  # Validation workers (default: 0, set to >0 for large val sets)
     ):
         """
         Initialize Trainer.
@@ -123,9 +124,11 @@ class Trainer:
             preprocess_num_proc: Number of processes for preprocessing (streaming only).
             preprocess_batch_size: Batch size for streaming preprocessing.
             cleanup_shards: Whether to auto-cleanup shards after training.
-            num_workers: Number of DataLoader worker processes for background data loading.
-                        Higher values enable more prefetching but use more CPU/RAM.
-                        Set to 0 for single-threaded loading (default: 4).
+            num_workers: Number of DataLoader worker processes for training background data loading.
+                        Higher values enable more prefetching but use more CPU/RAM (default: 4).
+            val_num_workers: Number of DataLoader worker processes for validation.
+                        Defaults to 0 (safe, minimal overhead). Set to >0 for large validation sets
+                        where preprocessing time matters (uses 'spawn', CUDA-safe).
         """
         # Apply intelligent stride default based on seq_len
         if stride is None:
@@ -218,6 +221,10 @@ class Trainer:
         if val_loader is not None:
             self.val_loader = val_loader
         elif val_texts is not None:
+            # Validation workers: default to 0 (safe, no overhead), can be set >0 for large val sets.
+            # With 'spawn' multiprocessing in dataset.py, workers are CUDA-safe.
+            if locals().get('val_num_workers') is None:
+                val_num_workers = 0
             # Check if streaming data
             if _is_iterable_column(val_texts):
                 self._val_texts_is_streaming = True
@@ -229,7 +236,7 @@ class Trainer:
                     stride=stride,
                     shuffle=False,
                     drop_last=False,
-                    num_workers=num_workers,
+                    num_workers=val_num_workers,
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     shard_cache_dir=shard_cache_dir,
@@ -250,7 +257,7 @@ class Trainer:
                     cfg.batch_size,
                     shuffle=False,
                     drop_last=False,
-                    num_workers=num_workers,
+                    num_workers=val_num_workers,
                     min_tail_len=min_tail_len,
                     seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
                     lazy=True,
