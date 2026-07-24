@@ -32,23 +32,23 @@ from helix_lm.trainer import Trainer
 DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
 
 # Set to None to use full dataset
-NUM_SAMPLES = 1271135
-# Since an L40s is all we have to work with, gotta compromise 1.5B tokens it is...
+NUM_SAMPLES = None
+
 
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "linear"
+ATTENTION_MODE = "hybrid"
 
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
-N_COLUMNS = 2                               # Simple graph, faster training
+N_COLUMNS = 2                               
 NODES_PER_COLUMN = (3, 3)                   # Balanced 2-column graph
 N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
 FFN_EXPANSION = 3                           # Per PanGu-π + 0.3 for architectural reasons
 SEQ_LEN = 1024                              # Target context length
 N_LOOPS = 4                                 # Production: 4 recurrent loops
-DROPOUT = 0.1                               # Slight reduction at scale
+DROPOUT = .12                               # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
 
 # Topology — dense 
@@ -57,13 +57,16 @@ LATERAL_P = 0.8
 VERTICAL_P = 0.9
 VERTICAL_DEPTH = 2
 
-# Training
-BATCH_SIZE = 16
-GRAD_ACCUM = 4       
-WEIGHT_DECAY = 0.05
+
+
+# --- Training ---
+BATCH_SIZE = 64
+GRAD_ACCUM = 2                              # effective = 128
+WEIGHT_DECAY = 0.10
 GRAD_CLIP = 1.0
-LR_STAGES = [5e-3, 2e-3, 1e-3]
-WARMUP_STAGES = [500, 100, 50]
+
+LR_STAGES = [8e-3, 3e-3, 1e-3]
+WARMUP_STAGES = [1000, 200, 100]
 # Increasing n_loops apparently has a huge effect on 
 # stabilizing batches and making the loss surface
 # isotropic. Or model size ... In any case, 2e-3,
@@ -91,10 +94,13 @@ USE_TITANS = False
 PUSH_RETRY_ATTEMPTS = 3
 PUSH_RETRY_DELAY = 90
 
+
+
 # Streaming dataset settings
 STREAMING = True                            # Load dataset as streaming 3B token dataset (IterableDataset)
 PREPROCESS_BATCH_SIZE = 1000                # Batch size for streaming preprocessing
 CLEANUP_SHARDS = True                       # Clean up temporary shards after training
+NUM_WORKERS = 12
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SAFEGUARD
@@ -354,7 +360,7 @@ def main():
             # Streaming-specific options
             preprocess_batch_size=PREPROCESS_BATCH_SIZE,
             cleanup_shards=CLEANUP_SHARDS,
-            num_workers=4,  # DataLoader workers for prefetching
+            num_workers=NUM_WORKERS,  # DataLoader workers for prefetching
         )
 
         # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may not be effective here)
