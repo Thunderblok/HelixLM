@@ -1,6 +1,6 @@
 """
 
-HelixLM 87M — 3B token pretraining, production run.
+HelixLM 104M — 3B token pretraining, production run.
 Single training job with 3 epochs, each at a distinct learning rate.
 
 """
@@ -114,10 +114,10 @@ if not HF_TOKEN:
 # SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-OUTPUT_DIR = Path("production_run_87M_1024_nloops4")
+OUTPUT_DIR = Path("production_run_104M_1024_nloops4")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = OUTPUT_DIR / f"production_train_87M_1024_nl4_{RUN_TS}.log"
-RESULTS_JSON = OUTPUT_DIR / f"production_results_87M_1024_nl4_{RUN_TS}.json"
+LOG_FILE = OUTPUT_DIR / f"production_train_104M_1024_nl4_{RUN_TS}.log"
+RESULTS_JSON = OUTPUT_DIR / f"production_results_104M_1024_nl4_{RUN_TS}.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,10 +128,10 @@ logger = logging.getLogger(__name__)
 
 # ── Dynamic repo naming ──────────────────────────────────────────────────
 REPO_BASE = (
-    f"HelixLM-87M-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-h{N_HEADS}-nl{N_LOOPS}"
+    f"HelixLM-104M-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-h{N_HEADS}-nl{N_LOOPS}"
     f"-ffn{int(FFN_EXPANSION)}-s{SEQ_LEN}-3BT"
 )
-REPO_BASE_ALT = f"HelixLM-87M-{RUN_TS}-prod"
+REPO_BASE_ALT = f"HelixLM-104M-{RUN_TS}-prod"
 
 
 def make_repo_name(epoch: int, use_alt: bool = False) -> str:
@@ -207,7 +207,7 @@ def main():
     overlap_pct = (1 - effective_stride/SEQ_LEN) * 100
 
     logger.info("=" * 70)
-    logger.info("HelixLM 87M Training — d%d, cols=%d, seq=%d, n_loops=%d", D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
+    logger.info("HelixLM 104M Training — d%d, cols=%d, seq=%d, n_loops=%d", D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
