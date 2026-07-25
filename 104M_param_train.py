@@ -293,7 +293,8 @@ def main():
         lateral_p=LATERAL_P,
         vertical_p=VERTICAL_P,
         vertical_depth=VERTICAL_DEPTH,
-        attention_mode=ATTENTION_MODE
+        attention_mode=ATTENTION_MODE,
+        linear_feature_dim=32
     )
 
     # ── Training ────────────────────────────────────────────────────────
