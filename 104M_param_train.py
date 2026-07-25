@@ -38,7 +38,7 @@ NUM_SAMPLES = None
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "full"
+ATTENTION_MODE = "linear"
 
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
@@ -98,7 +98,7 @@ PUSH_RETRY_DELAY = 90
 
 # Streaming dataset settings
 STREAMING = True                            # Load dataset as streaming 3B token dataset (IterableDataset)
-PREPROCESS_BATCH_SIZE = 1000                # Batch size for streaming preprocessing
+PREPROCESS_BATCH_SIZE = 10000               # Batch size for streaming preprocessing
 CLEANUP_SHARDS = True                       # Clean up temporary shards after training
 NUM_WORKERS = 12
 
