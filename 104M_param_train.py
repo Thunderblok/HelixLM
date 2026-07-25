@@ -38,7 +38,7 @@ NUM_SAMPLES = None
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "linear"
+ATTENTION_MODE = "hybrid"
 
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
@@ -46,7 +46,7 @@ N_COLUMNS = 3
 NODES_PER_COLUMN = (3, 3, 3)                # Balanced 2-column graph
 N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
 FFN_EXPANSION = 3                           # Per PanGu-π + 0.3 for architectural reasons
-SEQ_LEN = 1024                              # Target context length
+SEQ_LEN = 512                               # Target context length
 N_LOOPS = 4                                 # Production: 4 recurrent loops
 DROPOUT = .1                                # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
@@ -60,8 +60,8 @@ VERTICAL_DEPTH = 2
 
 
 # --- Training ---
-BATCH_SIZE = 32
-GRAD_ACCUM = 4                               # effective = 128
+BATCH_SIZE = 64
+GRAD_ACCUM = 2                               # effective = 128
 WEIGHT_DECAY = 0.10
 GRAD_CLIP = 1.0
 
