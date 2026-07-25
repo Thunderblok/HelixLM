@@ -38,7 +38,7 @@ NUM_SAMPLES = None
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "hybrid"
+ATTENTION_MODE = "full"
 
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
@@ -48,7 +48,7 @@ N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
 FFN_EXPANSION = 3                           # Per PanGu-π + 0.3 for architectural reasons
 SEQ_LEN = 1024                              # Target context length
 N_LOOPS = 4                                 # Production: 4 recurrent loops
-DROPOUT = .12                               # Slight reduction at scale
+DROPOUT = .1                                # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
 
 # Topology — dense 
@@ -293,8 +293,7 @@ def main():
         lateral_p=LATERAL_P,
         vertical_p=VERTICAL_P,
         vertical_depth=VERTICAL_DEPTH,
-        attention_mode=ATTENTION_MODE,
-        linear_feature_dim=32
+        attention_mode=ATTENTION_MODE
     )
 
     # ── Training ────────────────────────────────────────────────────────
