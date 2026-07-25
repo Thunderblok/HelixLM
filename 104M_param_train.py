@@ -60,8 +60,8 @@ VERTICAL_DEPTH = 2
 
 
 # --- Training ---
-BATCH_SIZE = 32
-GRAD_ACCUM = 4                              # effective = 128
+BATCH_SIZE = 64
+GRAD_ACCUM = 2                               # effective = 128
 WEIGHT_DECAY = 0.10
 GRAD_CLIP = 1.0
 
