@@ -323,6 +323,7 @@ def main():
 
         # ── Create model ─────────────────────────────────────────────
         model = HelixForCausalLM(cfg)
+        model.model.recurrent = torch.compile(model.model.recurrent, mode="max-autotune", fullgraph=False)
         graph_info = model.model.recurrent.graph.get_graph_info()
         logger.info("Graph: %d nodes, %d edges", graph_info["n_nodes"], graph_info["n_edges"])
 
