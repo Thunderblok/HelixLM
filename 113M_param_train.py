@@ -47,7 +47,7 @@ NODES_PER_COLUMN = (3, 3, 3)                # Balanced 2-column graph
 N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
 FFN_EXPANSION = 3                           # Per PanGu-π + 0.3 for architectural reasons
 SEQ_LEN = 512                               # Target context length
-N_LOOPS = 4                                 # Production: 4 recurrent loops
+N_LOOPS = 3                                 # Production: 4 recurrent loops
 DROPOUT = .1                                # Slight reduction at scale
 GRAD_BUFFER_RATIO = 0.0
 
@@ -323,7 +323,8 @@ def main():
 
         # ── Create model ─────────────────────────────────────────────
         model = HelixForCausalLM(cfg)
-        model.model.recurrent = torch.compile(model.model.recurrent, mode="max-autotune", fullgraph=False)
+        # Torch compile regressed throughput catastrophically on n_loops = 4
+        # model.model.recurrent = torch.compile(model.model.recurrent, mode="max-autotune", fullgraph=False)
         graph_info = model.model.recurrent.graph.get_graph_info()
         logger.info("Graph: %d nodes, %d edges", graph_info["n_nodes"], graph_info["n_edges"])
 
