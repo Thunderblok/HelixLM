@@ -60,8 +60,8 @@ VERTICAL_DEPTH = 2
 
 
 # --- Training ---
-BATCH_SIZE = 64
-GRAD_ACCUM = 2                               # effective = 128
+BATCH_SIZE = 32
+GRAD_ACCUM = 4                             # effective = 128
 WEIGHT_DECAY = 0.10
 GRAD_CLIP = 1.0
 
@@ -98,10 +98,10 @@ PUSH_RETRY_DELAY = 90
 
 # Streaming dataset settings
 STREAMING = True                            # Load dataset as streaming 3B token dataset (IterableDataset)
-PREPROCESS_BATCH_SIZE = 2000                # Batch size for streaming preprocessing
+PREPROCESS_BATCH_SIZE = 1000                # Batch size for streaming preprocessing
 CLEANUP_SHARDS = True                       # Clean up temporary shards after training
-NUM_WORKERS = 4
-PREPROCESS_NUM_PROC = 8
+NUM_WORKERS = 12
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SAFEGUARD
