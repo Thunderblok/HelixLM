@@ -78,14 +78,11 @@ class LinearAttnNode(HeteroNode):
         k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # AMP-safe: compute feature maps and cumulatives in fp32 to prevent
-        # float16 overflow. The einsum over feature_dim can exceed 65504.
-        # Cast weights to fp32 so matmul dtype matches even when weights are bf16.
-        q_fp32 = self._feature_map(F.linear(q.float(), self.q_feat.weight.float(),
-                                            self.q_feat.bias.float() if self.q_feat.bias is not None else None))
-        k_fp32 = self._feature_map(F.linear(k.float(), self.k_feat.weight.float(),
-                                            self.k_feat.bias.float() if self.k_feat.bias is not None else None))
-        v_fp32 = v.float()
+        # BFloat16-safe: bf16 has same exponent range as fp32, so cumsum
+        # over seq_len=1024 cannot overflow. Skip fp32 casts to halve memory bandwidth.
+        q_fp32 = self._feature_map(self.q_feat(q))
+        k_fp32 = self._feature_map(self.k_feat(k))
+        v_fp32 = v
 
         # Apply attention mask: zero out k,v contributions from pad positions
         if attention_mask is not None:
@@ -93,17 +90,25 @@ class LinearAttnNode(HeteroNode):
             k_fp32 = k_fp32 * mask
             v_fp32 = v_fp32 * mask
 
-        kv = torch.einsum('bhTf,bhTd->bhTfd', k_fp32, v_fp32)
+        # Permute k, v so T is last dimension (stride-1 for cumsum)
+        k_t = k_fp32.permute(0, 1, 3, 2)   # [B, H, F, T]
+        v_t = v_fp32.permute(0, 1, 3, 2)   # [B, H, D, T]
 
-        # Move T to the LAST dimension so cumsum scans contiguous memory (stride = 1)
-        kv = kv.permute(0, 1, 3, 4, 2).contiguous()   # [B, H, F, D, T]
-        kv_cum = torch.cumsum(kv, dim=-1)              # one contiguous scan per row
-        kv_cum = kv_cum.permute(0, 1, 4, 2, 3)        # [B, H, T, F, D]
+        # z = cumsum(k).sum(F) — keep T last, no copy
+        z = torch.cumsum(k_t, dim=-1).sum(dim=2, keepdim=True).permute(0, 1, 3, 2).clamp(min=1e-6)  # [B, H, T, 1]
 
-        z = torch.cumsum(k_fp32, dim=2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        # KV outer product with T naturally last: [B, H, F, D, T]
+        kv = torch.einsum('bhft,bhdt->bhfdt', k_t, v_t)
 
+        # Cumsum over T — last dim, naturally contiguous, NO .contiguous() needed
+        kv_cum = torch.cumsum(kv, dim=-1)
+
+        # Permute back to [B, H, T, F, D] for output einsum
+        kv_cum = kv_cum.permute(0, 1, 4, 2, 3)
+
+        # Output (q_fp32 is still [B, H, T, F])
         out = torch.einsum('bhTf,bhTfd->bhTd', q_fp32, kv_cum) / z
-        out = out.to(x.dtype)  # cast back to fp16/bf16
+        out = out.to(x.dtype)
         # --------------------------------------------------------------
 
         out = out.transpose(1, 2).reshape(B, T, D)
