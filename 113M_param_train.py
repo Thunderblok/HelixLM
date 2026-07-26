@@ -38,7 +38,7 @@ NUM_SAMPLES = None
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "hybrid"
+ATTENTION_MODE = "linear"
 
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
@@ -98,9 +98,10 @@ PUSH_RETRY_DELAY = 90
 
 # Streaming dataset settings
 STREAMING = True                            # Load dataset as streaming 3B token dataset (IterableDataset)
-PREPROCESS_BATCH_SIZE = 10000               # Batch size for streaming preprocessing
+PREPROCESS_BATCH_SIZE = 2000                # Batch size for streaming preprocessing
 CLEANUP_SHARDS = True                       # Clean up temporary shards after training
-NUM_WORKERS = 12
+NUM_WORKERS = 4
+PREPROCESS_NUM_PROC = 8
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SAFEGUARD
@@ -361,6 +362,7 @@ def main():
             preprocess_batch_size=PREPROCESS_BATCH_SIZE,
             cleanup_shards=CLEANUP_SHARDS,
             num_workers=NUM_WORKERS,  # DataLoader workers for prefetching
+            preprocess_num_proc=PREPROCESS_NUM_PROC
         )
 
         # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may not be effective here)
