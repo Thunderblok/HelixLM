@@ -100,7 +100,7 @@ PUSH_RETRY_DELAY = 90
 STREAMING = True                            # Load dataset as streaming 3B token dataset (IterableDataset)
 PREPROCESS_BATCH_SIZE = 1000                # Batch size for streaming preprocessing
 CLEANUP_SHARDS = True                       # Clean up temporary shards after training
-NUM_WORKERS = 12
+NUM_WORKERS = 16
 
 
 # ═══════════════════════════════════════════════════════════════════════════
