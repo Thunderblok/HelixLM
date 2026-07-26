@@ -362,7 +362,6 @@ def main():
             preprocess_batch_size=PREPROCESS_BATCH_SIZE,
             cleanup_shards=CLEANUP_SHARDS,
             num_workers=NUM_WORKERS,  # DataLoader workers for prefetching
-            preprocess_num_proc=PREPROCESS_NUM_PROC
         )
 
         # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may not be effective here)
