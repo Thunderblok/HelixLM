@@ -98,7 +98,7 @@ class LinearAttnNode(HeteroNode):
         z = torch.cumsum(k_t, dim=-1).sum(dim=2, keepdim=True).permute(0, 1, 3, 2).clamp(min=1e-6)  # [B, H, T, 1]
 
         # KV outer product with T naturally last: [B, H, F, D, T]
-        kv = torch.einsum('bhft,bhdt->bhfdt', k_t, v_t)
+        kv = k_t.unsqueeze(3) * v_t.unsqueeze(2)   # [B,H,F,1,T] * [B,H,1,D,T] -> [B,H,F,D,T]
 
         # Cumsum over T — last dim, naturally contiguous, NO .contiguous() needed
         kv_cum = torch.cumsum(kv, dim=-1)
@@ -107,7 +107,7 @@ class LinearAttnNode(HeteroNode):
         kv_cum = kv_cum.permute(0, 1, 4, 2, 3)
 
         # Output (q_fp32 is still [B, H, T, F])
-        out = torch.einsum('bhTf,bhTfd->bhTd', q_fp32, kv_cum) / z
+        out = torch.matmul(q_fp32.unsqueeze(-2), kv_cum).squeeze(-2) / z
         out = out.to(x.dtype)
         # --------------------------------------------------------------
 
