@@ -13,7 +13,8 @@ import torch.nn.functional as F
 from .config import HelixConfig
 from .nodes import (
     HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode, RMSNorm
+    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode,
+    RMSNorm, FlashAttnNode
 )
 
 
