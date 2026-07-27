@@ -195,6 +195,8 @@ class HelixGraph(nn.Module):
     def _create_node(self, ntype: str, ncfg: dict) -> HeteroNode:
         if ntype == "linear_attn":
             return LinearAttnNode(**ncfg)
+        elif ntype == "flash_attn":
+            return FlashAttnNode(**ncfg)
         elif ntype == "full_attn":
             return FullAttnNode(**ncfg)
         elif ntype == "dense":
