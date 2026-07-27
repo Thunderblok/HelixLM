@@ -164,6 +164,63 @@ class FullAttnNode(HeteroNode):
         return out, None
 
 
+class FlashAttnNode(HeteroNode):
+    """Fused causal attention via PyTorch scaled_dot_product_attention.
+    
+    Semantically identical to FullAttnNode but dispatches to FlashAttention
+    (or memory-efficient attention) instead of manual matmul+softmax.
+    """
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True,
+                 attn_dropout: float = 0.0):
+        super().__init__(d_model)
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.use_rope = use_rope
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(attn_dropout if attn_dropout > 0 else dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+
+    def forward(self, x: torch.Tensor, state: Any = None, cache: Any = None,
+                attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
+        B, T, D = x.shape
+        x = self.norm(x)
+
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+
+        if attention_mask is not None:
+            # (B, T) -> (B, 1, 1, T) additive mask for key positions
+            mask = attention_mask.float().unsqueeze(1).unsqueeze(2)
+            mask = mask.masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=True
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, is_causal=True
+            )
+
+        out = out.transpose(1, 2).reshape(B, T, D)
+        out = self.resid_dropout(self.out_proj(out))
+        return out, None
+
+
 class DenseNode(HeteroNode):
     """Dense processing node with GELU activation."""
     def __init__(self, d_model: int, expansion: float = 2.0, dropout: float = 0.0):
