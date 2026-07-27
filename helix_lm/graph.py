@@ -126,8 +126,11 @@ class HelixGraph(nn.Module):
         for ci in range(cfg.n_columns):
             column = []
             use_full_attn = False
+            use_flash_attn = False
             if cfg.attention_mode == "full":
                 use_full_attn = True
+            elif cfg.attention_mode == "flash":
+                use_flash_attn = True
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
 
