@@ -38,7 +38,7 @@ NUM_SAMPLES = None
 SEED = 42
 HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "linear"
+ATTENTION_MODE = "flash"
 
 # Architecture: production configuration
 D_MODEL = 1024                              # High dim > many columns
