@@ -272,7 +272,7 @@ class HelixConfig(PretrainedConfig):
 
         # --- Validation ---
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
-        assert self.attention_mode in ["linear", "full", "hybrid"]
+        assert self.attention_mode in ["linear", "full", "hybrid", "flash"]
 
         # Ensure nodes_per_column matches n_columns
         npc = self.nodes_per_column
