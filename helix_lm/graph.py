@@ -141,6 +141,12 @@ class HelixGraph(nn.Module):
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
                     "attn_dropout": attn_drop,
                 }))
+            elif use_flash_attn:
+                column.append(("flash_attn", {
+                    "d_model": cfg.d_model, "n_heads": cfg.n_heads,
+                    "dropout": cfg.dropout, "use_rope": cfg.use_rope,
+                    "attn_dropout": attn_drop,
+                }))
             else:
                 column.append(("linear_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
