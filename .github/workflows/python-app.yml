@@ -43,7 +43,7 @@ jobs:
     - name: Demo run 
       timeout-minutes: 90
       run: |
-        python3 quick_demo_cpu.py
+        python3 quick_demo_cpu_multiscale.py
     - name: Demo run - Titans Memory
       timeout-minutes: 90
       run: |
