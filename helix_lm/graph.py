@@ -13,7 +13,8 @@ import torch.nn.functional as F
 from .config import HelixConfig
 from .nodes import (
     HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode, RMSNorm
+    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode, 
+    RMSNorm, ErrorCorrectingMultiScaleAttnNode
 )
 
 
@@ -126,13 +127,30 @@ class HelixGraph(nn.Module):
         for ci in range(cfg.n_columns):
             column = []
             use_full_attn = False
+            use_multi_scale = False
             if cfg.attention_mode == "full":
                 use_full_attn = True
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
+            elif cfg.attention_mode == "multi_scale_windowed":
+                use_multi_scale = True
 
             attn_drop = getattr(cfg, 'attn_dropout', cfg.dropout)
-            if use_full_attn:
+            if use_multi_scale:
+                column.append(("error_correcting_multi_scale_attn", {
+                    "d_model": cfg.d_model,
+                    "n_heads": cfg.n_heads,
+                    "local_window": getattr(cfg, "local_window", 64),
+                    "coarse_window": getattr(cfg, "coarse_window", 128),
+                    "compressed_windows": getattr(cfg, "compressed_windows", 8),
+                    "corrector_dim": getattr(cfg, "corrector_dim", None),
+                    "output_ffn_dim": getattr(cfg, "output_ffn_dim", None),
+                    "consensus_type": getattr(cfg, "consensus_type", "cosine"),
+                    "corrector_type": getattr(cfg, "corrector_type", "ffn"),
+                    "dropout": cfg.dropout,
+                    "attn_dropout": attn_drop,
+                }))
+            elif use_full_attn:
                 column.append(("full_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
@@ -200,6 +218,8 @@ class HelixGraph(nn.Module):
             return TitansMemoryNode(**ncfg)
         elif ntype == "gate":
             return GateNode(**ncfg)
+        elif ntype == "error_correcting_multi_scale_attn":
+            return ErrorCorrectingMultiScaleAttnNode(**ncfg)
         raise ValueError(f"Unknown node type: {ntype}")
 
     def _topsort(self) -> List[str]:
