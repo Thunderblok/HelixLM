@@ -54,6 +54,15 @@ class HelixConfig(PretrainedConfig):
         # --- Linear Attention ---
         linear_feature_dim: int = 64,
 
+        # --- Error-Correcting Multi-Scale Attention ---
+        local_window: int = 64,
+        coarse_window: int = 128,
+        compressed_windows: int = 8,
+        corrector_dim: Optional[int] = None,
+        output_ffn_dim: Optional[int] = None,
+        consensus_type: str = "cosine",
+        corrector_type: str = "ffn",
+        
         # --- SSM (Mamba-2 SSD) ---
         use_ssm: bool = False,
         ssm_d_state: int = 64,
@@ -178,6 +187,15 @@ class HelixConfig(PretrainedConfig):
         self.attn_dropout = attn_dropout
         self.linear_feature_dim = linear_feature_dim
 
+        # --- Error-Correcting Multi-Scale Attention ---
+        self.local_window = local_window
+        self.coarse_window = coarse_window
+        self.compressed_windows = compressed_windows
+        self.corrector_dim = corrector_dim
+        self.output_ffn_dim = output_ffn_dim
+        self.consensus_type = consensus_type
+        self.corrector_type = corrector_type
+
         # --- CCA ---
         self.use_cca = use_cca
         self.cca_warmup_steps = cca_warmup_steps
@@ -272,7 +290,11 @@ class HelixConfig(PretrainedConfig):
 
         # --- Validation ---
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
-        assert self.attention_mode in ["linear", "full", "hybrid"]
+        assert self.attention_mode in [
+            "linear",
+            "full",
+            "hybrid",
+            "multi_scale_windowed"]
 
         # Ensure nodes_per_column matches n_columns
         npc = self.nodes_per_column
