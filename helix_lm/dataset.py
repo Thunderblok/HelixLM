@@ -1,7 +1,23 @@
 """
 HelixLM Dataset with rolling text chunking and natural stop detection.
 
-Key fixes in this revision
+REMEDIATION (2026-08-22) — Issue 4:
+  Attention mask and loss mask are now SEPARATE across all four sample paths:
+    1. HelixDataset._make_sample
+    2. DocumentAwareDataset.__getitem__
+    3. HelixPrechunkedDataset.__getitem__
+    4. HelixShardedDataset._item_from_chunk
+
+  attention_mask: 1 for every REAL token (including overlap warmup), 0 only for
+                 exact trailing padding.
+  labels:         -100 for overlap warmup AND exact trailing padding; token id
+                 otherwise.
+
+  Previously, attention_mask was derived from (labels != -100), which made
+  overlap tokens invisible to attention even though they are legitimate context.
+  Overlap tokens now remain visible to attention while still excluded from loss.
+
+Key fixes retained from prior revision
   * DocumentAwareDataset now tracks exact pad_len in every chunk tuple.
     It NEVER scans backwards for pad_token_id, so GPT-2 (pad_id == eos_id)
     cannot accidentally mask a real EOS.
@@ -36,6 +52,17 @@ def _collate_batch(batch):
     }
 
 
+def _build_attention_mask(seq_len: int, pad_len: int) -> torch.Tensor:
+    """
+    Issue 4: attention_mask marks every REAL token as visible (1), including
+    overlap warmup tokens, and only exact trailing padding as 0.
+    """
+    am = torch.ones(seq_len, dtype=torch.long)
+    if pad_len > 0:
+        am[-pad_len:] = 0
+    return am
+
+
 class HelixDataset(Dataset):
     """
     Index-based Dataset with rolling chunking for language model pretraining.
@@ -49,7 +76,7 @@ class HelixDataset(Dataset):
     For each chunk, produces:
       - input_ids: (seq_len,)
       - labels: (seq_len,) — shifted by 1 for next-token prediction
-      - attention_mask: (seq_len,) — 1 for real tokens, 0 for padding
+      - attention_mask: (seq_len,) — 1 for real tokens (incl. overlap), 0 for padding
       - is_natural_stop: scalar bool — True if chunk ends at document boundary
     """
     def __init__(
@@ -156,10 +183,14 @@ class HelixDataset(Dataset):
             end_idx = start_idx + self.seq_len
             chunk = ids[start_idx:end_idx]
             labels = list(chunk)
+            overlap_mask = 0
             if start_idx > 0 and self.stride < self.seq_len:
                 warmup_len = self.seq_len - self.stride
                 labels[:warmup_len] = [-100] * warmup_len
-            return self._make_sample(chunk, labels, is_natural_stop)
+                overlap_mask = warmup_len
+            # Issue 4: pad_len=0 for full chunks; overlap stays visible to attention.
+            return self._make_sample(chunk, labels, is_natural_stop,
+                                     pad_len=0, overlap_mask=overlap_mask)
         else:
             chunk = ids[:length]
             pad_len = self.seq_len - length
@@ -167,14 +198,16 @@ class HelixDataset(Dataset):
             labels = list(chunk)
             if pad_len > 0:
                 labels[-pad_len:] = [-100] * pad_len
-            return self._make_sample(chunk, labels, is_natural_stop=True)
+            return self._make_sample(chunk, labels, is_natural_stop=True,
+                                     pad_len=pad_len, overlap_mask=0)
 
-    def _make_sample(self, chunk, labels, is_natural_stop):
+    def _make_sample(self, chunk, labels, is_natural_stop, pad_len=0, overlap_mask=0):
         input_ids = torch.tensor(chunk[:self.seq_len], dtype=torch.long)
         labels_t = torch.tensor(labels[:self.seq_len], dtype=torch.long)
-        # BUG FIX: Derive attention_mask from ANY -100 position (both padding AND overlap)
-        # This ensures attention_mask is consistent with labels
-        attention_mask = (labels_t != -100).long()
+        # Issue 4: attention_mask is derived from pad_len, NOT from labels.
+        # Overlap warmup tokens are real context -> visible to attention (1),
+        # but excluded from loss via labels=-100.
+        attention_mask = _build_attention_mask(self.seq_len, pad_len)
         return {
             "input_ids": input_ids,
             "labels": labels_t,
@@ -202,6 +235,10 @@ class DocumentAwareDataset(Dataset):
       - Short documents: kept as-is, padded to seq_len.
       - Only padding positions are masked in labels (-100).
       - No label masking for overlap regions except the explicit overlap head.
+
+    Issue 4: attention_mask now marks overlap tokens as visible (1) and only
+    exact trailing padding as 0. Previously it was (labels != -100), which hid
+    overlap context from attention.
     """
     def __init__(
         self,
@@ -336,17 +373,17 @@ class DocumentAwareDataset(Dataset):
         x = torch.tensor(chunk, dtype=torch.long)
         labels = x.clone()
 
-        # 1. Mask overlapping head (only when stride < seq_len)
+        # 1. Mask overlapping head (only when stride < seq_len) — loss mask only
         if overlap_mask > 0:
             labels[:overlap_mask] = -100
 
-        # 2. Mask exact trailing padding count (robust to pad_id == eos_id)
+        # 2. Mask exact trailing padding (robust to pad_id == eos_id) — loss mask only
         if pad_len > 0:
             labels[-pad_len:] = -100
 
-        # BUG FIX: Derive attention_mask from ANY -100 position (both padding AND overlap)
-        # This ensures attention_mask is consistent with labels
-        attention_mask = (labels != -100).long()
+        # Issue 4: attention_mask marks real tokens (incl. overlap) as visible.
+        # Only exact trailing padding is masked from attention.
+        attention_mask = _build_attention_mask(self.seq_len, pad_len)
         return {
             "input_ids": x,
             "labels": labels,
@@ -698,16 +735,16 @@ class HelixPrechunkedDataset(Dataset):
         x = torch.tensor(chunk, dtype=torch.long)
         labels = x.clone()
         
-        # Mask overlapping head (stride < seq_len)
+        # Mask overlapping head (stride < seq_len) — loss mask only
         if overlap_mask > 0:
             labels[:overlap_mask] = -100
         
-        # Mask trailing padding
+        # Mask trailing padding — loss mask only
         if pad_len > 0:
             labels[-pad_len:] = -100
         
-        # Derive attention_mask from labels (any -100 position)
-        attention_mask = (labels != -100).long()
+        # Issue 4: attention_mask marks real tokens (incl. overlap) as visible.
+        attention_mask = _build_attention_mask(self.seq_len, pad_len)
         
         return {
             "input_ids": x,
@@ -858,16 +895,16 @@ class HelixShardedDataset(Dataset):
         x = torch.tensor(chunk, dtype=torch.long)
         labels = x.clone()
         
-        # Mask overlapping head (stride < seq_len)
+        # Mask overlapping head (stride < seq_len) — loss mask only
         if overlap_mask > 0:
             labels[:overlap_mask] = -100
         
-        # Mask trailing padding
+        # Mask trailing padding — loss mask only
         if pad_len > 0:
             labels[-pad_len:] = -100
         
-        # Derive attention_mask from labels (any -100 position)
-        attention_mask = (labels != -100).long()
+        # Issue 4: attention_mask marks real tokens (incl. overlap) as visible.
+        attention_mask = _build_attention_mask(self.seq_len, pad_len)
         
         return {
             "input_ids": x,
@@ -1014,7 +1051,7 @@ def _handle_streaming_iterable(
     import os
     import pickle
     from datetime import datetime
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as completed
     
     if min_tail_len is None:
         min_tail_len = 1
@@ -1265,4 +1302,3 @@ def create_unified_data_loader(
     )
     
     return loader
-  
