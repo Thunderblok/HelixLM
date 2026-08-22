@@ -1051,7 +1051,7 @@ def _handle_streaming_iterable(
     import os
     import pickle
     from datetime import datetime
-    from concurrent.futures import ThreadPoolExecutor, as completed
+    from concurrent.futures import ThreadPoolExecutor
     
     if min_tail_len is None:
         min_tail_len = 1
