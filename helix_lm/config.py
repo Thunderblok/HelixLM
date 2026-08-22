@@ -3,6 +3,12 @@ HelixLM Configuration with HuggingFace PretrainedConfig integration.
 
 Scales from tiny smoke-test models (128 d_model) up to multi-billion
 parameter production models via a single dataclass.
+
+REMEDIATION (2026-08-22):
+  - Added compressed_views (V), compressed_dim (Dc), compressed_heads,
+    strict_nan_check for the ErrorCorrectingMultiScaleAttnNode.
+    compatibility but ignored (the node no longer has an output FFN;
+    the graph owns FFN via SwiGLU).
 """
 
 from math import e
@@ -57,12 +63,15 @@ class HelixConfig(PretrainedConfig):
         # --- Error-Correcting Multi-Scale Attention ---
         local_window: int = 64,
         coarse_window: int = 128,
-        compressed_windows: int = 8,
+        compressed_windows: int = 8,           # K: temporal compressed positions
+        compressed_views: int = 8,             # V: independent compressed kernels
+        compressed_dim: Optional[int] = None,  # Dc: bottleneck width (default d_model//2)
+        compressed_heads: Optional[int] = None,
         corrector_dim: Optional[int] = None,
-        output_ffn_dim: Optional[int] = None,
         consensus_type: str = "cosine",
         corrector_type: str = "ffn",
-        
+        strict_nan_check: bool = False,         # Issue 1: raise on corrupt NaN (opt-in)
+
         # --- SSM (Mamba-2 SSD) ---
         use_ssm: bool = False,
         ssm_d_state: int = 64,
@@ -145,7 +154,7 @@ class HelixConfig(PretrainedConfig):
 
         # memory
         memory_efficient_forward: bool = False,
-        
+
         # --- Curriculum Component Activation ---
         use_cca: bool = False,
         cca_warmup_steps: int = 5000,
@@ -191,10 +200,13 @@ class HelixConfig(PretrainedConfig):
         self.local_window = local_window
         self.coarse_window = coarse_window
         self.compressed_windows = compressed_windows
+        self.compressed_views = compressed_views
+        self.compressed_dim = compressed_dim
+        self.compressed_heads = compressed_heads
         self.corrector_dim = corrector_dim
-        self.output_ffn_dim = output_ffn_dim
         self.consensus_type = consensus_type
         self.corrector_type = corrector_type
+        self.strict_nan_check = strict_nan_check
 
         # --- CCA ---
         self.use_cca = use_cca
@@ -295,6 +307,13 @@ class HelixConfig(PretrainedConfig):
             "full",
             "hybrid",
             "multi_scale_windowed"]
+
+        # Compressed-branch validation
+        if self.attention_mode == "multi_scale_windowed":
+            assert self.compressed_windows >= 1, "compressed_windows (K) must be >= 1"
+            assert self.compressed_views >= 1, "compressed_views (V) must be >= 1"
+            if self.compressed_dim is not None:
+                assert self.compressed_dim >= 1, "compressed_dim (Dc) must be >= 1"
 
         # Ensure nodes_per_column matches n_columns
         npc = self.nodes_per_column
