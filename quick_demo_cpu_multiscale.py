@@ -44,6 +44,7 @@ def main():
         seq_len=MAX_SEQ_LEN,
         tokenizer_name="gpt2",
         use_titans_memory=False,
+        n_loops=3,
         attention_mode="multi_scale_windowed",
         local_window=16,
         coarse_window=32,
