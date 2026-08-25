@@ -18,7 +18,7 @@ from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
 
 EPOCHS = 10
 MAX_SEQ_LEN = 96
-NUM_SAMPLES = 1_000
+NUM_SAMPLES = 1_500
 VAL_SPLIT = 0.2
 
 EXAMPLE_PROMPTS = [
@@ -44,10 +44,12 @@ def main():
         seq_len=MAX_SEQ_LEN,
         tokenizer_name="gpt2",
         use_titans_memory=False,
+        n_loops=3,
         attention_mode="multi_scale_windowed",
-        local_window=16,
-        coarse_window=32,
-        compressed_windows=4,
+        local_window=32,
+        coarse_window=48,
+        compressed_windows=16,
+        compressed_views=8,
         corrector_dim=128,      # d_model // 2
         output_ffn_dim=1024,    # 4 * d_model
         consensus_type="cosine",
