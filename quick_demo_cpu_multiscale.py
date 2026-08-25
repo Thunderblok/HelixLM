@@ -45,9 +45,10 @@ def main():
         tokenizer_name="gpt2",
         use_titans_memory=False,
         attention_mode="multi_scale_windowed",
-        local_window=16,
-        coarse_window=32,
-        compressed_windows=4,
+        local_window=32,
+        coarse_window=48,
+        compressed_windows=16,
+        compressed_views=8,
         corrector_dim=128,      # d_model // 2
         output_ffn_dim=1024,    # 4 * d_model
         consensus_type="cosine",
