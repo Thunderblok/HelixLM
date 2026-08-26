@@ -330,16 +330,16 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         z_clean = torch.where(valid.unsqueeze(-1), z, torch.zeros_like(z))
         valid_f = valid.unsqueeze(-1).float()
 
-        # FP32 accumulation for stability.
+        # FP32 accumulation and division for stability.
         cum_z = torch.cumsum(z_clean.float(), dim=1)       # [B, T, Dc]
         cum_count = torch.cumsum(valid_f, dim=1)            # [B, T, 1]
 
         idx = boundaries.view(1, K, 1).expand(B, K, Dc)
-        z_comp = cum_z.gather(1, idx).to(z.dtype)           # [B, K, Dc]
+        z_comp_fp32 = cum_z.gather(1, idx)                 # [B, K, Dc]
 
         count_idx = boundaries.view(1, K, 1).expand(B, K, 1)
         counts = cum_count.gather(1, count_idx).clamp(min=1.0)  # [B, K, 1]
-        z_comp = z_comp / counts.to(z_comp.dtype)
+        z_comp = (z_comp_fp32 / counts).to(z.dtype)
 
         comp_valid = (cum_count.gather(1, count_idx).squeeze(-1) > 0)  # [B, K]
         return z_comp, comp_valid
