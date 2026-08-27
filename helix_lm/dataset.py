@@ -37,6 +37,12 @@ import torch
 from torch.utils.data import IterableDataset, Dataset, DataLoader
 from tqdm import tqdm
 
+from .streaming_dataset import (
+    preprocess_streaming_data,
+    create_streaming_loader,
+    compute_corpus_hash,
+    HelixStreamingDataLoader,
+)
 
 def _collate_batch(batch):
     """Module-level collate function for pickling with multiprocessing."""
@@ -1023,204 +1029,67 @@ def _handle_streaming_iterable(
     stride: Optional[int] = None,
     shuffle: bool = True,
     drop_last: bool = True,
-    num_workers: int = 0,
+    num_workers: int = 0,              # Kept for API compat; ignored (producer thread replaces workers)
     min_tail_len: Optional[int] = None,
     add_eos: bool = True,
     seed: int = 42,
     text_column: str = "text",
     shard_cache_dir: Optional[str] = None,
-    preprocess_num_proc: int = 5,
-    preprocess_batch_size: int = 1000,
+    preprocess_num_proc: int = 5,      # Kept for API compat; ignored
+    preprocess_batch_size: int = 1000, # Kept for API compat; ignored
     cleanup_shards: bool = True,
-) -> Tuple[DataLoader, str]:
+    use_existing_chunks: bool = False, # NEW
+    max_cache_shards: Optional[int] = None,  # NEW: None = load ALL into RAM
+) -> Tuple[Any, str]:
     """
-    Handle streaming IterableColumn by preprocessing to sharded Dataset.
-    
-    Strategy: Stream -> Shards -> Fast Loader
-    1. Stream data in batches to shards on disk (multi-thread preprocessing)
-    2. Pre-tokenize each shard using thread pool
-    3. Return DataLoader from concatenated shards
-    
-    MEMORY-EFFICIENT: Processes batches incrementally, never materializes full dataset.
-    
-    Returns:
-        Tuple of (DataLoader, shard_cache_dir). Caller is responsible for cleaning up
-        shard_cache_dir after training completes.
+    Handle streaming IterableColumn by preprocessing to contiguous numpy shards.
+
+    Three modes:
+      A. Fresh preprocess + load   (default)
+      B. Preprocess to a path, then load from that path
+      C. Load from an existing path (use_existing_chunks=True)
     """
-    import tempfile
-    import os
-    import pickle
-    from datetime import datetime
-    from concurrent.futures import ThreadPoolExecutor
-    
     if min_tail_len is None:
         min_tail_len = 1
-    
-    # Create cache directory
+
+    # --- Mode C: load pre-existing chunks --------------------------------
+    if use_existing_chunks and shard_cache_dir and os.path.exists(shard_cache_dir):
+        loader = create_streaming_loader(
+            shard_cache_dir,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            seed=seed,
+            max_cache_shards=max_cache_shards,
+        )
+        return loader, shard_cache_dir
+
+    # --- Mode A / B: preprocess first ------------------------------------
     if shard_cache_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shard_cache_dir = os.path.join(tempfile.gettempdir(), f"helix_shards_{timestamp}")
-    os.makedirs(shard_cache_dir, exist_ok=True)
-    
-    # Determine text extraction method
-    def extract_text(example):
-        if isinstance(example, dict):
-            return example.get(text_column, "")
-        return str(example)
-    
-    # Thread-safe batch processor function (closure captures tokenizer)
-    def process_batch(batch):
-        return _process_and_shard_batch(batch, tokenizer, seq_len, stride, min_tail_len, add_eos)
-    
-    # MEMORY-EFFICIENT: Stream and process batches incrementally with DETERMINISTIC ORDER
-    # Use a bounded queue approach with ThreadPoolExecutor, but buffer results
-    # to ensure shards are written in strict submission order
-    all_chunks = []
-    shard_idx = 0
-    batch = []
-    max_pending_batches = preprocess_num_proc * 2  # Limit pending work
-    
-    # For deterministic ordering: buffer completed results and write in sequence order
-    completed_results = {}  # batch_idx -> chunks
-    next_batch_to_write = 0  # Next batch index that should be written
-    
-    # Process batches incrementally using a sliding window of futures
-    with ThreadPoolExecutor(max_workers=preprocess_num_proc) as executor:
-        pending_futures = {}
-        
-        def drain_completed_futures():
-            """Process completed futures and buffer them for ordered writing."""
-            nonlocal all_chunks, shard_idx, next_batch_to_write
-            completed = [f for f in pending_futures if f.done()]
-            for f in completed:
-                batch_idx = pending_futures.pop(f)
-                try:
-                    chunks = f.result()
-                    completed_results[batch_idx] = chunks
-                except Exception as e:
-                    raise RuntimeError(f"Failed to process batch {batch_idx}: {e}")
-            
-            # Write completed batches in strict order
-            while next_batch_to_write in completed_results:
-                chunks = completed_results.pop(next_batch_to_write)
-                all_chunks.extend(chunks)
-                next_batch_to_write += 1
-                
-                # Save shard if it gets large
-                if len(all_chunks) >= 10000:  # ~10k sequences per shard
-                    shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
-                    with open(shard_path, 'wb') as f_save:
-                        pickle.dump(all_chunks, f_save)
-                    all_chunks = []
-                    shard_idx += 1
-        
-        # Stream examples and submit batches for processing
-        batch_idx = 0
-        for example in iterable:
-            text = extract_text(example)
-            if text:
-                batch.append(text)
-            
-            if len(batch) >= preprocess_batch_size:
-                # Wait if we have too many pending batches
-                while len(pending_futures) >= max_pending_batches:
-                    drain_completed_futures()
-                    if len(pending_futures) >= max_pending_batches:
-                        import time
-                        time.sleep(0.001)  # Brief yield
-                
-                # Submit batch for processing
-                future = executor.submit(process_batch, batch)
-                pending_futures[future] = batch_idx
-                batch_idx += 1
-                batch = []
-        
-        # Handle remaining batch
-        if batch:
-            while len(pending_futures) >= max_pending_batches:
-                drain_completed_futures()
-            future = executor.submit(process_batch, batch)
-            pending_futures[future] = batch_idx
-            batch_idx += 1
-        
-        # Drain remaining futures
-        while pending_futures:
-            drain_completed_futures()
-        
-        # Final flush: ensure all ordered results are written
-        while next_batch_to_write in completed_results:
-            chunks = completed_results.pop(next_batch_to_write)
-            all_chunks.extend(chunks)
-            next_batch_to_write += 1
-            
-            if len(all_chunks) >= 10000:
-                shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
-                with open(shard_path, 'wb') as f_save:
-                    pickle.dump(all_chunks, f_save)
-                all_chunks = []
-                shard_idx += 1
-    
-    # Save final shard
-    if all_chunks:
-        shard_path = os.path.join(shard_cache_dir, f"shard_{shard_idx:04d}.pkl")
-        with open(shard_path, 'wb') as f:
-            pickle.dump(all_chunks, f)
-        shard_idx += 1
-    
-    # Build list of shard paths (do NOT load them into memory)
-    shard_paths = []
-    for i in range(shard_idx):
-        shard_path = os.path.join(shard_cache_dir, f"shard_{i:04d}.pkl")
-        if os.path.exists(shard_path):
-            shard_paths.append(shard_path)
-    
-    # Create sharded dataset that reads from disk on-demand
-    # Note: We do NOT shuffle the dataset itself - shuffle is handled by DataLoader
-    # to match the List[str] path behavior exactly
-    dataset = HelixShardedDataset(shard_paths, seq_len, shuffle=False, seed=seed)
-    
-    # Use module-level collate_fn for pickling with multiprocessing
-    collate_fn = _collate_batch
-    
-    # DataLoader with prefetching and persistent workers for high throughput
-    prefetch_factor = 4 if num_workers > 0 else None
-    persistent_workers = num_workers > 0
-    
-    if shuffle:
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        loader_kwargs = dict(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            generator=generator,
-            collate_fn=collate_fn,
-            num_workers=num_workers,
-            drop_last=drop_last,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers,
-        )
-        # Linux optimization: use fork for faster worker spawning
-        import sys
-        if sys.platform == 'linux' and num_workers > 0:
-            loader_kwargs['multiprocessing_context'] = 'fork'
-        loader = DataLoader(**loader_kwargs)
-    else:
-        loader_kwargs = dict(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=num_workers,
-            drop_last=drop_last,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers,
-        )
-        import sys
-        if sys.platform == 'linux' and num_workers > 0:
-            loader_kwargs['multiprocessing_context'] = 'fork'
-        loader = DataLoader(**loader_kwargs)
-    
+        shard_cache_dir = os.path.join(tempfile.gettempdir(), f"helix_chunks_{timestamp}")
+
+    preprocess_streaming_data(
+        iterable,
+        tokenizer,
+        seq_len,
+        output_dir=shard_cache_dir,
+        stride=stride,
+        min_tail_len=min_tail_len,
+        add_eos=add_eos,
+        text_column=text_column,
+        shard_size=50_000,  # Cofounder: larger shards for better locality
+        show_progress=True,
+    )
+
+    loader = create_streaming_loader(
+        shard_cache_dir,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        seed=seed,
+        max_cache_shards=max_cache_shards,
+    )
     return loader, shard_cache_dir
 
 
@@ -1238,47 +1107,37 @@ def create_unified_data_loader(
     lazy: bool = True,
     seed: int = 42,
     text_column: str = "text",
-    # Sharding options (for IterableColumn path)
     shard_cache_dir: Optional[str] = None,
     preprocess_num_proc: int = 5,
     preprocess_batch_size: int = 1000,
     cleanup_shards: bool = True,
-) -> Tuple[DataLoader, str]:
+    use_existing_chunks: bool = False,      # <-- ADD THIS
+    max_cache_shards: Optional[int] = None,  # <-- ADD THIS
+) -> Union[DataLoader, Tuple[Any, str]]:
     """
     Create DataLoader that automatically detects data type:
+
     - List[str] -> DocumentAwareDataset
+	
     - Column[str] (with __getitem__) -> DocumentAwareDataset  
+	
     - IterableColumn[str] (streaming) -> Sharded preprocessing -> HelixShardedDataset
+	
     
+	
     For streaming data, returns (DataLoader, shard_cache_dir) tuple.
+	
     The caller MUST clean up shard_cache_dir after training completes.
-    
+
     Args:
-        data: Input data - List[str], Column[str], or IterableColumn[str]
-        tokenizer: Tokenizer instance
-        seq_len: Sequence length for model
-        batch_size: Batch size for DataLoader
-        stride: If < seq_len, enables within-document overlap
-        shuffle: Whether to shuffle the data
-        drop_last: Whether to drop last incomplete batch
-        num_workers: Number of worker processes for DataLoader
-        min_tail_len: Minimum tail length for document handling
-        add_eos: Whether to add EOS token
-        lazy: Whether to use lazy loading for DocumentAwareDataset
-        seed: Random seed for shuffling
-        text_column: Column name for text extraction from dicts
-        shard_cache_dir: Directory for temporary shard storage (streaming only)
-        preprocess_num_proc: Number of threads for parallel preprocessing (default: 5, streaming only)
-        preprocess_batch_size: Batch size for streaming preprocessing
-        cleanup_shards: If True, caller should cleanup shards after training
-    
-    Returns:
-        DataLoader for List[str]/Column[str] inputs
-        Tuple[DataLoader, str] for IterableColumn inputs (includes shard_cache_dir for cleanup)
+        ... existing args ...
+        use_existing_chunks: If True and shard_cache_dir exists, skip
+            preprocessing and load directly from disk.
+        max_cache_shards: Max shards to keep in RAM. None = load ALL shards
+            into RAM (default for V0). Set to an int for LRU caching when
+            corpus exceeds available system RAM.
     """
-    # Detect data type
     if _is_iterable_column(data):
-        # Streaming path
         return _handle_streaming_iterable(
             data, tokenizer, seq_len, batch_size, stride,
             shuffle=shuffle, drop_last=drop_last, num_workers=num_workers,
@@ -1288,7 +1147,10 @@ def create_unified_data_loader(
             preprocess_num_proc=preprocess_num_proc,
             preprocess_batch_size=preprocess_batch_size,
             cleanup_shards=cleanup_shards,
+            use_existing_chunks=use_existing_chunks,
+            max_cache_shards=max_cache_shards,
         )
+
     
     # List[str] or Column[str] path
     # Convert Column to list if needed (for non-iterable columns with __getitem__)
