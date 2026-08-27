@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
 from datasets import load_dataset
 from safetensors.torch import load_file as load_safetensors
 
