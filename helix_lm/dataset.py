@@ -28,6 +28,8 @@ Key fixes retained from prior revision
 
 Compatible with both eager and lazy loading.
 """
+import os
+from datetime import datetime
 import random
 import threading
 from typing import List, Optional, Iterator, Dict, Any, Union, Tuple
