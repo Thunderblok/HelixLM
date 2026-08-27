@@ -15,13 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
 from datasets import load_dataset
 from safetensors.torch import load_file as load_safetensors
 
-from helix_lm.config import HelixConfig
-from helix_lm.hf_model import HelixForCausalLM
-from helix_lm.trainer import Trainer
+from helix_lm import (
+    HelixTokenizer,
+    HelixConfig,
+    HelixForCausalLM,
+    Trainer
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -242,8 +244,7 @@ def main():
             logger.warning("⚠️  GPU < 40 GB VRAM: needs A100 (80GB).")
 
     # ── Tokenizer ───────────────────────────────────────────────────────
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = HelixTokenizer("gpt2")
     vocab_size = len(tokenizer)
     logger.info("Vocab:      %d", vocab_size)
 
