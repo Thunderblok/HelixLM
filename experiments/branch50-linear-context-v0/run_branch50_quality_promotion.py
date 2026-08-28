@@ -125,6 +125,20 @@ def verify_source_identity() -> dict[str, str]:
     }
 
 
+def initialize_cuda() -> None:
+    try:
+        torch.cuda.init()
+    except RuntimeError as error:
+        raise SystemExit(f"REFUSED: CUDA initialization failed: {error}") from error
+    if torch.cuda.get_device_capability() != (12, 0):
+        raise SystemExit(
+            "REFUSED: expected RTX5080 sm_120, found "
+            f"{torch.cuda.get_device_capability()}"
+        )
+    if not torch.cuda.is_bf16_supported():
+        raise SystemExit("REFUSED: BF16 unavailable")
+
+
 def model_state_root(model: torch.nn.Module) -> str:
     digest = hashlib.sha256()
     with torch.no_grad():
@@ -230,10 +244,7 @@ def main() -> None:
     args = parse_args()
     common, common_sha = load_common()
     source_identity = verify_source_identity()
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
-        raise SystemExit("REFUSED: RTX5080 sm_120 device unavailable")
-    if not torch.cuda.is_bf16_supported():
-        raise SystemExit("REFUSED: BF16 unavailable")
+    initialize_cuda()
     expected_batch = {512: 12, 1024: 6}[args.seq_len]
     if args.batch_size != expected_batch or args.grad_accum != 7:
         raise SystemExit(
