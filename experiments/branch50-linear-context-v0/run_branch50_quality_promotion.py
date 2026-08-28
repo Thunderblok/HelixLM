@@ -126,9 +126,21 @@ def verify_source_identity() -> dict[str, str]:
 
 
 def initialize_cuda() -> None:
-    device_count = int(torch._C._cuda_getDeviceCount())
+    device_count = 0
+    for _ in range(3):
+        device_count = int(torch._C._cuda_getDeviceCount())
+        if device_count > 0:
+            break
+        subprocess.run(
+            ["nvidia-smi", "-L"],
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.0)
     if device_count < 1:
-        raise SystemExit("REFUSED: CUDA driver reports zero devices")
+        raise SystemExit("REFUSED: CUDA driver reports zero devices after bounded wake-up")
     try:
         torch.cuda.init()
     except RuntimeError as error:
