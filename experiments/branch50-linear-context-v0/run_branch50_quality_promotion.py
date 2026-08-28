@@ -126,6 +126,9 @@ def verify_source_identity() -> dict[str, str]:
 
 
 def initialize_cuda() -> None:
+    device_count = int(torch._C._cuda_getDeviceCount())
+    if device_count < 1:
+        raise SystemExit("REFUSED: CUDA driver reports zero devices")
     try:
         torch.cuda.init()
     except RuntimeError as error:
