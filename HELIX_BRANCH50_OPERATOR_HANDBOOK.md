@@ -229,6 +229,27 @@ If lawful, repeat for seeds `42`, `8675309`, and `2026`. Promote 1024 only
 when its three-seed median quality is not worse, throughput is at least 90% of
 the 512 control, numerical integrity is perfect, and checkpoint resume passes.
 
+### Promotion-runner admission smoke
+
+The paired successor runner passed one real optimizer step for both variants
+before the 100M launch:
+
+```text
+INITIAL_MODEL_ROOT_BOTH=
+2c61d9764e6109f61a1c4a7f5c3ae56325301072cdf1fc602221be5279295f59
+
+RAW_TOKENS_PER_UPDATE_BOTH=43_008
+CAUSAL_TARGETS_PER_UPDATE_BOTH=42_924
+CHECKPOINT_READBACK_BOTH=PASS
+MLFLOW_ERRORS_BOTH=[]
+
+SEQ512_MLFLOW_RUN=956b9b8a2c614396859cf8cbc544ba62
+SEQ1024_MLFLOW_RUN=439f9074f25f4ed3817c29118c1bbd68
+```
+
+The exact smoke packet is committed at
+`experiments/branch50-linear-context-v0/evidence/quality-promotion-smoke-pair.json`.
+
 ## Lighteval publication gate
 
 The project is **Lighteval** (not LiteEval). It must run before any checkpoint

@@ -11,6 +11,8 @@ Included:
 - `evidence/real-corpus-1024-terminal.json` — terminal for the 100-step,
   1024-token real-corpus smoke.
 - `evidence/real-corpus-1024-config.json` — the material resolved Helix config.
+- `evidence/quality-promotion-smoke-pair.json` — matched one-step admission
+  evidence for the paired 512/1024 quality runner.
 - `evidence/SHA256SUMS` — roots for the committed packet.
 - `executed/` — byte-exact copies of the two Python harnesses, launcher, and
   shared-runner receipt used for the admitted court.

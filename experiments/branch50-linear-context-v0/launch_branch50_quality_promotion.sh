@@ -15,6 +15,19 @@ mkdir -p "$LOG_ROOT"
 export HELIX_BRANCH50_RUN_ROOT="$RUN_ROOT"
 export PYTHONHASHSEED=0
 
+wait_for_gpu() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if nvidia-smi -L >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "REFUSED: RTX 5080 driver unavailable after 30 bounded probes" >&2
+  return 74
+}
+
+wait_for_gpu
 "$PYTHON" "$RUNNER" \
   --seq-len 512 \
   --batch-size 12 \
@@ -26,6 +39,7 @@ export PYTHONHASHSEED=0
   --seed "$SEED" \
   2>&1 | tee "$LOG_ROOT/seq512-seed${SEED}-${STAMP}.log"
 
+wait_for_gpu
 "$PYTHON" "$RUNNER" \
   --seq-len 1024 \
   --batch-size 6 \

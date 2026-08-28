@@ -1,0 +1,29 @@
+{
+  "admission": "PASS",
+  "causal_targets_per_optimizer_step": 42924,
+  "initial_model_root": "2c61d9764e6109f61a1c4a7f5c3ae56325301072cdf1fc602221be5279295f59",
+  "raw_tokens_per_optimizer_step": 43008,
+  "seed": 42,
+  "variants": [
+    {
+      "batch_size": 12,
+      "checkpoint_readback": "PASS",
+      "checkpoint_sha256": "ba5e4887a8a7e9e01be0d69f80321a270b59188822020d20c708a877eb18fd4b",
+      "mlflow_errors": [],
+      "mlflow_run_id": "956b9b8a2c614396859cf8cbc544ba62",
+      "peak_vram_bytes": 11609451008,
+      "seq_len": 512,
+      "steps": 1
+    },
+    {
+      "batch_size": 6,
+      "checkpoint_readback": "PASS",
+      "checkpoint_sha256": "d85ff39e63a9babe5b91314f14453c7eceea555ccdc6e2dcabca42ec4bcd0799",
+      "mlflow_errors": [],
+      "mlflow_run_id": "439f9074f25f4ed3817c29118c1bbd68",
+      "peak_vram_bytes": 11602108416,
+      "seq_len": 1024,
+      "steps": 1
+    }
+  ]
+}
