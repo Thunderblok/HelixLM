@@ -1,0 +1,21 @@
+{
+  "batch_size": 6,
+  "causal_targets_per_optimizer_step": 42966,
+  "data_offset": {
+    "causal_targets_seen": 4296600,
+    "epoch": 0,
+    "raw_tokens_seen": 4300800,
+    "samples_seen": 4200,
+    "shard_position": 0,
+    "window_position": 4200
+  },
+  "grad_accum": 7,
+  "mlflow_errors": [],
+  "mlflow_run_id": "8e1f6c8b33c048cba447e87ee0a1c505",
+  "peak_vram_bytes": 12651372544,
+  "raw_tokens_per_optimizer_step": 43008,
+  "run_root": "/home/mo/DEV/experiments/helix-branch50-linear-context-v0/artifacts/branch50-linear-context-s1024-b6-a7-steps100-20260828T204229Z",
+  "seq_len": 1024,
+  "status": "PASS",
+  "steps": 100
+}

@@ -1,6 +1,22 @@
 
 # HelixLM: Recurrent Heterogeneous Graph Neural Language Model
 
+## Branch 50 linear-context research lane
+
+Branch `50-from-49-linear-context-scaling` carries the reproducible evidence
+and operator record for the RTX 5080 context-scaling campaign. Start with
+[HELIX_BRANCH50_OPERATOR_HANDBOOK.md](HELIX_BRANCH50_OPERATOR_HANDBOOK.md) and
+the compact evidence packet under
+[`experiments/branch50-linear-context-v0`](experiments/branch50-linear-context-v0/README.md).
+
+The admitted result is deliberately bounded: the fixed Branch-49 multiscale
+configuration exhibited approximately linear forward/backward FLOPs and
+context-dependent allocated memory at sequence lengths 512, 1024, and 2048;
+a real-corpus 1024-token smoke completed 100 optimizer steps. This is not yet a
+quality promotion, a 2048-token corpus result, or authority to publish weights.
+Any eventual model release must pass the Lighteval gate documented in the
+handbook.
+
 > **Why "Helix"?** A helix coils back on itself, just as our recurrent graph reuses its weights across depth iterations, refining understanding with each loop. Biological, elegant, memorable.
 
 HelixLM is an optimized hybrid architecture for small-scale language modeling, designed for **hyperpersonalization** and **on-device AI**. It combines biological brain-inspired random graph wiring with modern SOTA primitives (hybrid attention, Mamba-2 SSD, RoPE, SwiGLU, RMSNorm, optional Titans neural memory) and full HuggingFace integration.
