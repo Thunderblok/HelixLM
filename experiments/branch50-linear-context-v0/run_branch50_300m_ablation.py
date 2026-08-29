@@ -16,7 +16,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import torch
@@ -38,6 +38,272 @@ EXPECTED_PARAMETER_COUNT = 53_592_340
 GPT2_SPECIAL_ID = 50_256
 SEQ_LEN = 512
 CAUSAL_TARGETS_PER_SAMPLE = SEQ_LEN - 1
+
+
+def build_scheduler_state(
+    *,
+    policy: str,
+    base_lr: float,
+    warmup_microbatches: int,
+    grad_accum: int,
+    total_optimizer_steps: int,
+    min_lr_ratio: float,
+) -> dict[str, Any]:
+    warmup_optimizer_steps = max(1, warmup_microbatches // grad_accum)
+    if policy == "linear_warmup_then_constant" and min_lr_ratio != 1.0:
+        raise SystemExit(
+            "REFUSED: scheduler_min_lr_ratio is only active with cosine_decay"
+        )
+    if policy == "cosine_decay" and total_optimizer_steps <= warmup_optimizer_steps:
+        raise SystemExit(
+            "REFUSED: cosine_decay requires total optimizer steps beyond warmup"
+        )
+    return {
+        "type": policy,
+        "base_lr": base_lr,
+        "warmup_microbatches": warmup_microbatches,
+        "grad_accum": grad_accum,
+        "warmup_optimizer_steps": warmup_optimizer_steps,
+        "total_optimizer_steps": total_optimizer_steps,
+        "minimum_lr_ratio_after_warmup": min_lr_ratio,
+    }
+
+
+def optimizer_lr_for_step(
+    *,
+    base_lr: float,
+    optimizer_step_number: int,
+    warmup_optimizer_steps: int,
+    total_optimizer_steps: int,
+    min_lr_ratio: float,
+    policy: str,
+) -> float:
+    if warmup_optimizer_steps <= 0:
+        return base_lr
+    bounded_step = max(1, optimizer_step_number)
+    if bounded_step <= warmup_optimizer_steps:
+        return base_lr * min(1.0, bounded_step / warmup_optimizer_steps)
+    if policy == "linear_warmup_then_constant":
+        return base_lr
+    if policy == "cosine_decay":
+        decay_steps = max(1, total_optimizer_steps - warmup_optimizer_steps)
+        progress = min(1.0, (bounded_step - warmup_optimizer_steps) / decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+    raise SystemExit(f"REFUSED: unsupported scheduler policy: {policy}")
+
+
+def set_optimizer_lr(
+    optimizer: torch.optim.Optimizer,
+    *,
+    base_lr: float,
+    optimizer_step_number: int,
+    warmup_optimizer_steps: int,
+    total_optimizer_steps: int,
+    min_lr_ratio: float,
+    policy: str,
+) -> float:
+    lr = optimizer_lr_for_step(
+        base_lr=base_lr,
+        optimizer_step_number=optimizer_step_number,
+        warmup_optimizer_steps=warmup_optimizer_steps,
+        total_optimizer_steps=total_optimizer_steps,
+        min_lr_ratio=min_lr_ratio,
+        policy=policy,
+    )
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
+def corpus_pass_plan(
+    train_manifest: dict[str, Any],
+    *,
+    seq_len: int,
+    batch_size: int,
+    grad_accum: int,
+) -> dict[str, int]:
+    raw_tokens = int(train_manifest.get("tokens", 0))
+    if raw_tokens < seq_len or raw_tokens % seq_len != 0:
+        raise SystemExit(
+            "REFUSED: full-corpus pass requires manifest tokens to be an exact "
+            f"multiple of seq_len={seq_len}; tokens={raw_tokens}"
+        )
+    total_samples = raw_tokens // seq_len
+    causal_targets = total_samples * (seq_len - 1)
+    samples_per_full_step = batch_size * grad_accum
+    full_optimizer_steps = total_samples // samples_per_full_step
+    remaining_samples = total_samples % samples_per_full_step
+    optimizer_steps = full_optimizer_steps + (1 if remaining_samples else 0)
+    return {
+        "raw_tokens": raw_tokens,
+        "total_samples": total_samples,
+        "causal_targets": causal_targets,
+        "samples_per_full_optimizer_step": samples_per_full_step,
+        "full_optimizer_steps": full_optimizer_steps,
+        "remaining_samples": remaining_samples,
+        "optimizer_steps": optimizer_steps,
+    }
+
+
+def diminishing_return_decision(
+    validation_history: list[dict[str, Any]],
+    *,
+    window_evals: int,
+    min_improvement: float,
+    patience_windows: int,
+    min_optimizer_steps: int,
+) -> dict[str, Any]:
+    if window_evals <= 0 or patience_windows <= 0:
+        return {"enabled": False, "should_stop": False, "bad_windows": 0}
+    if len(validation_history) < window_evals + 1:
+        return {"enabled": True, "should_stop": False, "bad_windows": 0}
+    current_step = int(validation_history[-1]["step"])
+    if current_step < min_optimizer_steps:
+        return {"enabled": True, "should_stop": False, "bad_windows": 0}
+
+    bad_windows = 0
+    last_improvement: float | None = None
+    for end in range(len(validation_history), window_evals, -1):
+        start = end - window_evals
+        previous = validation_history[:start]
+        current = validation_history[start:end]
+        if not previous:
+            break
+        previous_best = min(float(item["val_loss"]) for item in previous)
+        current_best = min(float(item["val_loss"]) for item in current)
+        improvement = previous_best - current_best
+        last_improvement = improvement
+        if improvement < min_improvement:
+            bad_windows += 1
+            continue
+        break
+
+    return {
+        "enabled": True,
+        "should_stop": bad_windows >= patience_windows,
+        "bad_windows": bad_windows,
+        "last_window_improvement": last_improvement,
+        "window_evals": window_evals,
+        "min_improvement": min_improvement,
+        "patience_windows": patience_windows,
+        "min_optimizer_steps": min_optimizer_steps,
+    }
+
+
+def terminal_status_record(
+    *,
+    max_optimizer_steps: int,
+    stop_state: dict[str, Any],
+    mlflow_errors: list[Any],
+) -> dict[str, Any]:
+    status = "SMOKE_PASS" if max_optimizer_steps else "PASS"
+    promotion_eligible = not bool(max_optimizer_steps)
+    if stop_state.get("stop_reason") == "diminishing_return":
+        status = "STOPPED_DIMINISHING_RETURN"
+        promotion_eligible = False
+    if mlflow_errors:
+        status = "HOLD_MLFLOW_ERRORS"
+        promotion_eligible = False
+    return {
+        "status": status,
+        "promotion_eligible": promotion_eligible,
+        "numerical_health": "PASS",
+        "checkpoint_health": "PASS",
+        "mlflow_health": "PASS" if not mlflow_errors else "HOLD",
+    }
+
+
+def checkpoint_payload(
+    common: Any,
+    *,
+    model_state: dict[str, torch.Tensor],
+    model_root: str,
+    optimizer_state: dict[str, Any],
+    step: int,
+    data_offset: Any,
+    scheduler: dict[str, Any],
+    manifest_roots: dict[str, str],
+    ablation_contract: dict[str, Any],
+    best_val_loss: float,
+    best_val_step: int,
+    last_val_loss: float | None,
+    validation_history: list[dict[str, Any]],
+    stop_state: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "model": model_state,
+        "model_root": model_root,
+        "optimizer": optimizer_state,
+        "optimizer_state_entries": len(optimizer_state["state"]),
+        "step": int(step),
+        "data_offset": asdict(data_offset),
+        "rng_state": common.get_rng_state(),
+        "scheduler": scheduler,
+        "manifest_roots": manifest_roots,
+        "ablation_contract": ablation_contract,
+        "ablation_contract_root": canonical_root(ablation_contract),
+        "best_val_loss": best_val_loss,
+        "best_val_step": best_val_step,
+        "last_val_loss": last_val_loss,
+        "validation_history": validation_history,
+        "stop_state": stop_state,
+    }
+
+
+def iter_batches_with_policy(
+    sample_iter: Iterator[tuple[torch.Tensor, Any]],
+    *,
+    batch_size: int,
+    allow_partial_batch: bool,
+) -> Iterator[tuple[dict[str, torch.Tensor], Any]]:
+    while True:
+        rows: list[torch.Tensor] = []
+        last_offset: Any | None = None
+        try:
+            for _ in range(batch_size):
+                row, last_offset = next(sample_iter)
+                rows.append(row)
+        except StopIteration:
+            if not allow_partial_batch or not rows or last_offset is None:
+                return
+        if not rows or last_offset is None:
+            return
+        if len(rows) != batch_size and not allow_partial_batch:
+            return
+        input_ids = torch.stack(rows)
+        yield {
+            "input_ids": input_ids,
+            "labels": input_ids.clone(),
+            "attention_mask": torch.ones_like(input_ids),
+        }, last_offset
+        if len(rows) != batch_size:
+            return
+
+
+def iter_accumulation_groups(
+    sample_iter: Iterator[tuple[torch.Tensor, Any]],
+    *,
+    batch_size: int,
+    grad_accum: int,
+    allow_partial_batch: bool,
+    allow_partial_accumulation: bool,
+) -> Iterator[list[tuple[dict[str, torch.Tensor], Any]]]:
+    batch_iter = iter_batches_with_policy(
+        sample_iter,
+        batch_size=batch_size,
+        allow_partial_batch=allow_partial_batch,
+    )
+    while True:
+        group: list[tuple[dict[str, torch.Tensor], Any]] = []
+        try:
+            for _ in range(grad_accum):
+                group.append(next(batch_iter))
+        except StopIteration:
+            if allow_partial_accumulation and group:
+                yield group
+            return
+        yield group
 
 
 def sha256(path: Path) -> str:
@@ -169,28 +435,30 @@ def save_ablation_checkpoint(
     best_val_loss: float,
     best_val_step: int,
     last_val_loss: float | None,
+    validation_history: list[dict[str, Any]],
+    stop_state: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     model_root = model_state_root(model)
     optimizer_state = optimizer.state_dict()
     torch.save(
-        {
-            "model": model.state_dict(),
-            "model_root": model_root,
-            "optimizer": optimizer_state,
-            "optimizer_state_entries": len(optimizer_state["state"]),
-            "step": int(step),
-            "data_offset": asdict(data_offset),
-            "rng_state": common.get_rng_state(),
-            "scheduler": scheduler,
-            "manifest_roots": manifest_roots,
-            "ablation_contract": ablation_contract,
-            "ablation_contract_root": canonical_root(ablation_contract),
-            "best_val_loss": best_val_loss,
-            "best_val_step": best_val_step,
-            "last_val_loss": last_val_loss,
-        },
+        checkpoint_payload(
+            common,
+            model_state=model.state_dict(),
+            model_root=model_root,
+            optimizer_state=optimizer_state,
+            step=step,
+            data_offset=data_offset,
+            scheduler=scheduler,
+            manifest_roots=manifest_roots,
+            ablation_contract=ablation_contract,
+            best_val_loss=best_val_loss,
+            best_val_step=best_val_step,
+            last_val_loss=last_val_loss,
+            validation_history=validation_history,
+            stop_state=stop_state,
+        ),
         temporary,
     )
     os.replace(temporary, path)
@@ -245,6 +513,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
     parser.add_argument("--warmup-microbatches", type=int, default=2_000)
+    parser.add_argument(
+        "--scheduler-policy",
+        choices=("linear_warmup_then_constant", "cosine_decay"),
+        default="linear_warmup_then_constant",
+    )
+    parser.add_argument("--scheduler-min-lr-ratio", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--dropout", type=float, default=0.05)
@@ -254,6 +528,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--max-optimizer-steps", type=int, default=0)
     parser.add_argument("--skip-shard-sha256", action="store_true")
+    parser.add_argument("--full-corpus-pass", action="store_true")
+    parser.add_argument("--expected-full-corpus-raw-tokens", type=int, default=1_504_000_000)
+    parser.add_argument("--diminishing-window-evals", type=int, default=0)
+    parser.add_argument("--diminishing-min-improvement", type=float, default=0.0)
+    parser.add_argument("--diminishing-patience-windows", type=int, default=0)
+    parser.add_argument("--diminishing-min-optimizer-steps", type=int, default=0)
     return parser.parse_args()
 
 
@@ -278,16 +558,40 @@ def main() -> None:
         or args.validation_batches < 1
         or args.learning_rate <= 0
         or args.warmup_microbatches < 0
+        or not 0 < args.scheduler_min_lr_ratio <= 1
         or args.weight_decay < 0
         or args.grad_clip <= 0
         or not 0 <= args.dropout < 1
         or not 0 <= args.attention_dropout < 1
         or args.ffn_expansion <= 0
+        or args.diminishing_window_evals < 0
+        or args.diminishing_min_improvement < 0
+        or args.diminishing_patience_windows < 0
+        or args.diminishing_min_optimizer_steps < 0
     ):
         raise SystemExit("REFUSED: invalid ablation settings")
+    diminishing_enabled = (
+        args.diminishing_window_evals > 0
+        or args.diminishing_min_improvement > 0
+        or args.diminishing_patience_windows > 0
+        or args.diminishing_min_optimizer_steps > 0
+    )
+    if diminishing_enabled and (
+        args.diminishing_window_evals < 1
+        or args.diminishing_patience_windows < 1
+        or args.diminishing_min_optimizer_steps < 1
+    ):
+        raise SystemExit(
+            "REFUSED: diminishing-return stop requires positive window, patience, "
+            "and minimum optimizer steps"
+        )
+    if args.full_corpus_pass and args.max_optimizer_steps:
+        raise SystemExit("REFUSED: full-corpus pass cannot be combined with max-optimizer-steps")
     baseline_knobs = {
         "learning_rate": 1.5e-4,
         "warmup_microbatches": 2_000,
+        "scheduler_policy": "linear_warmup_then_constant",
+        "scheduler_min_lr_ratio": 1.0,
         "weight_decay": 0.05,
         "grad_clip": 1.0,
         "dropout": 0.05,
@@ -297,6 +601,8 @@ def main() -> None:
     resolved_knobs = {
         "learning_rate": args.learning_rate,
         "warmup_microbatches": args.warmup_microbatches,
+        "scheduler_policy": args.scheduler_policy,
+        "scheduler_min_lr_ratio": args.scheduler_min_lr_ratio,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
         "dropout": args.dropout,
@@ -304,8 +610,16 @@ def main() -> None:
         "ffn_expansion": args.ffn_expansion,
     }
     changed_knobs = [
-        key for key, baseline in baseline_knobs.items() if resolved_knobs[key] != baseline
+        key
+        for key, baseline in baseline_knobs.items()
+        if not key.startswith("scheduler_") and resolved_knobs[key] != baseline
     ]
+    if (
+        resolved_knobs["scheduler_policy"] != baseline_knobs["scheduler_policy"]
+        or resolved_knobs["scheduler_min_lr_ratio"]
+        != baseline_knobs["scheduler_min_lr_ratio"]
+    ):
+        changed_knobs.append("scheduler")
     if args.ablation_id == "control":
         if changed_knobs:
             raise SystemExit(f"REFUSED: control changes knobs: {changed_knobs}")
@@ -383,8 +697,28 @@ def main() -> None:
     warmup_optimizer_steps = max(1, cfg.warmup_steps // args.grad_accum)
     causal_targets_per_step = args.batch_size * args.grad_accum * CAUSAL_TARGETS_PER_SAMPLE
     raw_tokens_per_step = args.batch_size * args.grad_accum * SEQ_LEN
-    steps = math.ceil(args.target_causal_targets / causal_targets_per_step)
-    aligned_target_causal_targets = steps * causal_targets_per_step
+    full_corpus_plan = None
+    if args.full_corpus_pass:
+        full_corpus_plan = corpus_pass_plan(
+            train_manifest,
+            seq_len=SEQ_LEN,
+            batch_size=args.batch_size,
+            grad_accum=args.grad_accum,
+        )
+        if full_corpus_plan["raw_tokens"] != args.expected_full_corpus_raw_tokens:
+            raise SystemExit(
+                "REFUSED: full-corpus manifest token count mismatch: "
+                f"{full_corpus_plan['raw_tokens']} != {args.expected_full_corpus_raw_tokens}"
+            )
+        steps = full_corpus_plan["optimizer_steps"]
+        target_causal_targets = full_corpus_plan["causal_targets"]
+        aligned_target_causal_targets = full_corpus_plan["causal_targets"]
+        target_raw_tokens = full_corpus_plan["raw_tokens"]
+    else:
+        steps = math.ceil(args.target_causal_targets / causal_targets_per_step)
+        target_causal_targets = args.target_causal_targets
+        aligned_target_causal_targets = steps * causal_targets_per_step
+        target_raw_tokens = steps * raw_tokens_per_step
     manifest_roots = {
         "train_manifest_sha256": common.manifest_root(train_manifest),
         "val_manifest_sha256": common.manifest_root(val_manifest),
@@ -397,25 +731,44 @@ def main() -> None:
         "seq_len": SEQ_LEN,
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,
-        "target_causal_targets": args.target_causal_targets,
+        "target_causal_targets": target_causal_targets,
+        "target_raw_tokens": target_raw_tokens,
         "eval_every": args.eval_every,
         "checkpoint_every": args.checkpoint_every,
         "validation_batches": args.validation_batches,
         "seed": args.seed,
         "manifest_roots": manifest_roots,
         "source_identity": source_identity,
+        "full_corpus_pass": args.full_corpus_pass,
+        "expected_full_corpus_raw_tokens": args.expected_full_corpus_raw_tokens,
+        "full_corpus_plan": full_corpus_plan,
+        "diminishing_return": {
+            "enabled": diminishing_enabled,
+            "window_evals": args.diminishing_window_evals,
+            "min_improvement": args.diminishing_min_improvement,
+            "patience_windows": args.diminishing_patience_windows,
+            "min_optimizer_steps": args.diminishing_min_optimizer_steps,
+        },
     }
 
-    schedule = common.scheduler_state(
+    schedule = build_scheduler_state(
+        policy=args.scheduler_policy,
         base_lr=cfg.lr,
         warmup_microbatches=cfg.warmup_steps,
         grad_accum=args.grad_accum,
+        total_optimizer_steps=steps,
+        min_lr_ratio=args.scheduler_min_lr_ratio,
     )
     step = 0
     offset = common.DataOffset()
     best_val_loss = math.inf
     best_val_step = 0
     last_val_loss: float | None = None
+    validation_history: list[dict[str, Any]] = []
+    stop_state: dict[str, Any] = {
+        "stop_reason": "target_reached",
+        "diminishing_decision": {"enabled": diminishing_enabled, "should_stop": False},
+    }
     if args.resume:
         state = torch.load(args.resume, map_location="cpu", weights_only=True)
         if state.get("manifest_roots") != manifest_roots:
@@ -431,12 +784,14 @@ def main() -> None:
         best_val_loss = float(state.get("best_val_loss", math.inf))
         best_val_step = int(state.get("best_val_step", 0))
         last_val_loss = state.get("last_val_loss")
+        validation_history = list(state.get("validation_history", []))
+        stop_state = dict(state.get("stop_state", stop_state))
         common.set_rng_state(state.get("rng_state"))
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_name = (
         f"branch50-ablation-{args.ablation_id}-s512-b{args.batch_size}"
-        f"-a{args.grad_accum}-t{args.target_causal_targets}-{stamp}"
+        f"-a{args.grad_accum}-t{target_causal_targets}-{stamp}"
     )
     run_root = RUN_ROOT / "artifacts" / "ablation-300m-v0" / run_name
     run_root.mkdir(parents=True, exist_ok=False)
@@ -464,8 +819,14 @@ def main() -> None:
             "effective_sequences": args.batch_size * args.grad_accum,
             "raw_tokens_per_optimizer_step": raw_tokens_per_step,
             "causal_targets_per_optimizer_step": causal_targets_per_step,
-            "target_causal_targets": args.target_causal_targets,
+            "target_causal_targets": target_causal_targets,
             "aligned_target_causal_targets": aligned_target_causal_targets,
+            "target_raw_tokens": target_raw_tokens,
+            "full_corpus_pass": args.full_corpus_pass,
+            "expected_full_corpus_raw_tokens": args.expected_full_corpus_raw_tokens,
+            "full_corpus_raw_tokens": full_corpus_plan["raw_tokens"] if full_corpus_plan else "none",
+            "full_corpus_samples": full_corpus_plan["total_samples"] if full_corpus_plan else "none",
+            "full_corpus_remaining_samples": full_corpus_plan["remaining_samples"] if full_corpus_plan else "none",
             "steps": steps,
             "resume_checkpoint": str(args.resume) if args.resume else "none",
             "resume_step": step,
@@ -484,6 +845,7 @@ def main() -> None:
             "warmup_microbatches": cfg.warmup_steps,
             "warmup_optimizer_steps": warmup_optimizer_steps,
             "scheduler_policy": schedule["type"],
+            "scheduler_total_optimizer_steps": schedule["total_optimizer_steps"],
             "scheduler_min_lr_ratio": schedule["minimum_lr_ratio_after_warmup"],
             "weight_decay": cfg.weight_decay,
             "grad_clip": cfg.grad_clip,
@@ -497,6 +859,11 @@ def main() -> None:
             "validation_batches": args.validation_batches,
             "single_knob_contract": True,
             "shard_sha256_verified": not args.skip_shard_sha256,
+            "diminishing_return_enabled": diminishing_enabled,
+            "diminishing_window_evals": args.diminishing_window_evals,
+            "diminishing_min_improvement": args.diminishing_min_improvement,
+            "diminishing_patience_windows": args.diminishing_patience_windows,
+            "diminishing_min_optimizer_steps": args.diminishing_min_optimizer_steps,
         },
         tags={
             "run_kind": "branch50_300m_single_knob_ablation_v0",
@@ -527,36 +894,54 @@ def main() -> None:
     session_start_raw_tokens = offset.raw_tokens_seen
     session_start_causal_targets = offset.causal_targets_seen
     run_status = "FINISHED"
-    common.set_optimizer_lr(
+    set_optimizer_lr(
         optimizer,
         base_lr=cfg.lr,
         optimizer_step_number=step + 1,
         warmup_optimizer_steps=warmup_optimizer_steps,
+        total_optimizer_steps=steps,
+        min_lr_ratio=args.scheduler_min_lr_ratio,
+        policy=args.scheduler_policy,
     )
     try:
-        for batch, batch_offset in common.iter_batches(sample_iter, batch_size=args.batch_size):
+        group_iter = iter_accumulation_groups(
+            sample_iter,
+            batch_size=args.batch_size,
+            grad_accum=args.grad_accum,
+            allow_partial_batch=args.full_corpus_pass,
+            allow_partial_accumulation=args.full_corpus_pass,
+        )
+        for group in group_iter:
+            should_stop_now = False
             if args.max_optimizer_steps and step >= args.max_optimizer_steps:
                 break
-            device_batch = common.to_device(batch, device=device)
-            with autocast:
-                output = model(**device_batch, return_dict=True)
-                loss = output.loss
-            if loss is None or not torch.isfinite(loss):
-                raise RuntimeError(f"NONFINITE_LOSS step={step}")
-            targets = common.count_causal_targets(device_batch["labels"])
-            (loss / args.grad_accum).backward()
-            losses.append((float(loss.detach().cpu()), targets))
-            offset = batch_offset
-            if len(losses) < args.grad_accum:
-                continue
+            group_targets = sum(
+                common.count_causal_targets(batch["labels"]) for batch, _ in group
+            )
+            if group_targets <= 0:
+                raise RuntimeError(f"EMPTY_ACCUMULATION_GROUP step={step}")
+            for batch, batch_offset in group:
+                device_batch = common.to_device(batch, device=device)
+                with autocast:
+                    output = model(**device_batch, return_dict=True)
+                    loss = output.loss
+                if loss is None or not torch.isfinite(loss):
+                    raise RuntimeError(f"NONFINITE_LOSS step={step}")
+                targets = common.count_causal_targets(device_batch["labels"])
+                (loss * (targets / group_targets)).backward()
+                losses.append((float(loss.detach().cpu()), targets))
+                offset = batch_offset
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             if not torch.isfinite(grad_norm):
                 raise RuntimeError(f"NONFINITE_GRAD_NORM step={step}")
-            lr = common.set_optimizer_lr(
+            lr = set_optimizer_lr(
                 optimizer,
                 base_lr=cfg.lr,
                 optimizer_step_number=step + 1,
                 warmup_optimizer_steps=warmup_optimizer_steps,
+                total_optimizer_steps=steps,
+                min_lr_ratio=args.scheduler_min_lr_ratio,
+                policy=args.scheduler_policy,
             )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -588,36 +973,12 @@ def main() -> None:
                     "system/peak_vram_bytes": float(torch.cuda.max_memory_allocated()),
                     "train/skipped_batches": 0.0,
                     "train/nonfinite_events": 0.0,
+                    "train/accum_microbatches": float(len(losses)),
+                    "train/accum_samples": float(group[-1][1].samples_seen - (group[0][1].samples_seen - group[0][0]["input_ids"].shape[0])),
                 },
                 step=step,
             )
             losses.clear()
-
-            if step % args.checkpoint_every == 0:
-                checkpoint = save_rotating_checkpoint(
-                    common,
-                    run_root / "checkpoints",
-                    model=model,
-                    optimizer=optimizer,
-                    step=step,
-                    data_offset=offset,
-                    scheduler=schedule,
-                    manifest_roots=manifest_roots,
-                    ablation_contract=ablation_contract,
-                    best_val_loss=best_val_loss,
-                    best_val_step=best_val_step,
-                    last_val_loss=last_val_loss,
-                )
-                logger._append(
-                    {
-                        "event": "checkpoint",
-                        "step": step,
-                        "path": str(checkpoint),
-                        "sha256": sha256(checkpoint),
-                        "data_offset": asdict(offset),
-                        "ts": time.time(),
-                    }
-                )
 
             if step % args.eval_every == 0 or step == steps:
                 model.eval()
@@ -648,6 +1009,14 @@ def main() -> None:
                         val_targets += count
                 val_loss = val_sum / max(val_targets, 1)
                 last_val_loss = val_loss
+                validation_history.append(
+                    {
+                        "step": step,
+                        "val_loss": val_loss,
+                        "val_ppl": common.perplexity(val_loss),
+                        "val_targets": val_targets,
+                    }
+                )
                 improved = val_loss < best_val_loss
                 if improved:
                     best_val_loss = val_loss
@@ -673,8 +1042,68 @@ def main() -> None:
                     step=step,
                     phase="validation",
                 )
+                decision = diminishing_return_decision(
+                    validation_history,
+                    window_evals=args.diminishing_window_evals,
+                    min_improvement=args.diminishing_min_improvement,
+                    patience_windows=args.diminishing_patience_windows,
+                    min_optimizer_steps=args.diminishing_min_optimizer_steps,
+                )
+                stop_state = {
+                    "stop_reason": "diminishing_return"
+                    if decision.get("should_stop")
+                    else "target_reached",
+                    "diminishing_decision": decision,
+                }
+                if decision.get("enabled"):
+                    logger.log_metrics(
+                        {
+                            "diminishing/bad_windows": float(decision.get("bad_windows", 0)),
+                            "diminishing/last_window_improvement": float(
+                                decision.get("last_window_improvement", 0.0) or 0.0
+                            ),
+                            "diminishing/should_stop": 1.0
+                            if decision.get("should_stop")
+                            else 0.0,
+                        },
+                        step=step,
+                        phase="validation",
+                    )
                 model.train()
                 torch.cuda.empty_cache()
+                if decision.get("should_stop"):
+                    should_stop_now = True
+            if step % args.checkpoint_every == 0:
+                checkpoint = save_rotating_checkpoint(
+                    common,
+                    run_root / "checkpoints",
+                    model=model,
+                    optimizer=optimizer,
+                    step=step,
+                    data_offset=offset,
+                    scheduler=schedule,
+                    manifest_roots=manifest_roots,
+                    ablation_contract=ablation_contract,
+                    best_val_loss=best_val_loss,
+                    best_val_step=best_val_step,
+                    last_val_loss=last_val_loss,
+                    validation_history=validation_history,
+                    stop_state=stop_state,
+                )
+                logger._append(
+                    {
+                        "event": "checkpoint",
+                        "step": step,
+                        "path": str(checkpoint),
+                        "sha256": sha256(checkpoint),
+                        "data_offset": asdict(offset),
+                        "validation_history_len": len(validation_history),
+                        "stop_state": stop_state,
+                        "ts": time.time(),
+                    }
+                )
+            if should_stop_now:
+                break
             if step >= steps or (args.max_optimizer_steps and step >= args.max_optimizer_steps):
                 break
 
@@ -692,6 +1121,8 @@ def main() -> None:
             best_val_loss=best_val_loss,
             best_val_step=best_val_step,
             last_val_loss=last_val_loss,
+            validation_history=validation_history,
+            stop_state=stop_state,
         )
         logger._append(
             {
@@ -729,6 +1160,8 @@ def main() -> None:
             and float(restored["best_val_loss"]) == best_val_loss
             and int(restored["best_val_step"]) == best_val_step
             and restored["last_val_loss"] == last_val_loss
+            and restored["validation_history"] == validation_history
+            and restored["stop_state"] == stop_state
             and best_checkpoint_ok
         )
         if not restore_ok:
@@ -756,11 +1189,13 @@ def main() -> None:
     finally:
         logger.finish(status=run_status)
 
-    terminal_status = "SMOKE_PASS" if args.max_optimizer_steps else "PASS"
-    if logger.mlflow_errors:
-        terminal_status = "HOLD_MLFLOW_ERRORS"
+    terminal_record = terminal_status_record(
+        max_optimizer_steps=args.max_optimizer_steps,
+        stop_state=stop_state,
+        mlflow_errors=logger.mlflow_errors,
+    )
     terminal = {
-        "status": terminal_status,
+        **terminal_record,
         "steps": step,
         "ablation_id": args.ablation_id,
         "seq_len": SEQ_LEN,
@@ -768,8 +1203,12 @@ def main() -> None:
         "grad_accum": args.grad_accum,
         "raw_tokens_per_optimizer_step": raw_tokens_per_step,
         "causal_targets_per_optimizer_step": causal_targets_per_step,
-        "target_causal_targets": args.target_causal_targets,
+        "target_causal_targets": target_causal_targets,
         "aligned_target_causal_targets": aligned_target_causal_targets,
+        "target_raw_tokens": target_raw_tokens,
+        "full_corpus_pass": args.full_corpus_pass,
+        "expected_full_corpus_raw_tokens": args.expected_full_corpus_raw_tokens,
+        "full_corpus_plan": full_corpus_plan,
         "initial_model_root": initial_model_root,
         "final_model_root": restored_model_root,
         "parameter_count": params,
@@ -780,6 +1219,13 @@ def main() -> None:
         "dropout": cfg.dropout,
         "attention_dropout": cfg.attn_dropout,
         "ffn_expansion": cfg.ffn_expansion,
+        "scheduler_policy": args.scheduler_policy,
+        "scheduler_min_lr_ratio": args.scheduler_min_lr_ratio,
+        "scheduler": schedule,
+        "checkpoint_every": args.checkpoint_every,
+        "eval_every": args.eval_every,
+        "validation_history": validation_history,
+        "stop_state": stop_state,
         "last_val_loss": last_val_loss,
         "last_val_ppl": common.perplexity(last_val_loss)
         if last_val_loss is not None
