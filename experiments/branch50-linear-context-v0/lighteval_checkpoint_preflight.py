@@ -12,7 +12,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -69,6 +71,107 @@ def artifact_manifest(root: Path) -> list[dict[str, Any]]:
             }
         )
     return entries
+
+
+def independent_reload_court(
+    *,
+    export_dir: Path,
+    source_root: Path,
+    expected_model_root: str,
+) -> dict[str, Any]:
+    """Reload the export in a fresh process using the exact registered source.
+
+    Transformers 5.8.1 cannot reliably reconstruct Helix's transitive custom
+    module graph from a local ``trust_remote_code`` export: its local dynamic
+    module copier copies direct imports, while its hash walk expects transitive
+    imports to be present.  Lighteval therefore binds the exact Helix source,
+    registers its AutoClasses, and loads weights with remote code disabled.
+    """
+
+    code = r'''
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+export_dir = Path(sys.argv[1]).resolve()
+source_root = Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(source_root))
+
+from helix_lm.hf_model import HelixForCausalLM  # noqa: F401
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    export_dir,
+    trust_remote_code=False,
+    dtype=torch.float32,
+    low_cpu_mem_usage=False,
+)
+
+digest = hashlib.sha256()
+with torch.no_grad():
+    for name, tensor in model.state_dict().items():
+        contiguous = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(contiguous.dtype).encode("ascii"))
+        digest.update(json.dumps(list(contiguous.shape)).encode("ascii"))
+        digest.update(contiguous.numpy().tobytes())
+
+tie_required = bool(model.config.tie_word_embeddings)
+tie_observed = model.lm_head.weight.data_ptr() == model.model.embed.weight.data_ptr()
+print(json.dumps({
+    "class_module": type(model).__module__,
+    "class_name": type(model).__name__,
+    "model_root": digest.hexdigest(),
+    "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+    "registered_source_required": True,
+    "trust_remote_code": False,
+    "tie_word_embeddings": tie_required,
+    "tied_weight_alias_observed": tie_observed,
+}, sort_keys=True))
+'''
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(source_root)
+        if not existing_pythonpath
+        else os.pathsep.join((str(source_root), existing_pythonpath))
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(export_dir), str(source_root)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(
+            "REFUSED: independent registered-source reload failed:\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise SystemExit("REFUSED: independent reload emitted no result")
+    try:
+        result = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            "REFUSED: independent reload result was not JSON: "
+            f"{lines[-1]!r}"
+        ) from exc
+    if result.get("model_root") != expected_model_root:
+        raise SystemExit(
+            "REFUSED: independent reload changed model root: "
+            f"{expected_model_root} != {result.get('model_root')}"
+        )
+    if result.get("tie_word_embeddings") and not result.get(
+        "tied_weight_alias_observed"
+    ):
+        raise SystemExit("REFUSED: independent reload did not restore tied weights")
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,14 +306,14 @@ def main() -> None:
     device = torch.device(args.device)
     reloaded = AutoModelForCausalLM.from_pretrained(
         args.output_dir,
-        trust_remote_code=True,
+        trust_remote_code=False,
         dtype=torch.float32,
         low_cpu_mem_usage=False,
     ).to(device)
     reloaded.eval()
     reloaded_tokenizer = AutoTokenizer.from_pretrained(
         args.output_dir,
-        trust_remote_code=True,
+        trust_remote_code=False,
     )
     reloaded_root = model_state_root(reloaded)
     if reloaded_root != loaded_root:
@@ -218,6 +321,18 @@ def main() -> None:
             "REFUSED: save/reload changed model state root: "
             f"{loaded_root} != {reloaded_root}"
         )
+    tie_required = bool(reloaded.config.tie_word_embeddings)
+    tie_observed = (
+        reloaded.lm_head.weight.data_ptr()
+        == reloaded.model.embed.weight.data_ptr()
+    )
+    if tie_required and not tie_observed:
+        raise SystemExit("REFUSED: save/reload did not restore tied weights")
+    independent_reload = independent_reload_court(
+        export_dir=args.output_dir,
+        source_root=source_root,
+        expected_model_root=loaded_root,
+    )
 
     encoded = reloaded_tokenizer(
         FIXED_PROMPT,
@@ -282,7 +397,10 @@ def main() -> None:
             "files": exported_manifest,
             "manifest_root": canonical_root(exported_manifest),
             "reloaded_model_root": reloaded_root,
+            "tie_word_embeddings": tie_required,
+            "tied_weight_alias_observed": tie_observed,
         },
+        "independent_reload_court": independent_reload,
         "generation_court": {
             "prompt": FIXED_PROMPT,
             "max_new_tokens": args.max_new_tokens,
