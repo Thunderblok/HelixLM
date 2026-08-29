@@ -268,6 +268,41 @@ RUNNER_HELP=not_run_generic_python_missing_numpy
 ABLATION_ARTIFACTS_FOUND=none
 ```
 
+### 2026-08-29 control run in progress
+
+```text
+EVENT=control_run_progress_observation
+OBSERVATION_STATUS=in_progress
+PROMOTION_STATUS=non_promotable_until_terminal_and_validation
+
+RUN_ID=branch50-ablation-control-s512-b12-a7-t300000000-20260829T020213Z
+LOCAL_RUN_ROOT=/home/mo/DEV/experiments/helix-branch50-linear-context-v0/artifacts/ablation-300m-v0/branch50-ablation-control-s512-b12-a7-t300000000-20260829T020213Z
+WATCHDOG=installed_externally_every_30_min
+
+LATEST_EVIDENCED_STEP=1598
+TOTAL_OPTIMIZER_STEPS=6990
+CAUSAL_TARGETS_SEEN=68592552
+CAUSAL_TARGETS_PER_SECOND_APPROX=20843
+
+TRAIN_ACCUM_LOSS=5.33244
+TRAIN_IMMEDIATE_LOSS=5.48629
+SKIPPED_BATCHES=0
+NONFINITE_EVENTS=0
+PEAK_ALLOCATED_VRAM_BYTES=12653001216
+
+GPU_TOTAL_PROCESS_AND_SYSTEM_USE_MIB=15365
+GPU_FREE_MIB=453
+GPU_UTILIZATION_PERCENT=80
+GPU_TEMPERATURE_C=61
+GPU_POWER_W=204.64
+
+DISK_FREE_KB=374079128
+
+VALIDATION_STATUS=not_claimed_from_this_observation
+TERMINAL_STATUS=not_claimed_from_this_observation
+DECISION=pending_terminal_and_validation
+```
+
 The prior Branch-50 100M context-promotion evidence retained 512 over 1024:
 
 ```text
