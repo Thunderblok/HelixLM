@@ -634,8 +634,6 @@ def main() -> None:
         )
     if args.full_corpus_pass and args.max_optimizer_steps:
         raise SystemExit("REFUSED: full-corpus pass cannot be combined with max-optimizer-steps")
-    if args.promotion_manifest and not args.full_corpus_pass:
-        raise SystemExit("REFUSED: promotion manifest requires full-corpus pass")
     baseline_knobs = {
         "learning_rate": 1.5e-4,
         "warmup_microbatches": 2_000,
@@ -931,8 +929,12 @@ def main() -> None:
         tags={
             "run_kind": (
                 "branch50_promoted_full_corpus_v0"
-                if promotion_manifest is not None
-                else "branch50_300m_single_knob_ablation_v0"
+                if promotion_manifest is not None and args.full_corpus_pass
+                else (
+                    "branch50_promoted_combined_pilot_v0"
+                    if promotion_manifest is not None
+                    else "branch50_single_knob_ablation_v0"
+                )
             ),
             "production_effect": "none",
         },

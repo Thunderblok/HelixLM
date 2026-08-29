@@ -289,7 +289,7 @@ def court_checkpoint_cadence_is_a_real_knob(runner) -> None:
     assert runner.changed_knobs_from(baseline, resolved) == ["checkpoint_every"]
 
 
-def court_promoted_full_run_requires_exact_manifest(runner) -> None:
+def court_promoted_run_requires_exact_manifest(runner) -> None:
     selected = {
         "learning_rate": 1e-4,
         "warmup_microbatches": 500,
@@ -338,7 +338,7 @@ def main() -> None:
         court_checkpoint_payload_binds_latest_validation_and_stop_state,
         court_checkpoint_identity_detects_mismatch,
         court_checkpoint_cadence_is_a_real_knob,
-        court_promoted_full_run_requires_exact_manifest,
+        court_promoted_run_requires_exact_manifest,
     ]
     for court in courts:
         try:
