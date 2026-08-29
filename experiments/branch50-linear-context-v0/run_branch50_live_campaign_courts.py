@@ -28,6 +28,7 @@ ABLATION_ROOT = EXPERIMENT_ROOT / "artifacts" / "ablation-300m-v0"
 CAUSAL_TARGETS_PER_STEP = 12 * 7 * 511
 TOTAL_STEPS = 12
 SPLIT_STEPS = 6
+MAX_BENIGN_CHROME_GPU_MEMORY_MIB = 256
 
 
 def sha256(path: Path) -> str:
@@ -54,6 +55,63 @@ def assert_clean_source() -> None:
         raise SystemExit("REFUSED: live courts require a clean committed Branch-50 source")
 
 
+def read_process_cmdline(pid: int) -> str:
+    try:
+        return (
+            Path(f"/proc/{pid}/cmdline")
+            .read_bytes()
+            .replace(b"\x00", b" ")
+            .decode(errors="replace")
+            .strip()
+        )
+    except OSError:
+        return ""
+
+
+def is_benign_browser_gpu_process(cmdline: str, used_memory_mib: int) -> bool:
+    return (
+        used_memory_mib <= MAX_BENIGN_CHROME_GPU_MEMORY_MIB
+        and "/chrome" in cmdline
+        and "--type=gpu-process" in cmdline
+    )
+
+
+def parse_gpu_process_rows(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pieces = [piece.strip() for piece in line.split(",", 1)]
+        if len(pieces) != 2:
+            raise SystemExit(f"REFUSED: malformed nvidia-smi compute row: {line!r}")
+        try:
+            pid = int(pieces[0])
+            used_memory_mib = int(pieces[1])
+        except ValueError as error:
+            raise SystemExit(
+                f"REFUSED: non-numeric nvidia-smi compute row: {line!r}"
+            ) from error
+        rows.append(
+            {
+                "pid": pid,
+                "used_memory_mib": used_memory_mib,
+                "cmdline": read_process_cmdline(pid),
+            }
+        )
+    return rows
+
+
+def conflicting_gpu_processes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if not is_benign_browser_gpu_process(
+            str(row["cmdline"]), int(row["used_memory_mib"])
+        )
+    ]
+
+
 def assert_exclusive_gpu_lease() -> None:
     result = subprocess.run(
         ["ps", "-eo", "pid=,args="], check=True, capture_output=True, text=True
@@ -67,19 +125,22 @@ def assert_exclusive_gpu_lease() -> None:
         raise SystemExit(
             "REFUSED: another Branch-50 runner owns the GPU:\n" + "\n".join(conflicts)
         )
-    gpu_processes = subprocess.run(
+    gpu_process_output = subprocess.run(
         [
             "nvidia-smi",
-            "--query-compute-apps=pid,process_name",
+            "--query-compute-apps=pid,used_memory",
             "--format=csv,noheader,nounits",
         ],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if gpu_processes:
+    gpu_processes = parse_gpu_process_rows(gpu_process_output)
+    conflicts = conflicting_gpu_processes(gpu_processes)
+    if conflicts:
         raise SystemExit(
-            "REFUSED: another compute process owns the GPU:\n" + gpu_processes
+            "REFUSED: another compute process owns the GPU:\n"
+            + json.dumps(conflicts, indent=2, sort_keys=True)
         )
 
 
