@@ -157,6 +157,7 @@ class Campaign:
             returncode=0,
             run_root=str(run_root),
             terminal_status=terminal.get("status"),
+            promotion_eligible=terminal.get("promotion_eligible"),
             mlflow_run_id=terminal.get("mlflow_run_id"),
             checkpoint=terminal.get("checkpoint"),
             best_checkpoint=terminal.get("best_checkpoint"),
@@ -195,6 +196,19 @@ def require_terminal(run_root: Path, expected_status: str = "PASS") -> dict[str,
     if terminal.get("status") != expected_status:
         raise RuntimeError(f"required terminal is not {expected_status}: {run_root}")
     return terminal
+
+
+def terminal_campaign_status(terminal: dict[str, Any]) -> str:
+    status = terminal.get("status")
+    promotion_eligible = terminal.get("promotion_eligible")
+    if status == "PASS" and promotion_eligible is True:
+        return "PASS"
+    if status == "STOPPED_DIMINISHING_RETURN" and promotion_eligible is False:
+        return "STOPPED_DIMINISHING_RETURN"
+    raise RuntimeError(
+        "terminal cannot determine promotional campaign status: "
+        f"status={status!r} promotion_eligible={promotion_eligible!r}"
+    )
 
 
 def main() -> None:
@@ -344,11 +358,13 @@ def main() -> None:
             ],
             accepted_statuses=("PASS", "STOPPED_DIMINISHING_RETURN"),
         )
-        campaign.state["status"] = "PASS"
+        full_terminal = load_object(full / "terminal.json")
+        campaign_status = terminal_campaign_status(full_terminal)
+        campaign.state["status"] = campaign_status
         campaign.state["full_run_root"] = str(full)
         campaign.state["completed_at"] = utc_now()
         campaign.write_state()
-        campaign.log(f"CAMPAIGN_PASS full_run_root={full}")
+        campaign.log(f"CAMPAIGN_{campaign_status} full_run_root={full}")
     except BaseException as error:
         campaign.state["status"] = "HOLD"
         campaign.state["error_type"] = type(error).__name__
