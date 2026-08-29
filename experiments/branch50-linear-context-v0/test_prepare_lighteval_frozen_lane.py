@@ -55,6 +55,26 @@ def main() -> None:
     )
     assert MODULE.canonical_root({"a": 1}) != MODULE.canonical_root({"a": 2})
 
+    clean_values = {
+        ("rev-parse", "HEAD"): "h" * 40,
+        ("rev-parse", "HEAD^{tree}"): "t" * 40,
+        ("status", "--porcelain", "--untracked-files=all"): "",
+    }
+    clean_contract = MODULE.resolve_source_contract(
+        lambda *args: clean_values[args]
+    )
+    assert clean_contract == {
+        "branch50_source_head": "h" * 40,
+        "branch50_source_tree": "t" * 40,
+    }
+
+    dirty_values = dict(clean_values)
+    dirty_values[("status", "--porcelain", "--untracked-files=all")] = " M dirty.py"
+    assert_refuses(
+        lambda: MODULE.resolve_source_contract(lambda *args: dirty_values[args]),
+        "clean committed Branch-50 source",
+    )
+
     yaml_text = MODULE.render_model_yaml(
         Path("/tmp/export"),
         batch_size=4,

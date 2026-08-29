@@ -25,6 +25,7 @@ EXPECTED_LIGHTEVAL_VERSION = "0.13.0"
 EXPECTED_TRANSFORMERS_VERSION = "5.8.1"
 DEFAULT_TASKS = "arc:easy|0"
 DEFAULT_SMOKE_MAX_SAMPLES = 16
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 DATASET_IDENTITY = {
     "repository": "david-thrower/HelixLM-medium-1500.0Mt-2988750pt-20260528",
@@ -88,6 +89,31 @@ def require_version(package: str, expected: str) -> str:
             f"REFUSED: {package} version must be {expected}, found {observed!r}"
         )
     return observed
+
+
+def git_value(*args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def resolve_source_contract(git_fn: Any = git_value) -> dict[str, str]:
+    head = git_fn("rev-parse", "HEAD")
+    tree = git_fn("rev-parse", "HEAD^{tree}")
+    dirty = git_fn("status", "--porcelain", "--untracked-files=all")
+    if dirty:
+        raise SystemExit(
+            "REFUSED: Lighteval packet requires clean committed Branch-50 source"
+        )
+    return {
+        "branch50_source_head": head,
+        "branch50_source_tree": tree,
+    }
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -220,6 +246,7 @@ def main() -> None:
     lighteval_version = require_version("lighteval", EXPECTED_LIGHTEVAL_VERSION)
     transformers_version = require_version("transformers", EXPECTED_TRANSFORMERS_VERSION)
     receipt = validate_preflight_receipt(args.preflight_receipt, args.export_dir)
+    source_contract = resolve_source_contract()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_yaml_path = args.output_dir / "branch50_lighteval_model.yaml"
@@ -285,10 +312,7 @@ def main() -> None:
             "comparative_benchmark": False,
             "full_eval_requires_new_manifest_without_max_samples": True,
         },
-        "source_contract": {
-            "branch50_source_head": "c268d5c9655cded48de317d680d01b232ead2fe3",
-            "branch50_source_tree": "1a38ab5946cc0089f99c4b2b519cf8cf4cb5b0ad",
-        },
+        "source_contract": source_contract,
         "dataset_identity": DATASET_IDENTITY,
         "tokenizer_identity": TOKENIZER_IDENTITY,
         "checkpoint_preflight": {
