@@ -421,6 +421,52 @@ def canonical_root(value: Any) -> str:
     ).hexdigest()
 
 
+def changed_knobs_from(
+    baseline_knobs: dict[str, Any],
+    resolved_knobs: dict[str, Any],
+) -> list[str]:
+    changed_knobs = [
+        key
+        for key, baseline in baseline_knobs.items()
+        if not key.startswith("scheduler_") and resolved_knobs[key] != baseline
+    ]
+    if (
+        resolved_knobs["scheduler_policy"] != baseline_knobs["scheduler_policy"]
+        or resolved_knobs["scheduler_min_lr_ratio"]
+        != baseline_knobs["scheduler_min_lr_ratio"]
+    ):
+        changed_knobs.append("scheduler")
+    return changed_knobs
+
+
+def validate_promotion_manifest(
+    manifest: dict[str, Any],
+    *,
+    resolved_knobs: dict[str, Any],
+    changed_knobs: list[str],
+) -> dict[str, Any]:
+    if manifest.get("schema") != "helix.branch50.promotion-decision.v0":
+        raise SystemExit("REFUSED: unsupported promotion manifest schema")
+    if manifest.get("status") != "PROMOTED":
+        raise SystemExit("REFUSED: promotion manifest is not PROMOTED")
+    if manifest.get("selected_knobs") != resolved_knobs:
+        raise SystemExit("REFUSED: promotion manifest selected knobs do not match run")
+    if manifest.get("changed_knobs") != changed_knobs:
+        raise SystemExit("REFUSED: promotion manifest changed knobs do not match run")
+    evidence_run_ids = manifest.get("evidence_run_ids")
+    if (
+        not isinstance(evidence_run_ids, list)
+        or not evidence_run_ids
+        or any(not isinstance(run_id, str) or not run_id for run_id in evidence_run_ids)
+        or len(set(evidence_run_ids)) != len(evidence_run_ids)
+    ):
+        raise SystemExit("REFUSED: promotion manifest evidence run IDs are invalid")
+    decision = manifest.get("decision")
+    if not isinstance(decision, str) or not decision.strip():
+        raise SystemExit("REFUSED: promotion manifest decision is missing")
+    return manifest
+
+
 def save_ablation_checkpoint(
     common: Any,
     path: Path,
@@ -529,6 +575,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-optimizer-steps", type=int, default=0)
     parser.add_argument("--skip-shard-sha256", action="store_true")
     parser.add_argument("--full-corpus-pass", action="store_true")
+    parser.add_argument("--promotion-manifest", type=Path)
     parser.add_argument("--expected-full-corpus-raw-tokens", type=int, default=1_504_000_000)
     parser.add_argument("--diminishing-window-evals", type=int, default=0)
     parser.add_argument("--diminishing-min-improvement", type=float, default=0.0)
@@ -587,11 +634,14 @@ def main() -> None:
         )
     if args.full_corpus_pass and args.max_optimizer_steps:
         raise SystemExit("REFUSED: full-corpus pass cannot be combined with max-optimizer-steps")
+    if args.promotion_manifest and not args.full_corpus_pass:
+        raise SystemExit("REFUSED: promotion manifest requires full-corpus pass")
     baseline_knobs = {
         "learning_rate": 1.5e-4,
         "warmup_microbatches": 2_000,
         "scheduler_policy": "linear_warmup_then_constant",
         "scheduler_min_lr_ratio": 1.0,
+        "checkpoint_every": 500,
         "weight_decay": 0.05,
         "grad_clip": 1.0,
         "dropout": 0.05,
@@ -603,24 +653,30 @@ def main() -> None:
         "warmup_microbatches": args.warmup_microbatches,
         "scheduler_policy": args.scheduler_policy,
         "scheduler_min_lr_ratio": args.scheduler_min_lr_ratio,
+        "checkpoint_every": args.checkpoint_every,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
         "dropout": args.dropout,
         "attention_dropout": args.attention_dropout,
         "ffn_expansion": args.ffn_expansion,
     }
-    changed_knobs = [
-        key
-        for key, baseline in baseline_knobs.items()
-        if not key.startswith("scheduler_") and resolved_knobs[key] != baseline
-    ]
-    if (
-        resolved_knobs["scheduler_policy"] != baseline_knobs["scheduler_policy"]
-        or resolved_knobs["scheduler_min_lr_ratio"]
-        != baseline_knobs["scheduler_min_lr_ratio"]
-    ):
-        changed_knobs.append("scheduler")
-    if args.ablation_id == "control":
+    changed_knobs = changed_knobs_from(baseline_knobs, resolved_knobs)
+    promotion_manifest: dict[str, Any] | None = None
+    promotion_manifest_root: str | None = None
+    if args.promotion_manifest:
+        if args.ablation_id == "control":
+            raise SystemExit("REFUSED: control cannot use a promotion manifest")
+        if not args.promotion_manifest.is_file():
+            raise SystemExit(
+                f"REFUSED: promotion manifest missing: {args.promotion_manifest}"
+            )
+        promotion_manifest = validate_promotion_manifest(
+            json.loads(args.promotion_manifest.read_text()),
+            resolved_knobs=resolved_knobs,
+            changed_knobs=changed_knobs,
+        )
+        promotion_manifest_root = canonical_root(promotion_manifest)
+    elif args.ablation_id == "control":
         if changed_knobs:
             raise SystemExit(f"REFUSED: control changes knobs: {changed_knobs}")
     elif len(changed_knobs) != 1:
@@ -749,6 +805,8 @@ def main() -> None:
             "patience_windows": args.diminishing_patience_windows,
             "min_optimizer_steps": args.diminishing_min_optimizer_steps,
         },
+        "promotion_manifest": promotion_manifest,
+        "promotion_manifest_root": promotion_manifest_root,
     }
 
     schedule = build_scheduler_state(
@@ -857,16 +915,25 @@ def main() -> None:
             "grad_buffer_ratio": 0.0,
             "ordering_algorithm": common.ORDERING_ALGORITHM,
             "validation_batches": args.validation_batches,
-            "single_knob_contract": True,
+            "checkpoint_every": args.checkpoint_every,
             "shard_sha256_verified": not args.skip_shard_sha256,
             "diminishing_return_enabled": diminishing_enabled,
             "diminishing_window_evals": args.diminishing_window_evals,
             "diminishing_min_improvement": args.diminishing_min_improvement,
             "diminishing_patience_windows": args.diminishing_patience_windows,
             "diminishing_min_optimizer_steps": args.diminishing_min_optimizer_steps,
+            "promotion_manifest_path": (
+                str(args.promotion_manifest) if args.promotion_manifest else "none"
+            ),
+            "promotion_manifest_root": promotion_manifest_root or "none",
+            "single_knob_contract": promotion_manifest is None,
         },
         tags={
-            "run_kind": "branch50_300m_single_knob_ablation_v0",
+            "run_kind": (
+                "branch50_promoted_full_corpus_v0"
+                if promotion_manifest is not None
+                else "branch50_300m_single_knob_ablation_v0"
+            ),
             "production_effect": "none",
         },
     )

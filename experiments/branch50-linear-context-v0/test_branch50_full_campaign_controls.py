@@ -276,6 +276,56 @@ def court_checkpoint_identity_detects_mismatch(runner) -> None:
         raise AssertionError("scheduler mismatch would not be refused on resume")
 
 
+def court_checkpoint_cadence_is_a_real_knob(runner) -> None:
+    baseline = {
+        "learning_rate": 1.5e-4,
+        "warmup_microbatches": 2_000,
+        "scheduler_policy": "linear_warmup_then_constant",
+        "scheduler_min_lr_ratio": 1.0,
+        "checkpoint_every": 500,
+    }
+    resolved = dict(baseline)
+    resolved["checkpoint_every"] = 250
+    assert runner.changed_knobs_from(baseline, resolved) == ["checkpoint_every"]
+
+
+def court_promoted_full_run_requires_exact_manifest(runner) -> None:
+    selected = {
+        "learning_rate": 1e-4,
+        "warmup_microbatches": 500,
+        "scheduler_policy": "cosine_decay",
+        "scheduler_min_lr_ratio": 0.1,
+        "checkpoint_every": 250,
+    }
+    changed = ["learning_rate", "warmup_microbatches", "checkpoint_every", "scheduler"]
+    manifest = {
+        "schema": "helix.branch50.promotion-decision.v0",
+        "status": "PROMOTED",
+        "selected_knobs": selected,
+        "changed_knobs": changed,
+        "evidence_run_ids": ["control", "lr1e4", "warmup500", "cosine", "ckpt250"],
+        "decision": "selected by fixed-validation and operational courts",
+    }
+    assert runner.validate_promotion_manifest(
+        manifest,
+        resolved_knobs=selected,
+        changed_knobs=changed,
+    ) == manifest
+
+    hostile = dict(manifest)
+    hostile["selected_knobs"] = {**selected, "learning_rate": 2e-4}
+    try:
+        runner.validate_promotion_manifest(
+            hostile,
+            resolved_knobs=selected,
+            changed_knobs=changed,
+        )
+    except SystemExit as exc:
+        assert "REFUSED" in str(exc), exc
+    else:
+        raise AssertionError("promotion knob mutation did not turn the court RED")
+
+
 def main() -> None:
     runner = load_runner()
     courts = [
@@ -287,6 +337,8 @@ def main() -> None:
         court_periodic_checkpoint_after_validation_source_order,
         court_checkpoint_payload_binds_latest_validation_and_stop_state,
         court_checkpoint_identity_detects_mismatch,
+        court_checkpoint_cadence_is_a_real_knob,
+        court_promoted_full_run_requires_exact_manifest,
     ]
     for court in courts:
         try:
