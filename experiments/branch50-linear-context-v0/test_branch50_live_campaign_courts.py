@@ -54,10 +54,46 @@ def court_rotation_requires_exact_steps_and_no_staged_file() -> None:
         assert MODULE.verify_rotation(run_root)["status"] == "FAIL"
 
 
+def court_bounded_browser_gpu_process_is_not_training_contention() -> None:
+    chrome = {
+        "pid": 101,
+        "used_memory_mib": 152,
+        "cmdline": "/opt/google/chrome/chrome --type=gpu-process",
+    }
+    assert MODULE.conflicting_gpu_processes([chrome]) == []
+
+    oversized = dict(chrome, used_memory_mib=257)
+    assert MODULE.conflicting_gpu_processes([oversized]) == [oversized]
+
+    python = {
+        "pid": 202,
+        "used_memory_mib": 1,
+        "cmdline": "/usr/bin/python train.py",
+    }
+    assert MODULE.conflicting_gpu_processes([python]) == [python]
+
+    wrong_chrome_role = dict(chrome, cmdline="/opt/google/chrome/chrome --renderer")
+    assert MODULE.conflicting_gpu_processes([wrong_chrome_role]) == [wrong_chrome_role]
+
+
+def court_gpu_process_rows_refuse_malformed_observation() -> None:
+    assert MODULE.parse_gpu_process_rows("101, 152") == [
+        {"pid": 101, "used_memory_mib": 152, "cmdline": MODULE.read_process_cmdline(101)}
+    ]
+    try:
+        MODULE.parse_gpu_process_rows("malformed")
+    except SystemExit as error:
+        assert "malformed nvidia-smi compute row" in str(error)
+    else:
+        raise AssertionError("malformed GPU observation did not turn the court RED")
+
+
 def main() -> None:
     courts = [
         court_exact_resume_detects_mutation,
         court_rotation_requires_exact_steps_and_no_staged_file,
+        court_bounded_browser_gpu_process_is_not_training_contention,
+        court_gpu_process_rows_refuse_malformed_observation,
     ]
     for court in courts:
         court()

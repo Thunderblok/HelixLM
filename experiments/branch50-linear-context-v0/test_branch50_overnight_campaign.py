@@ -59,10 +59,41 @@ def court_full_stage_is_after_live_and_bounded_trials() -> None:
     assert 'accepted_statuses=("PASS", "STOPPED_DIMINISHING_RETURN")' in source
 
 
+def court_diminishing_terminal_does_not_promote_campaign() -> None:
+    terminal = {
+        "status": "STOPPED_DIMINISHING_RETURN",
+        "promotion_eligible": False,
+    }
+    assert MODULE.terminal_campaign_status(terminal) == "STOPPED_DIMINISHING_RETURN"
+
+
+def court_pass_terminal_requires_promotion_eligibility() -> None:
+    assert MODULE.terminal_campaign_status(
+        {"status": "PASS", "promotion_eligible": True}
+    ) == "PASS"
+    try:
+        MODULE.terminal_campaign_status({"status": "PASS", "promotion_eligible": False})
+    except RuntimeError as exc:
+        assert "promotion_eligible=False" in str(exc), exc
+    else:
+        raise AssertionError("non-promotional PASS terminal was accepted")
+
+
+def court_supervisor_has_no_unconditional_campaign_pass() -> None:
+    source = MODULE_PATH.read_text()
+    if 'campaign.state["status"] = "PASS"' in source:
+        raise AssertionError("supervisor still unconditionally promotes campaign PASS")
+    if "terminal_campaign_status(full_terminal)" not in source:
+        raise AssertionError("full terminal status is not bound into campaign status")
+
+
 def main() -> None:
     courts = [
         court_knob_args_are_complete_and_stable,
         court_full_stage_is_after_live_and_bounded_trials,
+        court_diminishing_terminal_does_not_promote_campaign,
+        court_pass_terminal_requires_promotion_eligibility,
+        court_supervisor_has_no_unconditional_campaign_pass,
     ]
     for court in courts:
         court()
