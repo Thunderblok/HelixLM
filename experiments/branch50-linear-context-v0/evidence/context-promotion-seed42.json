@@ -1,0 +1,238 @@
+{
+  "allowed_config_differences": [
+    "batch_size",
+    "max_position_embeddings",
+    "seq_len"
+  ],
+  "candidate": {
+    "batch_size": 6,
+    "evidence_roots": {
+      "checkpoint_sha256": "2e255c34b9d12236bfe8c91f1fdf4f4665a2ae1f7b4d38624adf2c448cb20411",
+      "mlflow_spool_sha256": "36aa4a134b28d384b2c1447efdfb7d814a64e637eecdf00e360f7d9ee40d1a38",
+      "resolved_config_sha256": "5603a6b13559205e2f7a4519d65f1c4f370c168e17fab66dd57fb683188b9f2e",
+      "terminal_sha256": "2c6d54977c9a8ce4c5fbd57158e46ddf08884c41bde2ff0197de63d77c3797d2"
+    },
+    "final_validation_loss": 5.03864461183548,
+    "final_validation_ppl": 154.26079001833116,
+    "mlflow_run_id": "4561589acb4c44d39d67f9e9635e267a",
+    "peak_vram_bytes": 12650489856,
+    "reference_causal_targets_per_second": 19941.7964032125,
+    "seq_len": 1024,
+    "terminal_causal_targets_per_second": 17392.614967906076
+  },
+  "comparison": {
+    "candidate_minus_control_peak_vram_bytes": -2511360,
+    "candidate_minus_control_val_loss": 0.01364046335220337,
+    "candidate_quality_not_worse": false,
+    "final_step": 2330,
+    "reference_throughput_ratio": 0.9710642284575993,
+    "terminal_throughput_ratio": 0.8483615598733938,
+    "throughput_floor": 0.9,
+    "throughput_floor_pass": true,
+    "throughput_reference_step": 1600
+  },
+  "control": {
+    "batch_size": 12,
+    "evidence_roots": {
+      "checkpoint_sha256": "ae8ba18d12928a83fcd78382a226df53f752b5eecde62e699bead63d7919a6ef",
+      "mlflow_spool_sha256": "33d40093ce62f0783084862b55be7d3db8c77c1d09bc6dab7bd8117073375b07",
+      "resolved_config_sha256": "f5343e2669e846b31345724ebaf5a98444bc32e9f10db48d54f2ac08482e5fe0",
+      "terminal_sha256": "a6e18481091b3ff0ba93f569d30857eb2c9c312e10fcfb8a23453608bf0d96af"
+    },
+    "final_validation_loss": 5.025004148483276,
+    "final_validation_ppl": 152.17088738974164,
+    "mlflow_run_id": "3f960461105f479598b1643ee1d34b8c",
+    "peak_vram_bytes": 12653001216,
+    "reference_causal_targets_per_second": 20536.022045511112,
+    "seq_len": 512,
+    "terminal_causal_targets_per_second": 20501.41801627797
+  },
+  "court_status": "PASS",
+  "identity_evidence_sha256": "add1608bc6f8d8ffc3a3585c16c3c2f5455e5db89365cbe482cbc9441ca6ef5e",
+  "limitations": [
+    "One seed only; three-seed promotion is not established.",
+    "The declared throughput gate uses the preregistered step-1600 reference metric; terminal cumulative throughput is retained separately and is below the floor.",
+    "The court compares next-token validation NLL on the fixed held-out paired-block validation set; it is not a long-context capability benchmark.",
+    "Skipped-batch, valid-row-nonfinite, and validation-nonfinite counters were not emitted by this runner and remain unavailable; strict_nan_check was enabled and every logged numeric metric was finite.",
+    "No model publication or production effect is authorized."
+  ],
+  "matched_contract": {
+    "aligned_target_causal_targets": 100012920,
+    "base_blocks_per_optimizer_step": 42,
+    "causal_targets_per_optimizer_step": 42924,
+    "grad_accum": 7,
+    "initial_model_root": "2c61d9764e6109f61a1c4a7f5c3ae56325301072cdf1fc602221be5279295f59",
+    "raw_tokens_per_optimizer_step": 43008,
+    "steps": 2330,
+    "target_causal_targets": 100000000
+  },
+  "numerical_observation": {
+    "logged_numeric_nonfinite_events": 0,
+    "skipped_batches": "UNAVAILABLE_NOT_INSTRUMENTED",
+    "strict_nan_check": true,
+    "valid_row_nonfinite_events": "UNAVAILABLE_NOT_INSTRUMENTED",
+    "validation_nonfinite_batches": "UNAVAILABLE_NOT_INSTRUMENTED"
+  },
+  "recommendation": "STOP_1024_PROMOTION",
+  "schema": "BRANCH50_CONTEXT_PROMOTION_V0",
+  "seed": 42,
+  "source_identity": {
+    "common_runner_sha256": "ed42a69331ebee2ff6e5d65706f2a138f8af46bf725eccf461ce2e10015f4110",
+    "harness_sha256": "38ac402c116513d90e62b5313de892d8da0f59beb3363ef6aa137885182b5e57",
+    "model_base_head": "03d0698dd3365c81695d9ed8d4568d35d6044fbb",
+    "model_base_tree": "745c042db9860bca4cdfa180543f8a60a769c936",
+    "model_source_diff": "false",
+    "source_dirty": "false",
+    "source_head": "90e2470c72a9c61b21eb0381bf3e7756348104db",
+    "source_tree": "4317bcaa6de2c2b6c4a807c6989af035daab6336",
+    "train_manifest_sha256": "83f56ff60e238e6483a5fe705070b20234df555253dfb77e1b309317e3b33b4c",
+    "val_manifest_sha256": "5a7bdaedb42c9f56cc6b666dd2bdd5751406ad24c53773eacea7747efb340406"
+  },
+  "validation_curve": [
+    {
+      "candidate_minus_control_val_loss": -0.00043523311614990234,
+      "candidate_val_loss": 8.532350659370422,
+      "control_val_loss": 8.532785892486572,
+      "step": 100
+    },
+    {
+      "candidate_minus_control_val_loss": 0.01244574785232544,
+      "candidate_val_loss": 7.351175487041473,
+      "control_val_loss": 7.338729739189148,
+      "step": 200
+    },
+    {
+      "candidate_minus_control_val_loss": -0.015423119068145752,
+      "candidate_val_loss": 6.874307811260223,
+      "control_val_loss": 6.889730930328369,
+      "step": 300
+    },
+    {
+      "candidate_minus_control_val_loss": 0.007271230220794678,
+      "candidate_val_loss": 6.567408800125122,
+      "control_val_loss": 6.560137569904327,
+      "step": 400
+    },
+    {
+      "candidate_minus_control_val_loss": -0.002732217311859131,
+      "candidate_val_loss": 6.361376702785492,
+      "control_val_loss": 6.364108920097351,
+      "step": 500
+    },
+    {
+      "candidate_minus_control_val_loss": 0.007979035377502441,
+      "candidate_val_loss": 6.210436940193176,
+      "control_val_loss": 6.202457904815674,
+      "step": 600
+    },
+    {
+      "candidate_minus_control_val_loss": 0.010405778884887695,
+      "candidate_val_loss": 6.07324755191803,
+      "control_val_loss": 6.062841773033142,
+      "step": 700
+    },
+    {
+      "candidate_minus_control_val_loss": 0.010616302490234375,
+      "candidate_val_loss": 5.959194540977478,
+      "control_val_loss": 5.948578238487244,
+      "step": 800
+    },
+    {
+      "candidate_minus_control_val_loss": 0.02163475751876831,
+      "candidate_val_loss": 5.8574453592300415,
+      "control_val_loss": 5.835810601711273,
+      "step": 900
+    },
+    {
+      "candidate_minus_control_val_loss": 0.021020829677581787,
+      "candidate_val_loss": 5.759182989597321,
+      "control_val_loss": 5.738162159919739,
+      "step": 1000
+    },
+    {
+      "candidate_minus_control_val_loss": 0.02353692054748535,
+      "candidate_val_loss": 5.674632668495178,
+      "control_val_loss": 5.651095747947693,
+      "step": 1100
+    },
+    {
+      "candidate_minus_control_val_loss": 0.035610198974609375,
+      "candidate_val_loss": 5.607859969139099,
+      "control_val_loss": 5.57224977016449,
+      "step": 1200
+    },
+    {
+      "candidate_minus_control_val_loss": 0.0331496000289917,
+      "candidate_val_loss": 5.5324708223342896,
+      "control_val_loss": 5.499321222305298,
+      "step": 1300
+    },
+    {
+      "candidate_minus_control_val_loss": 0.02438563108444214,
+      "candidate_val_loss": 5.459792912006378,
+      "control_val_loss": 5.435407280921936,
+      "step": 1400
+    },
+    {
+      "candidate_minus_control_val_loss": 0.024324476718902588,
+      "candidate_val_loss": 5.409240305423737,
+      "control_val_loss": 5.384915828704834,
+      "step": 1500
+    },
+    {
+      "candidate_minus_control_val_loss": 0.02366173267364502,
+      "candidate_val_loss": 5.3459256291389465,
+      "control_val_loss": 5.3222638964653015,
+      "step": 1600
+    },
+    {
+      "candidate_minus_control_val_loss": 0.0238112211227417,
+      "candidate_val_loss": 5.3005388379096985,
+      "control_val_loss": 5.276727616786957,
+      "step": 1700
+    },
+    {
+      "candidate_minus_control_val_loss": 0.02169269323348999,
+      "candidate_val_loss": 5.251035511493683,
+      "control_val_loss": 5.229342818260193,
+      "step": 1800
+    },
+    {
+      "candidate_minus_control_val_loss": 0.024961411952972412,
+      "candidate_val_loss": 5.2021666169166565,
+      "control_val_loss": 5.177205204963684,
+      "step": 1900
+    },
+    {
+      "candidate_minus_control_val_loss": 0.018314003944396973,
+      "candidate_val_loss": 5.15205991268158,
+      "control_val_loss": 5.133745908737183,
+      "step": 2000
+    },
+    {
+      "candidate_minus_control_val_loss": 0.018253564834594727,
+      "candidate_val_loss": 5.111605226993561,
+      "control_val_loss": 5.093351662158966,
+      "step": 2100
+    },
+    {
+      "candidate_minus_control_val_loss": 0.01382601261138916,
+      "candidate_val_loss": 5.079866945743561,
+      "control_val_loss": 5.066040933132172,
+      "step": 2200
+    },
+    {
+      "candidate_minus_control_val_loss": 0.012792348861694336,
+      "candidate_val_loss": 5.042261779308319,
+      "control_val_loss": 5.029469430446625,
+      "step": 2300
+    },
+    {
+      "candidate_minus_control_val_loss": 0.01364046335220337,
+      "candidate_val_loss": 5.03864461183548,
+      "control_val_loss": 5.025004148483276,
+      "step": 2330
+    }
+  ],
+  "verdict": "RETAIN_512_SEED42_QUALITY_GATE"
+}

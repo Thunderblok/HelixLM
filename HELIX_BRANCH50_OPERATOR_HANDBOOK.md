@@ -204,30 +204,88 @@ FINITE_GRADIENTS_ALL_CONTEXTS=PASS
 REAL_CORPUS_1024_100_STEPS=PASS
 REALTIME_MLFLOW=PASS
 
-1024_QUALITY_PROMOTION=NOT_ESTABLISHED
+1024_QUALITY_PROMOTION=REFUSED_BY_SEED42_QUALITY_GATE
 2048_REAL_CORPUS_TRAINING=NOT_RUN
-1024_CHECKPOINT_RESUME=NOT_RUN
-THREE_SEED_COMPARISON=NOT_RUN
+1024_CHECKPOINT_READBACK=PASS
+THREE_SEED_COMPARISON=NOT_RUN_NOT_REQUIRED_AFTER_SEED42_FAILURE
 MODEL_PUBLICATION=HELD
 LEGACY_DEPRECATION=HELD
 ```
 
-## Next lawful milestone
+## Court 3: matched 100M-target context promotion
 
-Run `BRANCH50_1024_QUALITY_PROMOTION_V0`:
+The seed-42 `BRANCH50_CONTEXT_PROMOTION_V0` pair completed with the same
+initial model root, ordered 1024-token base blocks, optimizer geometry, target
+positions, and 100,012,920 causal targets:
+
+| Metric | 512 control | 1024 candidate |
+| --- | ---: | ---: |
+| Batch / accumulation | 12 / 7 | 6 / 7 |
+| Optimizer steps | 2,330 | 2,330 |
+| Final validation loss | 5.0250041485 | 5.0386446118 |
+| Final validation PPL | 152.170887 | 154.260790 |
+| Step-1600 causal targets/s | 20,536.022 | 19,941.796 |
+| Peak allocated VRAM | 12,653,001,216 B | 12,650,489,856 B |
 
 ```text
-SOURCE/INITIALIZATION/DATA/TOKENIZER/OPTIMIZER/SCHEDULE=identical
-RUN_A=seq512, batch12, accum7
-RUN_B=seq1024, batch6, accum7
-FIRST_TRANCHE=100M causal targets, seed42
-VALIDATION=same exact held-out token positions
-COMPARE=same-token and same-step validation NLL, throughput, VRAM, gradients, resume
+CANDIDATE_MINUS_CONTROL_FINAL_VALIDATION_NLL=+0.0136404634
+STEP_1600_THROUGHPUT_RATIO=0.9710642285
+THROUGHPUT_FLOOR=0.90
+THROUGHPUT_GATE=PASS
+QUALITY_NOT_WORSE_GATE=FAIL
+VERDICT=RETAIN_512_SEED42_QUALITY_GATE
+RECOMMENDATION=STOP_1024_PROMOTION
 ```
 
-If lawful, repeat for seeds `42`, `8675309`, and `2026`. Promote 1024 only
-when its three-seed median quality is not worse, throughput is at least 90% of
-the 512 control, numerical integrity is perfect, and checkpoint resume passes.
+The terminal 1024 cumulative throughput ratio was 0.84836. The declared
+throughput court uses the preregistered step-1600 reference metric. External
+GPU contention was observed interactively later in the run, but no durable
+system-utilization trace was retained, so contention is context rather than a
+court fact. Both throughput figures remain in the evidence packet.
+
+The quality verdict does not depend on throughput. From step 600 through the
+terminal, 1024 was consistently worse on the matched validation set. Because
+the preregistered promotion rule required the candidate to be not worse, the
+additional-seed family is not launched. This is a clean negative architecture
+result, not a numerical or execution failure.
+
+Evidence and reproducible court:
+
+```text
+experiments/branch50-linear-context-v0/evidence/context-promotion-seed42.json
+experiments/branch50-linear-context-v0/build_context_promotion_packet.py
+```
+
+Local terminal checkpoint roots:
+
+```text
+SEQ512=ae8ba18d12928a83fcd78382a226df53f752b5eecde62e699bead63d7919a6ef
+SEQ1024=2e255c34b9d12236bfe8c91f1fdf4f4665a2ae1f7b4d38624adf2c448cb20411
+```
+
+MLflow runs:
+
+```text
+SEQ512=3f960461105f479598b1643ee1d34b8c
+SEQ1024=4561589acb4c44d39d67f9e9635e267a
+MLFLOW_ERRORS=[]
+STRICT_NAN_CHECK=true
+LOGGED_NUMERIC_NONFINITE_EVENTS=0
+SKIPPED_BATCHES=UNAVAILABLE_NOT_INSTRUMENTED
+VALID_ROW_NONFINITE_EVENTS=UNAVAILABLE_NOT_INSTRUMENTED
+VALIDATION_NONFINITE_BATCHES=UNAVAILABLE_NOT_INSTRUMENTED
+```
+
+## Next lawful milestone
+
+Retain 512 as the default training context for the next Branch-50 corpus or
+model-scale trial. A future 1024 experiment requires a new declared hypothesis,
+such as a long-context capability evaluation or a different token budget. It
+may not overwrite this failed quality-promotion family.
+
+The next model checkpoint remains subject to the Lighteval publication gate
+below. No current result authorizes publication, production activation, legacy
+deprecation, or cloud spend.
 
 ### Promotion-runner admission smoke
 
