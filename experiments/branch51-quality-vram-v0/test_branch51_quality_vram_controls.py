@@ -73,11 +73,13 @@ def court_optimizer_geometry_is_one_factor(runner) -> None:
     geometry = dict(baseline)
     geometry["batch_size"] = 10
     geometry["grad_accum"] = 6
+    geometry["warmup_microbatches"] = 1_710
     assert runner.changed_knobs_from(baseline, geometry) == ["optimizer_geometry"]
 
     geometry = dict(baseline)
-    geometry["batch_size"] = 7
-    geometry["grad_accum"] = 13
+    geometry["batch_size"] = 8
+    geometry["grad_accum"] = 8
+    geometry["warmup_microbatches"] = 2_280
     assert runner.changed_knobs_from(baseline, geometry) == ["optimizer_geometry"]
 
 
@@ -86,6 +88,7 @@ def court_mixed_geometry_and_ffn_is_not_single_factor(runner) -> None:
     hostile = dict(baseline)
     hostile["batch_size"] = 10
     hostile["grad_accum"] = 6
+    hostile["warmup_microbatches"] = 1_710
     hostile["ffn_expansion"] = 3.0
     assert runner.changed_knobs_from(baseline, hostile) == [
         "optimizer_geometry",
@@ -134,23 +137,29 @@ def court_full_corpus_geometry_math_is_bound(runner) -> None:
         batch_size=10,
         grad_accum=6,
     )
-    b7a13 = runner.corpus_pass_plan(
+    b8a8 = runner.corpus_pass_plan(
         {"tokens": 1_504_000_000},
         seq_len=512,
-        batch_size=7,
-        grad_accum=13,
-    )
-    b12a9 = runner.corpus_pass_plan(
-        {"tokens": 1_504_000_000},
-        seq_len=512,
-        batch_size=12,
-        grad_accum=9,
+        batch_size=8,
+        grad_accum=8,
     )
     assert b12a7["causal_targets"] == 1_501_062_500
     assert b12a7["optimizer_steps"] == 34_971
     assert b10a6["optimizer_steps"] == 48_959
-    assert b7a13["optimizer_steps"] == 32_281
-    assert b12a9["optimizer_steps"] == 27_200
+    assert b8a8["optimizer_steps"] == 45_899
+
+
+def court_geometry_warmup_profiles_preserve_optimizer_steps(runner) -> None:
+    expected = {
+        (12, 7): 2_000,
+        (10, 6): 1_710,
+        (8, 8): 2_280,
+        (7, 13): 3_705,
+        (12, 9): 2_565,
+    }
+    assert runner.GEOMETRY_WARMUP_MICROBATCHES == expected
+    for (batch_size, grad_accum), warmup_microbatches in expected.items():
+        assert warmup_microbatches // grad_accum == 285, batch_size
 
 
 def court_model_and_mlflow_parameters_are_logged() -> None:
@@ -216,6 +225,7 @@ def main() -> None:
         court_mixed_geometry_and_ffn_is_not_single_factor,
         court_scheduler_is_one_factor_with_min_ratio,
         court_full_corpus_geometry_math_is_bound,
+        court_geometry_warmup_profiles_preserve_optimizer_steps,
         court_model_and_mlflow_parameters_are_logged,
         court_promotion_manifest_binds_single_factor_decision,
     ]

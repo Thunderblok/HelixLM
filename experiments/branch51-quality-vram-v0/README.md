@@ -33,8 +33,7 @@ Each Branch51 non-control run changes exactly one declared factor family:
 optimizer_geometry:
   batch12xaccum7
   batch10xaccum6
-  batch7xaccum13
-  batch12xaccum9
+  batch8xaccum8
 
 scheduler:
   linear_warmup_then_constant
@@ -59,6 +58,7 @@ Use short bounded smokes before a 100M or 300M candidate:
   --ablation-id geometry-b10-a6 \
   --batch-size 10 \
   --grad-accum 6 \
+  --warmup-microbatches 1710 \
   --target-causal-targets 5000000 \
   --max-optimizer-steps 100 \
   --skip-shard-sha256
@@ -67,9 +67,10 @@ Use short bounded smokes before a 100M or 300M candidate:
 ```bash
 /home/mo/DEV/experiments/helix-branch49-5080-scaling-v0/.venv/bin/python \
   experiments/branch51-quality-vram-v0/run_branch51_quality_vram_ablation.py \
-  --ablation-id geometry-b7-a13 \
-  --batch-size 7 \
-  --grad-accum 13 \
+  --ablation-id geometry-b8-a8 \
+  --batch-size 8 \
+  --grad-accum 8 \
+  --warmup-microbatches 2280 \
   --target-causal-targets 5000000 \
   --max-optimizer-steps 100 \
   --skip-shard-sha256
