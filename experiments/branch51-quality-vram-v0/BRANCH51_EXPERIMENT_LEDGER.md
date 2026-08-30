@@ -38,12 +38,13 @@ CONTROL:
 
 CANDIDATE_GEOMETRY_A:
   batch10xaccum6
+  warmup_microbatches=1710
+  warmup_optimizer_steps=285
 
 CANDIDATE_GEOMETRY_B:
-  batch7xaccum13
-
-CANDIDATE_GEOMETRY_C:
-  batch12xaccum9
+  batch8xaccum8
+  warmup_microbatches=2280
+  warmup_optimizer_steps=285
 
 CANDIDATE_SCHEDULER:
   cosine_decay

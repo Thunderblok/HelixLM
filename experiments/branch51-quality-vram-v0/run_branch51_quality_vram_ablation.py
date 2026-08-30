@@ -41,12 +41,14 @@ CAUSAL_TARGETS_PER_SAMPLE = SEQ_LEN - 1
 BASELINE_BATCH_SIZE = 12
 BASELINE_GRAD_ACCUM = 7
 BASELINE_N_LOOPS = 3
-ALLOWED_OPTIMIZER_GEOMETRIES = {
-    (12, 7),
-    (10, 6),
-    (7, 13),
-    (12, 9),
+GEOMETRY_WARMUP_MICROBATCHES = {
+    (12, 7): 2_000,
+    (10, 6): 1_710,
+    (8, 8): 2_280,
+    (7, 13): 3_705,
+    (12, 9): 2_565,
 }
+ALLOWED_OPTIMIZER_GEOMETRIES = frozenset(GEOMETRY_WARMUP_MICROBATCHES)
 
 
 def build_scheduler_state(
@@ -435,16 +437,24 @@ def changed_knobs_from(
     resolved_knobs: dict[str, Any],
 ) -> list[str]:
     changed_knobs: list[str] = []
-    if (
+    geometry_changed = (
         resolved_knobs["batch_size"] != baseline_knobs["batch_size"]
         or resolved_knobs["grad_accum"] != baseline_knobs["grad_accum"]
-    ):
+    )
+    if geometry_changed:
         changed_knobs.append("optimizer_geometry")
+    geometry = (resolved_knobs["batch_size"], resolved_knobs["grad_accum"])
+    geometry_warmup = GEOMETRY_WARMUP_MICROBATCHES.get(geometry)
     changed_knobs.extend(
         key
         for key, baseline in baseline_knobs.items()
         if key not in {"batch_size", "grad_accum"}
         and not key.startswith("scheduler_")
+        and not (
+            key == "warmup_microbatches"
+            and geometry_changed
+            and resolved_knobs[key] == geometry_warmup
+        )
         and resolved_knobs[key] != baseline
     )
     if (
@@ -620,6 +630,16 @@ def main() -> None:
         raise SystemExit(
             "REFUSED: Branch51 supported optimizer geometries are "
             f"{allowed}"
+        )
+    expected_warmup_microbatches = GEOMETRY_WARMUP_MICROBATCHES[
+        (args.batch_size, args.grad_accum)
+    ]
+    if args.warmup_microbatches != expected_warmup_microbatches:
+        raise SystemExit(
+            "REFUSED: optimizer geometry must preserve the Branch50 "
+            "285 optimizer-step warmup; "
+            f"batch{args.batch_size}xaccum{args.grad_accum} requires "
+            f"warmup_microbatches={expected_warmup_microbatches}"
         )
     if args.skip_shard_sha256 and not args.max_optimizer_steps:
         raise SystemExit("REFUSED: full ablations require shard SHA-256 verification")
