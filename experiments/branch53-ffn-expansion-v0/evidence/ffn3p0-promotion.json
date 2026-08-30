@@ -1,0 +1,30 @@
+{
+  "schema": "helix.branch51.promotion-decision.v0",
+  "status": "PROMOTED",
+  "selected_knobs": {
+    "learning_rate": 0.00015,
+    "warmup_microbatches": 2280,
+    "scheduler_policy": "linear_warmup_then_constant",
+    "scheduler_min_lr_ratio": 1.0,
+    "checkpoint_every": 500,
+    "weight_decay": 0.05,
+    "grad_clip": 1.0,
+    "dropout": 0.05,
+    "attention_dropout": 0.05,
+    "ffn_expansion": 3.0,
+    "batch_size": 8,
+    "grad_accum": 8,
+    "n_loops": 3,
+    "activation_checkpointing": true
+  },
+  "changed_knobs": [
+    "optimizer_geometry",
+    "ffn_expansion",
+    "activation_checkpointing"
+  ],
+  "evidence_run_ids": [
+    "3b4d833fea24417eae11f87184e69ff1"
+  ],
+  "decision": "founder-authorized queued 400M FFN 3.0 pilot after the Branch52 400M terminal passes its numerical, checkpoint, MLflow, and target-count gates",
+  "quality_claim": "unavailable_until_fixed_token_400m_pilot"
+}

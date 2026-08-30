@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one resumable Branch52 activation-checkpointing ablation."""
+"""Run one resumable Branch53 FFN-expansion ablation."""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent
 SOURCE = Path(__file__).resolve().parents[2]
 RUN_ROOT = Path(
     os.environ.get(
-        "HELIX_BRANCH52_RUN_ROOT",
-        "/home/mo/DEV/experiments/helix-branch52-activation-checkpointing-v0",
+        "HELIX_BRANCH53_RUN_ROOT",
+        "/home/mo/DEV/experiments/helix-branch53-ffn-expansion-v0",
     )
 )
 BASELINE_ROOT = Path("/home/mo/DEV/experiments/helix-branch49-5080-scaling-v0")
@@ -367,7 +367,7 @@ def verify_source_identity() -> dict[str, str]:
     tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
     dirty = git("status", "--porcelain").stdout.strip()
     if dirty:
-        raise SystemExit(f"REFUSED: Branch52 source checkout dirty:\n{dirty}")
+        raise SystemExit(f"REFUSED: Branch53 source checkout dirty:\n{dirty}")
     changed_paths = {
         path
         for path in git(
@@ -383,6 +383,11 @@ def verify_source_identity() -> dict[str, str]:
         "experiments/branch52-activation-checkpointing-v0/evidence/activation-checkpoint-smokes-20260830.json",
         "experiments/branch52-activation-checkpointing-v0/evidence/b8a8-smoke-promotion.json",
         "experiments/branch52-activation-checkpointing-v0/test_branch52_activation_checkpointing.py",
+        "experiments/branch53-ffn-expansion-v0/README.md",
+        "experiments/branch53-ffn-expansion-v0/BRANCH53_EXPERIMENT_LEDGER.md",
+        "experiments/branch53-ffn-expansion-v0/evidence/ffn3p0-promotion.json",
+        "experiments/branch53-ffn-expansion-v0/launch_after_branch52.sh",
+        "experiments/branch53-ffn-expansion-v0/test_branch53_ffn_expansion.py",
     }
     unexpected_paths = changed_paths - allowed_paths
     required_paths = {
@@ -391,7 +396,7 @@ def verify_source_identity() -> dict[str, str]:
     }
     if unexpected_paths or not required_paths.issubset(changed_paths):
         raise SystemExit(
-            "REFUSED: Branch52 source boundary mismatch: "
+            "REFUSED: Branch53 source boundary mismatch: "
             f"changed={sorted(changed_paths)!r} unexpected={sorted(unexpected_paths)!r}"
         )
     return {
@@ -401,7 +406,7 @@ def verify_source_identity() -> dict[str, str]:
         "branch51_base_head": BRANCH51_BASE_HEAD,
         "model_base_head": MODEL_BASE_HEAD,
         "model_base_tree": MODEL_BASE_TREE,
-        "model_source_diff": "activation_checkpointing_only",
+        "model_source_diff": "activation_checkpointing_with_ffn_runtime_ablation",
     }
 
 
@@ -650,7 +655,7 @@ def main() -> None:
             for batch, accum in sorted(ALLOWED_OPTIMIZER_GEOMETRIES)
         )
         raise SystemExit(
-            "REFUSED: Branch52 supported optimizer geometries are "
+            "REFUSED: Branch53 supported optimizer geometries are "
             f"{allowed}"
         )
     expected_warmup_microbatches = GEOMETRY_WARMUP_MICROBATCHES[
@@ -860,8 +865,8 @@ def main() -> None:
         "val_manifest_sha256": common.manifest_root(val_manifest),
     }
     ablation_contract = {
-        "schema": "helix.branch52.activation-checkpointing-ablation.v0",
-        "branch52_profile": "activation_checkpointing_v0",
+        "schema": "helix.branch53.ffn-expansion-ablation.v0",
+        "branch53_profile": "ffn_expansion_3p0_v0",
         "ablation_id": args.ablation_id,
         "changed_knobs": changed_knobs,
         "knobs": resolved_knobs,
@@ -929,7 +934,7 @@ def main() -> None:
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_name = (
-        f"branch52-ablation-{args.ablation_id}-s512-b{args.batch_size}"
+        f"branch53-ablation-{args.ablation_id}-s512-b{args.batch_size}"
         f"-a{args.grad_accum}-t{target_causal_targets}-{stamp}"
     )
     run_root = RUN_ROOT / "artifacts" / "quality-vram-ablation-v0" / run_name
@@ -937,7 +942,7 @@ def main() -> None:
     harness_sha = sha256(Path(__file__))
     logger = RealtimeMLflowLogger(
         tracking_uri=args.mlflow_uri,
-        experiment="helix-branch52-activation-checkpointing-v0",
+        experiment="helix-branch53-ffn-expansion-v0",
         run_name=run_name,
         spool_path=run_root / "mlflow_spool.jsonl",
         params={
@@ -1024,12 +1029,12 @@ def main() -> None:
         },
         tags={
             "run_kind": (
-                "branch52_promoted_full_corpus_v0"
+                "branch53_promoted_full_corpus_v0"
                 if promotion_manifest is not None and args.full_corpus_pass
                 else (
-                    "branch52_promoted_combined_pilot_v0"
+                    "branch53_promoted_combined_pilot_v0"
                     if promotion_manifest is not None
-                    else "branch52_single_factor_ablation_v0"
+                    else "branch53_single_factor_ablation_v0"
                 )
             ),
             "production_effect": "none",
@@ -1047,7 +1052,7 @@ def main() -> None:
         json.dumps(
             {
                 "schema": "thunderline.training.mission.projection.v0",
-                "profile": "HELIX_BRANCH52_ACTIVATION_CHECKPOINTING_V0",
+                "profile": "HELIX_BRANCH53_FFN_EXPANSION_V0",
                 "mission": {
                     "workload": "helix_model_training",
                     "production_effect": "none",
