@@ -32,6 +32,13 @@ RUN_ROOT = Path(
 )
 BASELINE_ROOT = Path("/home/mo/DEV/experiments/helix-branch49-5080-scaling-v0")
 COMMON_PATH = BASELINE_ROOT / "run_512d_streaming_k32_loops3_1500m.py"
+COMMON_RECEIPT = (
+    SOURCE
+    / "experiments"
+    / "branch50-linear-context-v0"
+    / "executed"
+    / "baseline-runner.sha256"
+)
 MODEL_BASE_HEAD = "03d0698dd3365c81695d9ed8d4568d35d6044fbb"
 MODEL_BASE_TREE = "745c042db9860bca4cdfa180543f8a60a769c936"
 EXPECTED_PARAMETER_COUNT = 53_592_340
@@ -326,7 +333,7 @@ def sha256(path: Path) -> str:
 
 
 def load_common():
-    receipt = ROOT / "executed" / "baseline-runner.sha256"
+    receipt = COMMON_RECEIPT
     if not receipt.exists():
         raise SystemExit(f"REFUSED: common-runner receipt missing: {receipt}")
     expected = receipt.read_text().strip().split()[0]

@@ -68,6 +68,18 @@ def court_branch50_terminal_is_bound_as_control_reference() -> None:
     )
 
 
+def court_common_runner_receipt_is_inherited_from_branch50(runner) -> None:
+    expected = (
+        REPO
+        / "experiments"
+        / "branch50-linear-context-v0"
+        / "executed"
+        / "baseline-runner.sha256"
+    )
+    assert runner.COMMON_RECEIPT == expected
+    assert expected.is_file()
+
+
 def court_optimizer_geometry_is_one_factor(runner) -> None:
     baseline = baseline_knobs()
     geometry = dict(baseline)
@@ -221,6 +233,7 @@ def main() -> None:
     runner = load_runner()
     courts = [
         court_branch50_terminal_is_bound_as_control_reference,
+        court_common_runner_receipt_is_inherited_from_branch50,
         court_optimizer_geometry_is_one_factor,
         court_mixed_geometry_and_ffn_is_not_single_factor,
         court_scheduler_is_one_factor_with_min_ratio,
