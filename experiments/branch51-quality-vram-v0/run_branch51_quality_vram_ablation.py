@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one resumable Branch-51 quality/VRAM ablation."""
+"""Run one resumable Branch52 activation-checkpointing ablation."""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent
 SOURCE = Path(__file__).resolve().parents[2]
 RUN_ROOT = Path(
     os.environ.get(
-        "HELIX_BRANCH51_RUN_ROOT",
-        "/home/mo/DEV/experiments/helix-branch51-quality-vram-v0",
+        "HELIX_BRANCH52_RUN_ROOT",
+        "/home/mo/DEV/experiments/helix-branch52-activation-checkpointing-v0",
     )
 )
 BASELINE_ROOT = Path("/home/mo/DEV/experiments/helix-branch49-5080-scaling-v0")
@@ -41,6 +41,7 @@ COMMON_RECEIPT = (
 )
 MODEL_BASE_HEAD = "03d0698dd3365c81695d9ed8d4568d35d6044fbb"
 MODEL_BASE_TREE = "745c042db9860bca4cdfa180543f8a60a769c936"
+BRANCH51_BASE_HEAD = "d297a3c633f04751bc9e0a0f7af28e2751c47853"
 EXPECTED_PARAMETER_COUNT = 53_592_340
 GPT2_SPECIAL_ID = 50_256
 SEQ_LEN = 512
@@ -342,7 +343,7 @@ def load_common():
         raise SystemExit(
             f"REFUSED: common runner drift: actual={actual} expected={expected}"
         )
-    spec = importlib.util.spec_from_file_location("branch51_u16_common", COMMON_PATH)
+    spec = importlib.util.spec_from_file_location("branch52_u16_common", COMMON_PATH)
     if spec is None or spec.loader is None:
         raise SystemExit("REFUSED: cannot load common U16 runner")
     module = importlib.util.module_from_spec(spec)
@@ -365,29 +366,40 @@ def verify_source_identity() -> dict[str, str]:
     head = git("rev-parse", "HEAD").stdout.strip()
     tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
     dirty = git("status", "--porcelain").stdout.strip()
-    model_diff = git(
-        "diff",
-        "--quiet",
-        MODEL_BASE_HEAD,
-        "--",
-        "helix_lm",
-        "requirements.txt",
-        check=False,
-    )
     if dirty:
-        raise SystemExit(f"REFUSED: Branch-51 source checkout dirty:\n{dirty}")
-    if model_diff.returncode != 0:
+        raise SystemExit(f"REFUSED: Branch52 source checkout dirty:\n{dirty}")
+    changed_paths = {
+        path
+        for path in git(
+            "diff", "--name-only", f"{BRANCH51_BASE_HEAD}...HEAD"
+        ).stdout.splitlines()
+        if path
+    }
+    allowed_paths = {
+        "helix_lm/hf_model.py",
+        "experiments/branch51-quality-vram-v0/run_branch51_quality_vram_ablation.py",
+        "experiments/branch52-activation-checkpointing-v0/README.md",
+        "experiments/branch52-activation-checkpointing-v0/BRANCH52_EXPERIMENT_LEDGER.md",
+        "experiments/branch52-activation-checkpointing-v0/test_branch52_activation_checkpointing.py",
+    }
+    unexpected_paths = changed_paths - allowed_paths
+    required_paths = {
+        "helix_lm/hf_model.py",
+        "experiments/branch51-quality-vram-v0/run_branch51_quality_vram_ablation.py",
+    }
+    if unexpected_paths or not required_paths.issubset(changed_paths):
         raise SystemExit(
-            "REFUSED: model-source bytes drift from admitted Branch-51 base "
-            f"{MODEL_BASE_HEAD}"
+            "REFUSED: Branch52 source boundary mismatch: "
+            f"changed={sorted(changed_paths)!r} unexpected={sorted(unexpected_paths)!r}"
         )
     return {
         "source_head": head,
         "source_tree": tree,
         "source_dirty": "false",
+        "branch51_base_head": BRANCH51_BASE_HEAD,
         "model_base_head": MODEL_BASE_HEAD,
         "model_base_tree": MODEL_BASE_TREE,
-        "model_source_diff": "false",
+        "model_source_diff": "activation_checkpointing_only",
     }
 
 
@@ -605,6 +617,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-dropout", type=float, default=0.05)
     parser.add_argument("--ffn-expansion", type=float, default=2.5)
     parser.add_argument("--n-loops", type=int, default=BASELINE_N_LOOPS)
+    parser.add_argument("--activation-checkpointing", action="store_true")
     parser.add_argument("--mlflow-uri", default="https://mlflow.thunderline.net")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--max-optimizer-steps", type=int, default=0)
@@ -635,7 +648,7 @@ def main() -> None:
             for batch, accum in sorted(ALLOWED_OPTIMIZER_GEOMETRIES)
         )
         raise SystemExit(
-            "REFUSED: Branch51 supported optimizer geometries are "
+            "REFUSED: Branch52 supported optimizer geometries are "
             f"{allowed}"
         )
     expected_warmup_microbatches = GEOMETRY_WARMUP_MICROBATCHES[
@@ -701,6 +714,7 @@ def main() -> None:
         "batch_size": BASELINE_BATCH_SIZE,
         "grad_accum": BASELINE_GRAD_ACCUM,
         "n_loops": BASELINE_N_LOOPS,
+        "activation_checkpointing": False,
     }
     resolved_knobs = {
         "learning_rate": args.learning_rate,
@@ -716,6 +730,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,
         "n_loops": args.n_loops,
+        "activation_checkpointing": args.activation_checkpointing,
     }
     changed_knobs = changed_knobs_from(baseline_knobs, resolved_knobs)
     promotion_manifest: dict[str, Any] | None = None
@@ -799,6 +814,12 @@ def main() -> None:
     )
     device = torch.device("cuda")
     model = HelixForCausalLM(cfg).to(device)
+    if args.activation_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    if bool(model.gradient_checkpointing) != args.activation_checkpointing:
+        raise SystemExit("REFUSED: activation checkpointing instantiation mismatch")
     params = model.count_parameters()
     if args.ffn_expansion == 2.5 and args.n_loops == BASELINE_N_LOOPS and (
         int(params["total"]) != EXPECTED_PARAMETER_COUNT
@@ -837,8 +858,8 @@ def main() -> None:
         "val_manifest_sha256": common.manifest_root(val_manifest),
     }
     ablation_contract = {
-        "schema": "helix.branch51.quality-vram-ablation.v0",
-        "branch51_profile": "quality_vram_scaling_v0",
+        "schema": "helix.branch52.activation-checkpointing-ablation.v0",
+        "branch52_profile": "activation_checkpointing_v0",
         "ablation_id": args.ablation_id,
         "changed_knobs": changed_knobs,
         "knobs": resolved_knobs,
@@ -906,7 +927,7 @@ def main() -> None:
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_name = (
-        f"branch51-ablation-{args.ablation_id}-s512-b{args.batch_size}"
+        f"branch52-ablation-{args.ablation_id}-s512-b{args.batch_size}"
         f"-a{args.grad_accum}-t{target_causal_targets}-{stamp}"
     )
     run_root = RUN_ROOT / "artifacts" / "quality-vram-ablation-v0" / run_name
@@ -914,7 +935,7 @@ def main() -> None:
     harness_sha = sha256(Path(__file__))
     logger = RealtimeMLflowLogger(
         tracking_uri=args.mlflow_uri,
-        experiment="helix-branch51-quality-vram-v0",
+        experiment="helix-branch52-activation-checkpointing-v0",
         run_name=run_name,
         spool_path=run_root / "mlflow_spool.jsonl",
         params={
@@ -975,6 +996,10 @@ def main() -> None:
             "amp_dtype": "bfloat16",
             "strict_nan_check": True,
             "grad_buffer_ratio": 0.0,
+            "activation_checkpointing_requested": args.activation_checkpointing,
+            "activation_checkpointing_instantiated": bool(
+                model.gradient_checkpointing
+            ),
             "ordering_algorithm": common.ORDERING_ALGORITHM,
             "validation_batches": args.validation_batches,
             "checkpoint_every": args.checkpoint_every,
@@ -997,12 +1022,12 @@ def main() -> None:
         },
         tags={
             "run_kind": (
-                "branch51_promoted_full_corpus_v0"
+                "branch52_promoted_full_corpus_v0"
                 if promotion_manifest is not None and args.full_corpus_pass
                 else (
-                    "branch51_promoted_combined_pilot_v0"
+                    "branch52_promoted_combined_pilot_v0"
                     if promotion_manifest is not None
-                    else "branch51_single_factor_ablation_v0"
+                    else "branch52_single_factor_ablation_v0"
                 )
             ),
             "production_effect": "none",
@@ -1020,7 +1045,7 @@ def main() -> None:
         json.dumps(
             {
                 "schema": "thunderline.training.mission.projection.v0",
-                "profile": "HELIX_BRANCH51_QUALITY_VRAM_V0",
+                "profile": "HELIX_BRANCH52_ACTIVATION_CHECKPOINTING_V0",
                 "mission": {
                     "workload": "helix_model_training",
                     "production_effect": "none",
@@ -1103,6 +1128,13 @@ def main() -> None:
                     raise RuntimeError(f"NONFINITE_LOSS step={step}")
                 targets = common.count_causal_targets(device_batch["labels"])
                 (loss * (targets / group_targets)).backward()
+                if args.activation_checkpointing and (
+                    model._gradient_checkpoint_function_calls
+                    <= model._gradient_checkpoint_forward_calls
+                ):
+                    raise RuntimeError(
+                        "ACTIVATION_CHECKPOINTING_RECOMPUTE_NOT_OBSERVED"
+                    )
                 losses.append((float(loss.detach().cpu()), targets))
                 offset = batch_offset
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -1143,6 +1175,16 @@ def main() -> None:
                     )
                     / elapsed,
                     "train/lr": lr,
+                    "train/gradient_checkpoint_forward_calls": float(
+                        model._gradient_checkpoint_forward_calls
+                    ),
+                    "train/gradient_checkpoint_function_calls": float(
+                        model._gradient_checkpoint_function_calls
+                    ),
+                    "train/gradient_checkpoint_recompute_calls": float(
+                        model._gradient_checkpoint_function_calls
+                        - model._gradient_checkpoint_forward_calls
+                    ),
                     "train/gradient_norm_pre_clip": float(grad_norm.detach().cpu()),
                     "system/peak_vram_bytes": float(torch.cuda.max_memory_allocated()),
                     "train/skipped_batches": 0.0,
@@ -1398,6 +1440,23 @@ def main() -> None:
         "attention_dropout": cfg.attn_dropout,
         "ffn_expansion": cfg.ffn_expansion,
         "n_loops": cfg.n_loops,
+        "activation_checkpointing_requested": args.activation_checkpointing,
+        "activation_checkpointing_instantiated": bool(model.gradient_checkpointing),
+        "activation_checkpointing_forward_calls": (
+            model._gradient_checkpoint_forward_calls
+        ),
+        "activation_checkpointing_function_calls": (
+            model._gradient_checkpoint_function_calls
+        ),
+        "activation_checkpointing_recompute_calls": (
+            model._gradient_checkpoint_function_calls
+            - model._gradient_checkpoint_forward_calls
+        ),
+        "activation_checkpointing_executed": bool(
+            args.activation_checkpointing
+            and model._gradient_checkpoint_function_calls
+            > model._gradient_checkpoint_forward_calls
+        ),
         "scheduler_policy": args.scheduler_policy,
         "scheduler_min_lr_ratio": args.scheduler_min_lr_ratio,
         "scheduler": schedule,

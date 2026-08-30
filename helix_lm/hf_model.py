@@ -155,6 +155,14 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.config = config
 
+        # Hugging Face only enables checkpointing on modules that expose this
+        # runtime flag.  The class advertised support before Branch52, but no
+        # module consumed the checkpoint function, so enabling it was a no-op
+        # (or raised, depending on the Transformers version).
+        self.gradient_checkpointing = False
+        self._gradient_checkpoint_forward_calls = 0
+        self._gradient_checkpoint_function_calls = 0
+
         # Hard-enforce: this model has no KV-cache
         self.config.use_cache = False
 
@@ -260,11 +268,35 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         # SACRED: Pass e (NOT detached) to preserve full gradient flow.
         # e.detach() was tested and causes ~2x PPL regression.
         # Pass attention_mask and cca_step for regression fixes (mask propagation, CCA)
-        h = self.model.recurrent(
-            e, e,
-            attention_mask=attention_mask,
-            cca_step=kwargs.get("cca_step", None),
-        )
+        cca_step = kwargs.get("cca_step", None)
+        if self.training and self.gradient_checkpointing:
+            if not hasattr(self, "_gradient_checkpointing_func"):
+                raise RuntimeError(
+                    "gradient checkpointing was enabled without a checkpoint function"
+                )
+
+            self._gradient_checkpoint_forward_calls += 1
+
+            def recurrent_forward(h: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+                # A checkpointed function executes once in the forward pass and
+                # once again during backward recomputation.  The counters are
+                # deliberately runtime-only evidence, not model state.
+                self._gradient_checkpoint_function_calls += 1
+                return self.model.recurrent(
+                    h,
+                    embedding,
+                    attention_mask=attention_mask,
+                    cca_step=cca_step,
+                )
+
+            h = self._gradient_checkpointing_func(recurrent_forward, e, e)
+        else:
+            h = self.model.recurrent(
+                e,
+                e,
+                attention_mask=attention_mask,
+                cca_step=cca_step,
+            )
 
         # Output
         # P2 FIX: Removed the CUDA-only h.clone() band-aid. The clone
