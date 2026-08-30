@@ -37,7 +37,13 @@ fi
 
 jq -e '
   .status == "PASS" and
+  .mlflow_run_id == "3b4d833fea24417eae11f87184e69ff1" and
+  .target_causal_targets == 400000000 and
   .data_offset.causal_targets_seen >= 400000000 and
+  .batch_size == 8 and
+  .grad_accum == 8 and
+  .ffn_expansion == 2.5 and
+  .n_loops == 3 and
   .nonfinite_events == 0 and
   .skipped_batches == 0 and
   .checkpoint_health == "PASS" and

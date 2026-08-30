@@ -9,6 +9,7 @@ branch=53-from-52-ffn-expansion
 single_new_factor=ffn_expansion_2.5_to_3.0
 target_causal_targets=400000000
 launch_gate=exact_branch52_terminal_pass
+parent_mlflow_run_id=3b4d833fea24417eae11f87184e69ff1
 gpu_overlap=forbidden
 production_effect=none
 ```

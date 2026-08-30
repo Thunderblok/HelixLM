@@ -25,6 +25,13 @@
   "evidence_run_ids": [
     "3b4d833fea24417eae11f87184e69ff1"
   ],
+  "parent_terminal_gate": {
+    "run_root": "/home/mo/DEV/experiments/helix-branch52-activation-checkpointing-v0/artifacts/quality-vram-ablation-v0/branch52-ablation-activation-checkpointing-b8-a8-400m-s512-b8-a8-t400000000-20260830T165308Z",
+    "mlflow_run_id": "3b4d833fea24417eae11f87184e69ff1",
+    "required_status": "PASS",
+    "minimum_causal_targets": 400000000,
+    "required_numerical_health": "PASS"
+  },
   "decision": "founder-authorized queued 400M FFN 3.0 pilot after the Branch52 400M terminal passes its numerical, checkpoint, MLflow, and target-count gates",
   "quality_claim": "unavailable_until_fixed_token_400m_pilot"
 }
