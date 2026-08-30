@@ -109,7 +109,7 @@ def main() -> None:
         finally:
             MODULE.sys.executable = original_executable
 
-    print("LIGHEVAL_CHECKPOINT_PREFLIGHT_HELPER_COURTS=PASS")
+    print("LIGHTEVAL_CHECKPOINT_PREFLIGHT_HELPER_COURTS=PASS")
 
 
 if __name__ == "__main__":
