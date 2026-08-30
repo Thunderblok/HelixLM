@@ -1,0 +1,77 @@
+{
+  "schema": "helix.branch50.full-corpus-terminal-summary.v0",
+  "run_id": "branch50-ablation-promoted-full-corpus-s512-b12-a7-t1501062500-20260829T142802Z",
+  "mlflow_run_id": "98ecead0eaba4b438728d8ce51a926c5",
+  "status": "PASS",
+  "full_corpus_pass": true,
+  "promotion_eligible": true,
+  "stop_reason": "target_reached",
+  "identity": {
+    "source_head": "fd471eaf002fa0f7e6874c41816126a4b4204de1",
+    "source_tree": "b454e1f7ccf304b6719fda4075c0a531338a19c7",
+    "model_base_head": "03d0698dd3365c81695d9ed8d4568d35d6044fbb",
+    "runner_sha256": "383365daf14ecf4aff0907257c59c5be8de27d7fc9829d525686614848eab609",
+    "promotion_manifest_sha256": "cfe1bd96ce06224e24ebfd02b5065c26426fbe6087491a71c19789fe37295f4b",
+    "promotion_manifest_root": "646b72db7420115e8708018656f34dcd4b0c888cb9e21aba99e04222a3e9fe18",
+    "resolved_config_sha256": "f5343e2669e846b31345724ebaf5a98444bc32e9f10db48d54f2ac08482e5fe0",
+    "terminal_json_sha256": "e62af912015daaa1c0ef1e48a896f1430e9ace235c2c224599b2b8aa30af962a"
+  },
+  "configuration": {
+    "parameter_count": 53592340,
+    "sequence_length": 512,
+    "batch_size": 12,
+    "gradient_accumulation": 7,
+    "effective_sequences": 84,
+    "raw_tokens_per_optimizer_step": 43008,
+    "causal_targets_per_optimizer_step": 42924,
+    "learning_rate": 0.00015,
+    "scheduler": "linear_warmup_then_constant",
+    "warmup_microbatches": 2000,
+    "warmup_optimizer_steps": 285,
+    "minimum_lr_ratio_after_warmup": 1.0,
+    "weight_decay": 0.05,
+    "gradient_clip": 1.0,
+    "dropout": 0.05,
+    "attention_dropout": 0.05,
+    "ffn_expansion": 2.5,
+    "n_loops": 3,
+    "compressed_windows": 8,
+    "compressed_views": 8,
+    "master_dtype": "float32",
+    "amp_dtype": "bfloat16",
+    "grad_buffer_ratio": 0.0,
+    "strict_nan_check": true
+  },
+  "outcome": {
+    "raw_tokens_seen": 1504000000,
+    "causal_targets_seen": 1501062500,
+    "samples_seen": 2937500,
+    "optimizer_steps": 34971,
+    "best_validation_step": 34700,
+    "best_validation_loss": 3.858164131641388,
+    "best_validation_perplexity": 47.378291172127675,
+    "final_validation_loss": 3.8601065427064896,
+    "final_validation_perplexity": 47.47040872526028,
+    "peak_vram_bytes": 12655427072,
+    "skipped_batches": 0,
+    "nonfinite_events": 0
+  },
+  "artifacts": {
+    "final_model_root": "92c739460e738eb4fdc6c86b0a093131831aadeb74fe4c6f38a6aa70e30af127",
+    "terminal_checkpoint_sha256": "d25bf658f2bc87485afefe44638639cfbbeb214da739c6bad7acd55f0712360f",
+    "terminal_checkpoint_readback": "PASS",
+    "best_model_checkpoint_sha256": "ca7705d7266f3590e9bbc7dd253476eb7888be477cbd97d538ee647927cdada4",
+    "best_model_checkpoint_readback": "PASS"
+  },
+  "health": {
+    "numerical": "PASS",
+    "checkpoint": "PASS",
+    "mlflow": "PASS",
+    "mlflow_errors": []
+  },
+  "limitations": [
+    "Validation selection used the fixed 98112-causal-target court, not Lighteval.",
+    "Promotion eligibility is experiment evidence, not publication or production authority.",
+    "Checkpoint bodies remain outside git and are identified here by content hash."
+  ]
+}
