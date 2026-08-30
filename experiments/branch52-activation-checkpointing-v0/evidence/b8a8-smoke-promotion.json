@@ -1,6 +1,6 @@
 {
-  "schema": "helix.branch52.promotion-decision.v0",
-  "status": "PROMOTED_FOR_FIXED_TOKEN_PILOT_ONLY",
+  "schema": "helix.branch51.promotion-decision.v0",
+  "status": "PROMOTED",
   "selected_knobs": {
     "learning_rate": 0.00015,
     "warmup_microbatches": 2280,
@@ -26,6 +26,6 @@
     "0543fb4cabf64475acae5d05be93e4f6",
     "305be47eeef14735aaf4bcc51d9832c6"
   ],
-  "decision": "admit a fixed-token 100M b8a8 pilot after independent geometry and activation-checkpointing courts",
-  "quality_claim": "unavailable_until_fixed_token_pilot"
+  "decision": "admit a fixed-token 400M b8a8 Branch52 pilot by founder direction after independent geometry and activation-checkpointing courts",
+  "quality_claim": "unavailable_until_fixed_token_400m_pilot"
 }
