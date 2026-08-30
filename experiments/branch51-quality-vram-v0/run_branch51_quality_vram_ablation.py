@@ -380,6 +380,8 @@ def verify_source_identity() -> dict[str, str]:
         "experiments/branch51-quality-vram-v0/run_branch51_quality_vram_ablation.py",
         "experiments/branch52-activation-checkpointing-v0/README.md",
         "experiments/branch52-activation-checkpointing-v0/BRANCH52_EXPERIMENT_LEDGER.md",
+        "experiments/branch52-activation-checkpointing-v0/evidence/activation-checkpoint-smokes-20260830.json",
+        "experiments/branch52-activation-checkpointing-v0/evidence/b8a8-smoke-promotion.json",
         "experiments/branch52-activation-checkpointing-v0/test_branch52_activation_checkpointing.py",
     }
     unexpected_paths = changed_paths - allowed_paths
