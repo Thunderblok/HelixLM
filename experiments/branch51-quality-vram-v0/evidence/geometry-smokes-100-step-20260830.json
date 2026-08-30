@@ -1,0 +1,61 @@
+{
+  "schema": "helix.branch51.geometry-smokes.v0",
+  "source_head": "8a9d5988099d6307798595afd4ca03ca54b22945",
+  "status": "PASS",
+  "quality_claim": "unavailable_from_100_step_warmup_smokes",
+  "shared": {
+    "amp_dtype": "bfloat16",
+    "master_dtype": "float32",
+    "nonfinite_events": 0,
+    "parameter_count": 53592340,
+    "seq_len": 512,
+    "skipped_batches": 0,
+    "warmup_optimizer_steps": 285
+  },
+  "runs": [
+    {
+      "batch_size": 12,
+      "best_val_loss": 8.536221027374268,
+      "best_val_ppl": 5096.050094549297,
+      "causal_targets_per_optimizer_step": 42924,
+      "grad_accum": 7,
+      "mlflow_run_id": "9e14dbe8bc414d5e913ca51c55d37789",
+      "peak_vram_bytes": 12043352064,
+      "raw_tokens_per_second_at_step_100": 19117.99392687112,
+      "run_id": "branch51-ablation-control-s512-b12-a7-t5000000-20260830T134249Z",
+      "terminal_sha256": "d8ca542f1c426e3f07150c7d91c6235c71d0b21546fef8345fa711127a7e0efd",
+      "warmup_microbatches": 2000
+    },
+    {
+      "batch_size": 10,
+      "best_val_loss": 8.559626579284668,
+      "best_val_ppl": 5216.732772604541,
+      "causal_targets_per_optimizer_step": 30660,
+      "grad_accum": 6,
+      "mlflow_run_id": "7acca60a8c524767a65e9a4dfd93a904",
+      "peak_vram_bytes": 10202473472,
+      "raw_tokens_per_second_at_step_100": 18126.85408354904,
+      "run_id": "branch51-ablation-geometry-b10-a6-s512-b10-a6-t5000000-20260830T133543Z",
+      "terminal_sha256": "3708cf6790cba5baf27ce3f8113f313872e55e2fe11e131192989985303284ba",
+      "warmup_microbatches": 1710
+    },
+    {
+      "batch_size": 8,
+      "best_val_loss": 8.559529840946198,
+      "best_val_ppl": 5216.228138952979,
+      "causal_targets_per_optimizer_step": 32704,
+      "grad_accum": 8,
+      "mlflow_run_id": "b718c841f07f46dcb3101e4cabd13163",
+      "peak_vram_bytes": 8364573696,
+      "raw_tokens_per_second_at_step_100": 16737.158475629032,
+      "run_id": "branch51-ablation-geometry-b8-a8-s512-b8-a8-t5000000-20260830T133849Z",
+      "terminal_sha256": "4bad0ac28ba7604a93612651a5b8015c94bc984ba745f3359ebb90d1a8166861",
+      "warmup_microbatches": 2280
+    }
+  ],
+  "selection": {
+    "first_quality_pilot": "batch10xaccum6",
+    "reason": "saves 1.84 GB allocated VRAM versus control while retaining 94.8 percent of control step-100 raw-token throughput; batch8xaccum8 saves more memory but retains 87.5 percent throughput",
+    "stop_condition": "promote only after a fixed-token validation trajectory, not from startup perplexity"
+  }
+}
