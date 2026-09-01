@@ -75,6 +75,7 @@ if setsid env \
     --dropout 0.05 \
     --attention-dropout 0.05 \
     --ffn-expansion 3.0 \
+    --expected-profile ffn_expansion_3p0_v0 \
     --n-loops 3 \
     --activation-checkpointing \
     --promotion-manifest "${PROMOTION}" \

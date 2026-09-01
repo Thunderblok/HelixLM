@@ -43,6 +43,7 @@ MODEL_BASE_HEAD = "03d0698dd3365c81695d9ed8d4568d35d6044fbb"
 MODEL_BASE_TREE = "745c042db9860bca4cdfa180543f8a60a769c936"
 BRANCH51_BASE_HEAD = "d297a3c633f04751bc9e0a0f7af28e2751c47853"
 EXPECTED_PARAMETER_COUNT = 53_592_340
+EXPECTED_FFN_3P0_PARAMETER_COUNT = 54_771_988
 GPT2_SPECIAL_ID = 50_256
 SEQ_LEN = 512
 CAUSAL_TARGETS_PER_SAMPLE = SEQ_LEN - 1
@@ -57,6 +58,9 @@ GEOMETRY_WARMUP_MICROBATCHES = {
     (12, 9): 2_565,
 }
 ALLOWED_OPTIMIZER_GEOMETRIES = frozenset(GEOMETRY_WARMUP_MICROBATCHES)
+AUTO_PROFILE = "auto"
+FFN_3P0_PROFILE = "ffn_expansion_3p0_v0"
+LEARNING_RATE_PROFILE = "learning_rate_ablation_v0"
 
 
 def build_scheduler_state(
@@ -492,6 +496,55 @@ def changed_knobs_from(
     return changed_knobs
 
 
+def resolve_branch53_profile(
+    *,
+    expected_profile: str,
+    resolved_knobs: dict[str, Any],
+    changed_knobs: list[str],
+) -> str:
+    if (
+        resolved_knobs.get("ffn_expansion") == 3.0
+        and "ffn_expansion" in changed_knobs
+    ):
+        observed_profile = FFN_3P0_PROFILE
+    elif (
+        resolved_knobs.get("ffn_expansion") == 2.5
+        and changed_knobs == ["learning_rate"]
+    ):
+        observed_profile = LEARNING_RATE_PROFILE
+    else:
+        observed_profile = "branch53_ablation_v0"
+
+    if expected_profile != AUTO_PROFILE and expected_profile != observed_profile:
+        raise SystemExit(
+            "REFUSED: Branch53 profile/config mismatch: "
+            f"expected={expected_profile!r} observed={observed_profile!r} "
+            f"changed_knobs={changed_knobs!r} "
+            f"ffn_expansion={resolved_knobs.get('ffn_expansion')!r}"
+        )
+    return observed_profile
+
+
+def validate_branch53_parameter_count(
+    *, profile: str, parameter_count: dict[str, Any]
+) -> None:
+    expected = {
+        FFN_3P0_PROFILE: EXPECTED_FFN_3P0_PARAMETER_COUNT,
+        LEARNING_RATE_PROFILE: EXPECTED_PARAMETER_COUNT,
+    }.get(profile)
+    if expected is None:
+        return
+
+    total = int(parameter_count["total"])
+    trainable = int(parameter_count["trainable"])
+    if total != expected or trainable != expected:
+        raise SystemExit(
+            "REFUSED: Branch53 parameter count mismatch: "
+            f"profile={profile!r} expected={expected} "
+            f"observed_total={total} observed_trainable={trainable}"
+        )
+
+
 def validate_promotion_manifest(
     manifest: dict[str, Any],
     *,
@@ -623,6 +676,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--attention-dropout", type=float, default=0.05)
     parser.add_argument("--ffn-expansion", type=float, default=2.5)
+    parser.add_argument(
+        "--expected-profile",
+        choices=(AUTO_PROFILE, FFN_3P0_PROFILE, LEARNING_RATE_PROFILE),
+        default=AUTO_PROFILE,
+    )
     parser.add_argument("--n-loops", type=int, default=BASELINE_N_LOOPS)
     parser.add_argument("--activation-checkpointing", action="store_true")
     parser.add_argument("--mlflow-uri", default="https://mlflow.thunderline.net")
@@ -740,6 +798,11 @@ def main() -> None:
         "activation_checkpointing": args.activation_checkpointing,
     }
     changed_knobs = changed_knobs_from(baseline_knobs, resolved_knobs)
+    branch53_profile = resolve_branch53_profile(
+        expected_profile=args.expected_profile,
+        resolved_knobs=resolved_knobs,
+        changed_knobs=changed_knobs,
+    )
     promotion_manifest: dict[str, Any] | None = None
     promotion_manifest_root: str | None = None
     if args.promotion_manifest:
@@ -828,6 +891,10 @@ def main() -> None:
     if bool(model.gradient_checkpointing) != args.activation_checkpointing:
         raise SystemExit("REFUSED: activation checkpointing instantiation mismatch")
     params = model.count_parameters()
+    validate_branch53_parameter_count(
+        profile=branch53_profile,
+        parameter_count=params,
+    )
     if args.ffn_expansion == 2.5 and args.n_loops == BASELINE_N_LOOPS and (
         int(params["total"]) != EXPECTED_PARAMETER_COUNT
         or int(params["trainable"]) != EXPECTED_PARAMETER_COUNT
@@ -865,8 +932,10 @@ def main() -> None:
         "val_manifest_sha256": common.manifest_root(val_manifest),
     }
     ablation_contract = {
-        "schema": "helix.branch53.ffn-expansion-ablation.v0",
-        "branch53_profile": "ffn_expansion_3p0_v0",
+        "schema": "helix.branch53.ablation.v0",
+        "branch53_profile": branch53_profile,
+        "expected_profile": args.expected_profile,
+        "resolved_invocation_arguments": sys.argv[1:],
         "ablation_id": args.ablation_id,
         "changed_knobs": changed_knobs,
         "knobs": resolved_knobs,
@@ -955,6 +1024,8 @@ def main() -> None:
             "data_root": str(common.DATA),
             "validation_data_root": str(common.VAL_DATA),
             "ablation_id": args.ablation_id,
+            "branch53_profile": branch53_profile,
+            "expected_profile": args.expected_profile,
             "changed_knobs": json.dumps(changed_knobs),
             "ablation_contract_root": canonical_root(ablation_contract),
             "seq_len": SEQ_LEN,
@@ -1052,7 +1123,10 @@ def main() -> None:
         json.dumps(
             {
                 "schema": "thunderline.training.mission.projection.v0",
-                "profile": "HELIX_BRANCH53_FFN_EXPANSION_V0",
+                "profile": {
+                    FFN_3P0_PROFILE: "HELIX_BRANCH53_FFN_EXPANSION_V0",
+                    LEARNING_RATE_PROFILE: "HELIX_BRANCH53_LEARNING_RATE_V0",
+                }.get(branch53_profile, "HELIX_BRANCH53_ABLATION_V0"),
                 "mission": {
                     "workload": "helix_model_training",
                     "production_effect": "none",
@@ -1421,6 +1495,8 @@ def main() -> None:
         **terminal_record,
         "steps": step,
         "ablation_id": args.ablation_id,
+        "branch53_profile": branch53_profile,
+        "expected_profile": args.expected_profile,
         "seq_len": SEQ_LEN,
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,

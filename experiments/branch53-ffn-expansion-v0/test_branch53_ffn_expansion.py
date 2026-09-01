@@ -41,8 +41,65 @@ def selected_knobs() -> dict[str, object]:
     }
 
 
+def court_profile_binding_refuses_an_omitted_ffn_flag(runner) -> None:
+    hostile = selected_knobs()
+    hostile["learning_rate"] = 0.0002
+    hostile["ffn_expansion"] = 2.5
+
+    try:
+        runner.resolve_branch53_profile(
+            expected_profile="ffn_expansion_3p0_v0",
+            resolved_knobs=hostile,
+            changed_knobs=["learning_rate"],
+        )
+    except SystemExit as exc:
+        assert "profile/config mismatch" in str(exc)
+    else:
+        raise AssertionError("omitted FFN flag did not turn the profile court RED")
+
+    assert (
+        runner.resolve_branch53_profile(
+            expected_profile="auto",
+            resolved_knobs=hostile,
+            changed_knobs=["learning_rate"],
+        )
+        == "learning_rate_ablation_v0"
+    )
+    assert (
+        runner.resolve_branch53_profile(
+            expected_profile="ffn_expansion_3p0_v0",
+            resolved_knobs=selected_knobs(),
+            changed_knobs=[
+                "optimizer_geometry",
+                "ffn_expansion",
+                "activation_checkpointing",
+            ],
+        )
+        == "ffn_expansion_3p0_v0"
+    )
+
+
+def court_ffn_profile_binds_the_observed_parameter_count(runner) -> None:
+    try:
+        runner.validate_branch53_parameter_count(
+            profile="ffn_expansion_3p0_v0",
+            parameter_count={"total": 53_592_340, "trainable": 53_592_340},
+        )
+    except SystemExit as exc:
+        assert "parameter count mismatch" in str(exc)
+    else:
+        raise AssertionError("baseline-sized FFN 3.0 model did not turn the court RED")
+
+    runner.validate_branch53_parameter_count(
+        profile="ffn_expansion_3p0_v0",
+        parameter_count={"total": 54_771_988, "trainable": 54_771_988},
+    )
+
+
 def main() -> None:
     runner = load_runner()
+    court_profile_binding_refuses_an_omitted_ffn_flag(runner)
+    court_ffn_profile_binds_the_observed_parameter_count(runner)
     manifest = json.loads(MANIFEST.read_text())
     changed = ["optimizer_geometry", "ffn_expansion", "activation_checkpointing"]
     runner.validate_promotion_manifest(
