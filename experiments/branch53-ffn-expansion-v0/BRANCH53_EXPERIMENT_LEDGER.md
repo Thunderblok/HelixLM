@@ -52,3 +52,22 @@ next_gate=repair_profile_binding_then_matched_ffn_2.5_vs_3.0_preflight
 The run-local contract resolved `ffn_expansion=2.5`, the parameter count stayed
 at 53,592,340, and `changed_knobs` contained only `learning_rate`. The hard-coded
 `ffn_expansion_3p0_v0` profile is therefore not FFN evidence.
+
+## 2026-09-01 - profile repair and checkpoint evaluation gate
+
+The profile/config identity repair and exact checkpoint export preflights are
+documented in `BRANCH53_PROFILE_REPAIR_AND_EVAL_GATE_V0.md`.
+
+```text
+repair_head=bfe672b5939fd5c2b0f0b7871ef7004eb126b5cd
+profile_identity=PASS
+branch50_checkpoint_export=PASS
+branch53_checkpoint_export=PASS
+downstream_lighteval=UNAVAILABLE
+matched_ffn_preflight=HELD
+new_full_corpus_run=FORBIDDEN
+```
+
+No downstream benchmark was executed. The isolated Lighteval 0.13.0 attempt
+was stopped before it could replace the working Torch/CUDA stack. A frozen
+evaluator/task/data contract is the next gate.
