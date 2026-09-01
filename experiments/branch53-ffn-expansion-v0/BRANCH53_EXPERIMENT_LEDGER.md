@@ -31,3 +31,24 @@ quality_improvement=UNAVAILABLE
 throughput=UNAVAILABLE
 peak_vram=UNAVAILABLE
 ```
+
+## 2026-09-01 - completed full-corpus LR 2e-4 run
+
+The completed 1.504B-raw-token terminal is documented in
+`BRANCH53_FULL_CORPUS_LR2E4_REPORT_V0.md`.
+
+```text
+terminal=PASS
+mlflow_run_id=edcae37fcfd045b29c19482ae948bf58
+best_validation_perplexity=45.82256472942389
+final_validation_perplexity=45.82256472942389
+skipped_batches=0
+nonfinite_events=0
+valid_ablation=learning_rate_1.5e-4_to_2.0e-4
+ffn_expansion_ablation=NOT_EXECUTED
+next_gate=repair_profile_binding_then_matched_ffn_2.5_vs_3.0_preflight
+```
+
+The run-local contract resolved `ffn_expansion=2.5`, the parameter count stayed
+at 53,592,340, and `changed_knobs` contained only `learning_rate`. The hard-coded
+`ffn_expansion_3p0_v0` profile is therefore not FFN evidence.
