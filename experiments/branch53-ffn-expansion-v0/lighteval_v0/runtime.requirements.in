@@ -1,0 +1,13 @@
+lighteval==0.13.0
+inspect-ai==0.3.140
+datasets==4.8.5
+fsspec==2025.9.0
+huggingface-hub==1.28.0
+hf-xet==1.6.0
+lxml==6.0.2
+pydantic==2.13.4
+tokenizers==0.22.2
+torch @ https://download-r2.pytorch.org/whl/nightly/cu128/torch-2.12.0.dev20260408%2Bcu128-cp314-cp314-manylinux_2_28_x86_64.whl
+triton @ https://download-r2.pytorch.org/whl/nightly/triton-3.7.0%2Bgit282c8251-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+transformers==5.8.1
+xxhash==3.6.0

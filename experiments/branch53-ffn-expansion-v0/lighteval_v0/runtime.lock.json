@@ -1,0 +1,38 @@
+{
+  "schema_version": "helix.lighteval.runtime-lock.v0",
+  "python": "3.14.2",
+  "package_count": 158,
+  "requirements_input_sha256": "6da0e2629ef4e893ecdacbee923bfb6c513f3139f527d3e0a62930a44fd8826c",
+  "requirements_lock_sha256": "475a98a17736aeec6a9847a12cdfed7b0a8458d83ef7ffd73906eb4197480fea",
+  "installed_freeze_sha256": "1cd336fa13442d910ad1e7a7ee941f960afa9ae28477caaeed2e5dd15d61d03e",
+  "critical_packages": {
+    "inspect-ai": "0.3.140",
+    "lighteval": "0.13.0",
+    "torch": "2.12.0.dev20260408+cu128",
+    "transformers": "5.8.1",
+    "triton": "3.7.0+git282c8251",
+    "xxhash": "3.6.0"
+  },
+  "cuda": {
+    "torch_cuda": "12.8",
+    "device": "NVIDIA GeForce RTX 5080",
+    "device_count": 1,
+    "bfloat16_smoke": [2.0, 4.0, 6.0]
+  },
+  "auxiliary_resources": {
+    "nltk_punkt": {
+      "archive_path": "/home/mo/DEV/experiments/helix-lighteval-runtime-v0/cache/nltk/tokenizers/punkt.zip",
+      "archive_sha256": "51c3078994aeaf650bfc8e028be4fb42b4a0d177d41c012b6a983979653660ec"
+    },
+    "nltk_punkt_tab": {
+      "archive_path": "/home/mo/DEV/experiments/helix-lighteval-runtime-v0/cache/nltk/tokenizers/punkt_tab.zip",
+      "archive_sha256": "e57f64187974277726a3417ca6f181ec5403676c717672eef6a748a7b20e0106"
+    }
+  },
+  "installation": {
+    "runtime_path": "/home/mo/DEV/experiments/helix-lighteval-runtime-v0/.venv",
+    "working_runtime_modified": false,
+    "legacy_tmp_runtime_modified": false,
+    "uv_pip_check": "PASS"
+  }
+}

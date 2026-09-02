@@ -1,0 +1,143 @@
+{
+  "schema_version": "helix.lighteval.paired-evaluation.v0",
+  "evaluator": {
+    "name": "lighteval",
+    "version": "0.13.0",
+    "python": "3.14.2",
+    "dependency_lock": "runtime.lock.json"
+  },
+  "model_adapter": {
+    "kind": "registered_local_transformers_export_v0",
+    "registration_module": "helix_lm.hf_model",
+    "config_class": "HelixConfig",
+    "model_class": "HelixForCausalLM",
+    "tokenizer_class": "HelixTokenizer",
+    "trust_remote_code": false,
+    "dtype": "bfloat16",
+    "device": "cuda",
+    "batch_size": 8,
+    "max_length": 512,
+    "add_special_tokens": true,
+    "skip_special_tokens": true,
+    "pairwise_tokenization": false,
+    "continuous_batching": false,
+    "compile": false
+  },
+  "sampling": {
+    "few_shots": 0,
+    "few_shot_seeds": 1,
+    "random_seed": 1234,
+    "max_samples": null,
+    "dataset_loading_processes": 1
+  },
+  "scoring": {
+    "comparison_unit": "task_primary_metric",
+    "aggregate": "unweighted_macro_mean_of_five_task_primary_metrics",
+    "sample_weighted_aggregate": false,
+    "winner_rule": "report_per_task_deltas_and_macro_delta_without_promotion",
+    "tie_rule": "exact_numeric_equality",
+    "higher_is_better": true
+  },
+  "tasks": [
+    {
+      "name": "helix_arc_easy",
+      "source_task": "arc:easy",
+      "hf_repo": "allenai/ai2_arc",
+      "hf_revision": "5a61ed188b8810abf32686fa83eb93787cbc5f25",
+      "source_revision": "210d026faf9955653af8916fad021475a3f00453",
+      "dataset_projection": "hf_refs_convert_parquet",
+      "hf_subset": "ARC-Easy",
+      "projection_files": {
+        "train": ["train/0000.parquet"],
+        "validation": ["validation/0000.parquet"],
+        "test": ["test/0000.parquet"]
+      },
+      "evaluation_splits": ["test"],
+      "metric": "loglikelihood_acc"
+    },
+    {
+      "name": "helix_hellaswag",
+      "source_task": "hellaswag",
+      "hf_repo": "Rowan/hellaswag",
+      "hf_revision": "382ffb520660cc2ba98092cd8aa07cafc9c47f6d",
+      "source_revision": "218ec52e09a7e7462a5400043bb9a69a41d06b76",
+      "dataset_projection": "hf_refs_convert_parquet",
+      "hf_subset": "default",
+      "projection_files": {
+        "train": ["train/0000.parquet"],
+        "validation": ["validation/0000.parquet"],
+        "test": ["test/0000.parquet"]
+      },
+      "evaluation_splits": ["validation"],
+      "metric": "exact_match"
+    },
+    {
+      "name": "helix_openbookqa",
+      "source_task": "openbookqa",
+      "hf_repo": "allenai/openbookqa",
+      "hf_revision": "ff32d06f3b17a43c2042765b39a22ba55a0d41f9",
+      "source_revision": "388097ea7776314e93a529163e0fea805b8a6454",
+      "dataset_projection": "hf_refs_convert_parquet",
+      "hf_subset": "main",
+      "projection_files": {
+        "train": ["train/0000.parquet"],
+        "validation": ["validation/0000.parquet"],
+        "test": ["test/0000.parquet"]
+      },
+      "evaluation_splits": ["validation"],
+      "metric": "exact_match"
+    },
+    {
+      "name": "helix_piqa",
+      "source_task": "piqa",
+      "hf_repo": "ybisk/piqa",
+      "hf_revision": "142c51238b3ca2bc61e9a075913871b8b600e8e1",
+      "source_revision": "2e8ac2dffd59bac8c3c6714948f4c551a0848bb0",
+      "dataset_projection": "hf_refs_convert_parquet",
+      "hf_subset": "plain_text",
+      "projection_files": {
+        "train": ["train/0000.parquet"],
+        "validation": ["validation/0000.parquet"],
+        "test": ["test/0000.parquet"]
+      },
+      "evaluation_splits": ["validation"],
+      "metric": "exact_match"
+    },
+    {
+      "name": "helix_winogrande",
+      "source_task": "winogrande",
+      "hf_repo": "allenai/winogrande",
+      "hf_revision": "546d5aa0e42fc0fa9ad2c13260322ec969e083ee",
+      "source_revision": "01e74176c63542e6b0bcb004dcdea22d94fb67b5",
+      "dataset_projection": "hf_refs_convert_parquet",
+      "hf_subset": "winogrande_xl",
+      "projection_files": {
+        "train": ["train/0000.parquet"],
+        "validation": ["validation/0000.parquet"],
+        "test": ["test/0000.parquet"]
+      },
+      "evaluation_splits": ["validation"],
+      "metric": "loglikelihood_acc"
+    }
+  ],
+  "checkpoints": [
+    {
+      "id": "branch50_lr1p5e4_ffn2p5_full_best",
+      "ffn_expansion": 2.5,
+      "parameter_count": 53592340,
+      "checkpoint_sha256": "ca7705d7266f3590e9bbc7dd253476eb7888be477cbd97d538ee647927cdada4",
+      "model_root_sha256": "9fdb212a2f6e24e083e43ce43bb266ff969f0ffcca8cda93bf74dbbd0005dee3",
+      "export_manifest_root_sha256": "d92c321e88fe134f51a561ef1a3766b3f3e69cb70fc129427dadaf7303e5b5b1",
+      "export_path": "/home/mo/DEV/experiments/helix-branch53-ffn-expansion-v0/artifacts/lighteval-preflight-v0/branch50-lr1p5e4-full-best-export"
+    },
+    {
+      "id": "branch53_lr2e4_ffn2p5_full_best",
+      "ffn_expansion": 2.5,
+      "parameter_count": 53592340,
+      "checkpoint_sha256": "588ed9606ff2b185c00f2fb8238d74c0ec5877ffbdce055674489e397b2a82bf",
+      "model_root_sha256": "e25e0fe551a39180b2e67447b445420d0561f3b362d89bdcd2714e4884882f0d",
+      "export_manifest_root_sha256": "e4ad037b750bc9205428c2f91bad4e30071332ff10e513c9799a4ad33cd9bdd4",
+      "export_path": "/home/mo/DEV/experiments/helix-branch53-ffn-expansion-v0/artifacts/lighteval-preflight-v0/branch53-lr2e4-full-best-export"
+    }
+  ]
+}
