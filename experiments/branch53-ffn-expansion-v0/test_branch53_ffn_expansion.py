@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 RUNNER = ROOT.parent / "branch51-quality-vram-v0" / "run_branch51_quality_vram_ablation.py"
 MANIFEST = ROOT / "evidence" / "ffn3p0-promotion.json"
+FULL_CORPUS_MANIFEST = ROOT / "evidence" / "ffn3p0-lr2e4-full-promotion.json"
 
 
 def load_runner():
@@ -39,6 +40,20 @@ def selected_knobs() -> dict[str, object]:
         "n_loops": 3,
         "activation_checkpointing": True,
     }
+
+
+def full_corpus_selected_knobs() -> dict[str, object]:
+    knobs = selected_knobs()
+    knobs.update(
+        {
+            "learning_rate": 0.0002,
+            "warmup_microbatches": 2000,
+            "batch_size": 12,
+            "grad_accum": 7,
+            "activation_checkpointing": False,
+        }
+    )
+    return knobs
 
 
 def court_profile_binding_refuses_an_omitted_ffn_flag(runner) -> None:
@@ -106,6 +121,13 @@ def main() -> None:
         manifest,
         resolved_knobs=selected_knobs(),
         changed_knobs=changed,
+    )
+
+    full_corpus_manifest = json.loads(FULL_CORPUS_MANIFEST.read_text())
+    runner.validate_promotion_manifest(
+        full_corpus_manifest,
+        resolved_knobs=full_corpus_selected_knobs(),
+        changed_knobs=["learning_rate", "ffn_expansion"],
     )
 
     hostile = dict(manifest)
