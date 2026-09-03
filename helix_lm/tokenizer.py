@@ -23,6 +23,8 @@ class HelixTokenizer:
         self._backend = None
         self._char_to_id: Optional[Dict[str, int]] = None
         self._id_to_char: Optional[Dict[int, str]] = None
+        self.padding_side = "left"
+        self.model_input_names = ["input_ids", "attention_mask"]
 
         if tokenizer_name == "char":
             # Character-level: must call build_vocab(texts) before use
