@@ -30,7 +30,7 @@ Compatible with both eager and lazy loading.
 """
 import random
 import threading
-from typing import List, Optional, Iterator, Dict, Any, Union, Tuple
+from typing import List, Optional, Iterable, Iterator, Dict, Any, Union, Tuple
 from collections import OrderedDict
 
 import torch
@@ -49,6 +49,14 @@ def _collate_batch(batch):
         "labels": labels,
         "attention_mask": attention_mask,
         "is_natural_stop": is_natural_stop,
+    }
+
+
+def collate_continuous(batch: List[Dict[str, torch.Tensor]]):
+    return {
+        "input_ids": torch.stack([b["input_ids"] for b in batch]),
+        "labels": torch.stack([b["labels"] for b in batch]),
+        "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
     }
 
 
@@ -433,6 +441,73 @@ class HelixDatasetFromTokens(Dataset):
             "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
             "is_natural_stop": torch.tensor(end >= len(self.tokens) * 0.9, dtype=torch.bool),
         }
+
+##########
+
+class ContinuousWindowDataset(IterableDataset):
+    """
+    Yields fixed-length seq_len windows from a continuous token stream.
+    Documents are concatenated with the tokenizer's eos_token.
+    No padding, no overlap, no label masking.
+
+    Args:
+        texts: Iterable of raw strings (List[str], Column, IterableColumn, etc.)
+        tokenizer: HelixTokenizer instance.
+        seq_len: Sequence length of the model.
+        buffer_size: Size of the shuffle buffer (number of windows). Larger = better shuffle, more RAM.
+        seed: Seed for the shuffle buffer.
+    """
+    def __init__(self, texts, tokenizer, seq_len: int, buffer_size: int = 50000, seed: int = 42):
+        super().__init__()
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self.buffer_size = buffer_size
+        self.seed = seed
+
+    def _token_stream(self):
+        """Yield individual token ids from the concatenated corpus."""
+        for text in self.texts:
+            text = text.strip()
+            if not text:
+                continue
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            yield from ids
+            if self.eos_token_id is not None:
+                yield self.eos_token_id
+
+    def _windowed_stream(self):
+        """Accumulate tokens and yield exactly seq_len windows."""
+        buf = []
+        for token_id in self._token_stream():
+            buf.append(token_id)
+            if len(buf) == self.seq_len:
+                chunk = torch.tensor(buf, dtype=torch.long)
+                yield {
+                    "input_ids": chunk,
+                    "labels": chunk.clone(),
+                    "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
+                }
+                buf = []
+        # Drop tail (< seq_len tokens). Standard for pretraining.
+
+    def __iter__(self):
+        # Shuffle buffer with reservoir-style sampling.
+        rng = random.Random(self.seed)
+        buf = []
+        for sample in self._windowed_stream():
+            if len(buf) < self.buffer_size:
+                buf.append(sample)
+            else:
+                idx = rng.randint(0, len(buf) - 1)
+                yield buf[idx]
+                buf[idx] = sample
+        rng.shuffle(buf)
+        for sample in buf:
+            yield sample
+
+##########
 
 
 class HelixHFDataset(Dataset):
