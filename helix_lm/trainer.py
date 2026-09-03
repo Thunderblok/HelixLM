@@ -641,6 +641,12 @@ class PretrainTrainer(Trainer):
       - labels = input_ids (no loss masking)
       - Non-overlapping windows
     Works with both List[str] / Column and IterableColumn inputs.
+
+    Args:
+        total_optimizer_steps: Optional known number of total optimizer steps.
+            If None, a constant LR after warmup is used (min_lr_ratio=1.0).
+        min_lr_ratio: Minimum learning rate ratio for cosine decay (only used if total_optimizer_steps is not None).
+        buffer_size: Size of shuffle buffer for continuous window dataset.
     """
     def __init__(
         self,
@@ -655,23 +661,42 @@ class PretrainTrainer(Trainer):
         amp_dtype="bfloat16",
         buffer_size=50000,
         seed=42,
-        num_workers=0,          # Keep 0 for simplicity; tokenization in main process.
+        num_workers=0,
+        total_optimizer_steps=None,
+        min_lr_ratio=1.0,
         **kwargs,
     ):
-        # Build continuous loaders before calling super
-        train_loader = self._build_continuous_loader(
-            train_texts, tokenizer, cfg.seq_len, cfg.batch_size,
-            buffer_size=buffer_size, seed=seed, num_workers=num_workers,
-            shuffle=True,
+        from torch.utils.data import DataLoader
+        from .dataset import ContinuousWindowDataset, collate_continuous
+
+        # Build continuous loaders
+        train_dataset = ContinuousWindowDataset(
+            train_texts, tokenizer, cfg.seq_len,
+            buffer_size=buffer_size, seed=seed, shuffle=True
         )
-        val_loader = None
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            collate_fn=collate_continuous,
+            num_workers=num_workers,
+            shuffle=False,  # dataset already shuffles
+        )
+
+        self.val_loader = None
         if val_texts is not None:
-            val_loader = self._build_continuous_loader(
-                val_texts, tokenizer, cfg.seq_len, cfg.batch_size,
-                buffer_size=buffer_size, seed=seed, num_workers=num_workers,
+            val_dataset = ContinuousWindowDataset(
+                val_texts, tokenizer, cfg.seq_len,
+                buffer_size=buffer_size, seed=seed, shuffle=False
+            )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=cfg.batch_size,
+                collate_fn=collate_continuous,
+                num_workers=num_workers,
                 shuffle=False,
             )
 
+        # Call parent with our pre-built loaders
         super().__init__(
             model=model,
             cfg=cfg,
@@ -680,26 +705,34 @@ class PretrainTrainer(Trainer):
             grad_accum_steps=grad_accum_steps,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
-            train_loader=train_loader,
-            val_loader=val_loader,
+            train_loader=self.train_loader,
+            val_loader=self.val_loader,
             **kwargs,
         )
 
-    @staticmethod
-    def _build_continuous_loader(
-        texts, tokenizer, seq_len, batch_size,
-        buffer_size, seed, num_workers, shuffle,
-    ):
-        from torch.utils.data import DataLoader
-        from .dataset import ContinuousWindowDataset, collate_continuous
+        self.total_optimizer_steps = total_optimizer_steps
+        # Override scheduler min_lr_ratio
+        self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
 
-        dataset = ContinuousWindowDataset(
-            texts, tokenizer, seq_len, buffer_size=buffer_size, seed=seed
-        )
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            collate_fn=collate_continuous,
-            num_workers=num_workers,
-            shuffle=False,  # shuffle is already handled inside the dataset
-        )
+        # If using constant LR, set the scheduler's min ratio explicitly
+        if total_optimizer_steps is None:
+            self._scheduler_min_lr = 1.0
+
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        Override to create scheduler without relying on len(self.train_loader).
+        If total_optimizer_steps is unknown, use a very large number and rely on
+        constant LR (min_lr_ratio=1.0) after warmup.
+        """
+        if self.scheduler is None:
+            from .trainer import get_cosine_schedule_with_warmup
+
+            total_steps = self.total_optimizer_steps if self.total_optimizer_steps is not None else 10**9
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self._scheduler_warmup,
+                num_training_steps=total_steps,
+                num_cycles=self._scheduler_cycles,
+                min_lr_ratio=self._scheduler_min_lr,
+            )
+        return super().train_epoch(epoch)
