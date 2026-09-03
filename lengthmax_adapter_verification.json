@@ -1,0 +1,34 @@
+{
+  "schema": "helix.lengthmax-adapter-verification.v0",
+  "source": {
+    "base_commit": "288d22528c53ead2f72fe565e843f13b9f081975",
+    "posture": "isolated experimental Branch-49 copy"
+  },
+  "tokenizer": {
+    "algorithm": "iterative-byte-bpe-vocab-leftmost-longest-v0",
+    "artifact": "/home/mo/DEV/experiments/helix-lengthmax-david-v1/iterative-hybrid-dev/iterative-hybrid-tokenizer.json",
+    "artifact_sha256": "5b2aca3a56fd9588eac88eb832ffd3491c14bc55cac06967cee05910537e52d1",
+    "vocab_size": 50257,
+    "special_id": 50256
+  },
+  "focused_tests": {
+    "tests": 6,
+    "failures": 0,
+    "errors": 0,
+    "terminal": "pass"
+  },
+  "real_artifact_smoke": {
+    "rows": 1000,
+    "raw_bytes": 5082141,
+    "tokens": 875868,
+    "bytes_per_token": 5.8024051569414565,
+    "roundtrip": "pass",
+    "checkpoint_reload": "pass"
+  },
+  "nonclaims": [
+    "not production tokenizer admission",
+    "not downstream model-quality evidence",
+    "not Hugging Face upload support",
+    "not a completed matched-model training run"
+  ]
+}
