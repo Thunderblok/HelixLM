@@ -714,19 +714,24 @@ class PretrainTrainer(Trainer):
         # Override scheduler min_lr_ratio
         self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
 
-        # If using constant LR, set the scheduler's min ratio explicitly
-        if total_optimizer_steps is None:
-            self._scheduler_min_lr = 1.0
-
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        Override to create scheduler without relying on len(self.train_loader).
-        If total_optimizer_steps is unknown, use a very large number and rely on
-        constant LR (min_lr_ratio=1.0) after warmup.
+        Override train_epoch to avoid using len(self.train_loader).
+        Handles gradient accumulation correctly for any number of micro-batches,
+        including a final partial group.
         """
-        if self.scheduler is None:
-            from .trainer import get_cosine_schedule_with_warmup
+        self.model.train()
+        total_loss = 0.0
+        raw_count = 0
+        accum_count = 0
+        skipped_batches = 0
+        epoch_start = time.time()
+        tokens_seen = 0
 
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # Initialize scheduler without relying on len
+        if self.scheduler is None:
             total_steps = self.total_optimizer_steps if self.total_optimizer_steps is not None else 10**9
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
@@ -735,4 +740,114 @@ class PretrainTrainer(Trainer):
                 num_cycles=self._scheduler_cycles,
                 min_lr_ratio=self._scheduler_min_lr,
             )
-        return super().train_epoch(epoch)
+
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch}",
+            unit="batch",
+            disable=not self.verbose,
+        )
+
+        for batch_idx, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(self.device)
+            labels = batch["labels"].to(self.device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            cca_step = None
+            if getattr(self.cfg, "use_cca", False):
+                cca_step = self.global_step
+
+            if self.use_amp:
+                with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype):
+                    outputs = self.model(
+                        input_ids, labels=labels,
+                        attention_mask=attention_mask,
+                        cca_step=cca_step,
+                    )
+                    loss = outputs["loss"]
+            else:
+                outputs = self.model(
+                    input_ids, labels=labels,
+                    attention_mask=attention_mask,
+                    cca_step=cca_step,
+                )
+                loss = outputs["loss"]
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                skipped_batches += 1
+                if skipped_batches <= 5 and self.verbose:
+                    print(f"  WARNING: NaN/Inf loss at batch {batch_idx}. Skipping.")
+                continue
+
+            # Backward pass WITHOUT scaling; we will divide gradients manually
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            accum_count += 1
+            total_loss += loss.item()
+            raw_count += 1
+            tokens_seen += input_ids.numel()
+
+            # Optimizer step after accumulation
+            if accum_count == self.grad_accum_steps:
+                self._step(accum_count)
+                accum_count = 0
+
+            # Progress bar update
+            avg = total_loss / max(raw_count, 1)
+            lr = self.scheduler.get_last_lr()[0]
+            elapsed = time.time() - epoch_start
+            tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+            pbar.set_postfix({
+                "loss": f"{avg:.4f}",
+                "ppl": f"{compute_perplexity(avg):.2f}",
+                "lr": f"{lr:.2e}",
+                "tok/s": f"{tok_per_sec:,.0f}",
+            })
+
+        # End of epoch: handle leftover accumulation (partial group)
+        if accum_count > 0:
+            self._step(accum_count)
+
+        avg_loss = total_loss / max(raw_count, 1)
+        return {
+            "loss": avg_loss,
+            "perplexity": compute_perplexity(avg_loss),
+            "time": time.time() - epoch_start,
+            "skipped_batches": skipped_batches,
+        }
+
+    def _step(self, group_size: int):
+        """
+        Divide accumulated gradients by the actual number of micro-batches in the group,
+        then clip, optimizer step, scheduler step, zero_grad.
+        """
+        # Unscale gradients if using AMP GradScaler
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+
+        # Divide gradients by group size
+        for param in self.model.parameters():
+            if param.grad is not None:
+                param.grad.div_(group_size)
+
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+
+        # Optimizer step
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        # Scheduler step
+        self.scheduler.step()
+
+        # Zero gradients
+        self.optimizer.zero_grad(set_to_none=True)
+        self.global_step += 1
