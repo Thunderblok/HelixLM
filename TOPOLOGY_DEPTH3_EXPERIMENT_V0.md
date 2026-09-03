@@ -52,7 +52,13 @@ CPU-only preflight results at seed 42:
 | 512d, 4 columns, depth 2 | 65,675,290 | 12 | 37 | 2 |
 | 512d, 4 columns, depth 3 | 66,461,722 | 12 | 36 | 3 |
 | 768d, 3 columns, depth 2 | 103,883,156 | 9 | 22 | 2 |
+| 768d, 4 columns, depth 2 | 128,397,338 | 12 | 37 | 2 |
 | 768d, 4 columns, depth 3 | 130,166,810 | 12 | 36 | 3 |
+
+At width 768, the fourth column costs 24,514,182 parameters before depth is
+raised. Moving that four-column graph from depth 2 to depth 3 adds another
+1,769,472 parameters at this seed because predecessor-dependent merge layers
+change width.
 
 The 768-wide treatments use 12 heads to preserve the reference 64-element
 attention-head width. That is a preflight choice and must be reconciled with
@@ -120,7 +126,7 @@ CUDA_VISIBLE_DEVICES="" python topology_depth3_preflight.py \
 Observed terminal root:
 
 ```text
-aa8fd6196039e502b1f2e0510c51e51deae39808ef4acfda45c806232193cc97
+11997496724f2e2ffeef60a779e799bc7017bd52c0f29b53d915ef84ce1a9370
 ```
 
 ```text

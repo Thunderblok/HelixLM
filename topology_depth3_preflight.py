@@ -127,6 +127,7 @@ def run_preflight() -> dict[str, Any]:
         # David's production priority: widen first. Twelve heads preserve the
         # reference 64-wide attention heads when d_model rises from 512 to 768.
         TopologyTreatment("width_priority_3c_d2", 768, 12, 3, (2, 3, 2), 0.5, 0.7, 2),
+        TopologyTreatment("width_depth_control_4c_d2", 768, 12, 4, (2, 3, 2, 2), 0.5, 0.7, 2),
         TopologyTreatment("width_plus_depth_4c_d3", 768, 12, 4, (2, 3, 2, 2), 0.5, 0.7, 3),
     ]
     observed = {item.name: inspect_treatment(item) for item in treatments}
@@ -142,9 +143,13 @@ def run_preflight() -> dict[str, Any]:
         observed["width_priority_3c_d2"]["parameter_count_total"]
         - observed["reference_3c_d2"]["parameter_count_total"]
     )
-    width_plus_depth_delta = (
-        observed["width_plus_depth_4c_d3"]["parameter_count_total"]
+    fourth_column_delta = (
+        observed["width_depth_control_4c_d2"]["parameter_count_total"]
         - observed["width_priority_3c_d2"]["parameter_count_total"]
+    )
+    width_depth3_delta = (
+        observed["width_plus_depth_4c_d3"]["parameter_count_total"]
+        - observed["width_depth_control_4c_d2"]["parameter_count_total"]
     )
     return {
         "schema": "helix.topology-depth3-preflight.v0",
@@ -161,7 +166,8 @@ def run_preflight() -> dict[str, Any]:
             "depth3_parameter_delta": parameter_delta,
             "production_priority": "d_model_768_before_additional_columns_or_depth",
             "width_priority_parameter_delta_from_reference": width_priority_delta,
-            "width_plus_depth_parameter_delta_from_width_priority": width_plus_depth_delta,
+            "fourth_column_parameter_delta_at_d768": fourth_column_delta,
+            "depth3_parameter_delta_at_d768_four_columns": width_depth3_delta,
             "width_preflight_head_dimension": 64,
             "interpretation_constraint": (
                 "vertical_depth changes graph fan-in and therefore learned merge width; "
