@@ -56,6 +56,9 @@ class SutraPreflightCourt(unittest.TestCase):
         result = model_court()
         self.assertEqual(result["parameter_count_total"], EXPECTED_PARAMETER_COUNT)
         self.assertEqual(result["seq_len"], 1_024)
+        self.assertEqual(result["lateral_p"], 0.5)
+        self.assertEqual(result["vertical_p"], 0.7)
+        self.assertEqual(result["vertical_depth"], 2)
 
     def test_dataset_court_binds_order_and_rejects_missing_text(self):
         rows = [{"text": "alpha", "domain": "a"}, {"text": "beta", "domain": "b"}]
