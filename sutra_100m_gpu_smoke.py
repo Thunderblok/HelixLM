@@ -18,7 +18,10 @@ from sutra_100m_preflight import EXPECTED_PARAMETER_COUNT, SEQ_LEN, build_config
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=1)
     args = parser.parse_args()
+    if args.batch_size <= 0:
+        raise SystemExit("REFUSED: --batch-size must be positive")
     if not torch.cuda.is_available():
         raise SystemExit("UNAVAILABLE: CUDA is not available")
     if not torch.cuda.is_bf16_supported():
@@ -29,13 +32,15 @@ def main() -> None:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     device = torch.device("cuda")
-    config = build_config(batch_size=1)
+    config = build_config(batch_size=args.batch_size)
     config.memory_efficient_forward = True
     model = HelixForCausalLM(config).to(device)
     if model.count_parameters()["total"] != EXPECTED_PARAMETER_COUNT:
         raise RuntimeError("parameter count drift")
 
-    input_ids = torch.randint(0, config.vocab_size, (1, SEQ_LEN), device=device)
+    input_ids = torch.randint(
+        0, config.vocab_size, (args.batch_size, SEQ_LEN), device=device
+    )
     attention_mask = torch.ones_like(input_ids)
     started = time.perf_counter()
     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -62,9 +67,9 @@ def main() -> None:
         "amp_dtype": "bfloat16",
         "master_dtype": "float32",
         "parameter_count": EXPECTED_PARAMETER_COUNT,
-        "batch_size": 1,
+        "batch_size": args.batch_size,
         "sequence_length": SEQ_LEN,
-        "causal_targets": SEQ_LEN - 1,
+        "causal_targets": args.batch_size * (SEQ_LEN - 1),
         "loss": float(output.loss.detach().cpu()),
         "elapsed_seconds": elapsed,
         "peak_vram_bytes": int(torch.cuda.max_memory_allocated()),

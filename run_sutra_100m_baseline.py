@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Train the frozen 101M/T1024 Sutra baseline with passive state probes."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import random
+import subprocess
+import time
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+import numpy as np
+import torch
+
+from automata_state_probe import observe_hidden_sequence
+from helix_lm.hf_model import HelixForCausalLM
+from helix_lm.tokenizer import HelixTokenizer
+from realtime_mlflow import RealtimeMLflowLogger
+from sutra_100m_preflight import (
+    DATASET,
+    DATASET_REVISION,
+    EXPECTED_PARAMETER_COUNT,
+    SEQ_LEN,
+    build_config,
+)
+from sutra_stream import SutraStreamOffset, iter_packed_sequences, resume_rows
+
+
+ROOT = Path(__file__).resolve().parent
+EXPERIMENT = "helix-sutra100m-automata-capacity-v0"
+
+
+def git_value(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def verify_source(expected_head: str, expected_tree: str) -> dict[str, str]:
+    observed = {
+        "source_head": git_value("rev-parse", "HEAD"),
+        "source_tree": git_value("rev-parse", "HEAD^{tree}"),
+        "source_dirty": str(bool(git_value("status", "--porcelain"))).lower(),
+    }
+    if observed["source_head"] != expected_head:
+        raise SystemExit(f"REFUSED: source HEAD drift: {observed}")
+    if observed["source_tree"] != expected_tree:
+        raise SystemExit(f"REFUSED: source tree drift: {observed}")
+    if observed["source_dirty"] != "false":
+        raise SystemExit(f"REFUSED: source checkout is dirty: {observed}")
+    return observed
+
+
+def canonical_root(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), default=str, allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def iter_batches(
+    sequences: Iterator[tuple[torch.Tensor, SutraStreamOffset]], *, batch_size: int
+) -> Iterator[tuple[dict[str, torch.Tensor], SutraStreamOffset]]:
+    while True:
+        rows: list[torch.Tensor] = []
+        last_offset: SutraStreamOffset | None = None
+        try:
+            for _ in range(batch_size):
+                row, last_offset = next(sequences)
+                rows.append(row)
+        except StopIteration:
+            return
+        if len(rows) != batch_size or last_offset is None:
+            return
+        input_ids = torch.stack(rows)
+        yield {
+            "input_ids": input_ids,
+            "labels": input_ids.clone(),
+            "attention_mask": torch.ones_like(input_ids),
+        }, last_offset
+
+
+def count_causal_targets(labels: torch.Tensor) -> int:
+    return int((labels[:, 1:] != -100).sum().item())
+
+
+def rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all(),
+    }
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    offset: SutraStreamOffset,
+    run_contract: dict[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "offset": offset.to_dict(),
+            "rng_state": rng_state(),
+            "run_contract": run_contract,
+            "run_contract_root": canonical_root(run_contract),
+        },
+        temporary,
+    )
+    os.replace(temporary, path)
+
+
+def load_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    expected_contract: dict[str, Any],
+) -> tuple[int, SutraStreamOffset]:
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if state.get("run_contract_root") != canonical_root(expected_contract):
+        raise SystemExit("REFUSED: checkpoint run-contract mismatch")
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    restore_rng_state(state["rng_state"])
+    return int(state["step"]), SutraStreamOffset(**state["offset"])
+
+
+def evaluate(
+    model: HelixForCausalLM,
+    tokenizer: HelixTokenizer,
+    dataset: Any,
+    *,
+    validation_rows: int,
+    validation_batches: int,
+    batch_size: int,
+    device: torch.device,
+) -> dict[str, float]:
+    rows = dataset.take(validation_rows)
+    sequences = iter_packed_sequences(rows, tokenizer, seq_len=SEQ_LEN)
+    total_loss = 0.0
+    total_targets = 0
+    model.eval()
+    with torch.no_grad():
+        for index, (batch, _) in enumerate(iter_batches(sequences, batch_size=batch_size)):
+            if index >= validation_batches:
+                break
+            device_batch = {key: value.to(device) for key, value in batch.items()}
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                output = model(**device_batch, return_dict=True)
+            if output.loss is None or not torch.isfinite(output.loss):
+                raise RuntimeError("non-finite validation loss")
+            targets = count_causal_targets(device_batch["labels"])
+            total_loss += float(output.loss.detach().cpu()) * targets
+            total_targets += targets
+    if total_targets == 0:
+        raise RuntimeError("validation produced zero causal targets")
+    loss = total_loss / total_targets
+    return {"loss": loss, "ppl": math.exp(min(loss, 20)), "causal_targets": total_targets}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-source-head", required=True)
+    parser.add_argument("--expected-source-tree", required=True)
+    parser.add_argument("--artifacts-root", type=Path, required=True)
+    parser.add_argument("--max-optimizer-steps", type=int, default=1_000)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1.5e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--validation-rows", type=int, default=1_024)
+    parser.add_argument("--validation-batches", type=int, default=8)
+    parser.add_argument("--eval-every", type=int, default=100)
+    parser.add_argument("--checkpoint-every", type=int, default=100)
+    parser.add_argument("--probe-every", type=int, default=100)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--mlflow-uri", default=os.environ.get("MLFLOW_TRACKING_URI", "https://mlflow.thunderline.net")
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if min(
+        args.max_optimizer_steps,
+        args.batch_size,
+        args.grad_accum,
+        args.validation_rows,
+        args.validation_batches,
+        args.eval_every,
+        args.checkpoint_every,
+        args.probe_every,
+    ) <= 0:
+        raise SystemExit("REFUSED: counts and intervals must be positive")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (12, 0):
+        raise SystemExit("UNAVAILABLE: exact RTX 5080 CUDA runtime is absent")
+    if not torch.cuda.is_bf16_supported():
+        raise SystemExit("UNAVAILABLE: BF16 is unsupported")
+
+    source = verify_source(args.expected_source_head, args.expected_source_tree)
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    tokenizer = HelixTokenizer("gpt2", local_files_only=True)
+    if len(tokenizer) != 50_257 or tokenizer.eos_token_id != 50_256:
+        raise SystemExit("REFUSED: GPT-2 tokenizer identity mismatch")
+    config = build_config(batch_size=args.batch_size)
+    config.lr = args.learning_rate
+    config.weight_decay = args.weight_decay
+    config.memory_efficient_forward = True
+    model = HelixForCausalLM(config).to("cuda")
+    if model.count_parameters()["total"] != EXPECTED_PARAMETER_COUNT:
+        raise SystemExit("REFUSED: model parameter-count drift")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+
+    run_contract = {
+        **source,
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "validation_posture": "first_ordered_rows_held_out_from_training",
+        "validation_rows": args.validation_rows,
+        "tokenizer": "gpt2",
+        "tokenizer_vocab_size": len(tokenizer),
+        "parameter_count": EXPECTED_PARAMETER_COUNT,
+        "sequence_length": SEQ_LEN,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "seed": seed,
+        "state_probe_posture": "detached_observer_only_no_model_feedback",
+    }
+    contract_root = canonical_root(run_contract)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+    run_name = f"hlx-b49-sutra100m-t1024-l3-k8-f25-s42-{stamp}"
+    run_root = args.artifacts_root / run_name
+    run_root.mkdir(parents=True, exist_ok=False)
+    (run_root / "run_contract.json").write_text(
+        json.dumps(run_contract, indent=2, sort_keys=True) + "\n"
+    )
+
+    logger = RealtimeMLflowLogger(
+        tracking_uri=args.mlflow_uri,
+        experiment=EXPERIMENT,
+        run_name=run_name,
+        spool_path=run_root / "mlflow-events.jsonl",
+        params={**run_contract, "run_contract_root": contract_root},
+        tags={
+            "run_kind": "sutra100m_baseline_with_passive_state_probe_v0",
+            "production_effect": "none",
+            "automata_feedback": "disabled",
+        },
+    )
+    if logger.start() is None:
+        raise RuntimeError("MLFLOW_START_FAILED: refusing untracked training")
+
+    from datasets import load_dataset
+
+    stream = load_dataset(
+        DATASET, split="train", revision=DATASET_REVISION, streaming=True
+    )
+    step = 0
+    offset = SutraStreamOffset()
+    if args.resume:
+        step, offset = load_checkpoint(
+            args.resume, model=model, optimizer=optimizer, expected_contract=run_contract
+        )
+    train_rows = resume_rows(stream.skip(args.validation_rows), offset)
+    sequence_iter = iter_packed_sequences(
+        train_rows, tokenizer, seq_len=SEQ_LEN, start=offset
+    )
+
+    device = torch.device("cuda")
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    micro_count = 0
+    accumulated_targets = 0
+    accumulated_weighted_loss = 0.0
+    started = time.time()
+    run_status = "FINISHED"
+    last_validation: dict[str, float] | None = None
+    state_probe_path = run_root / "state-probes.jsonl"
+    try:
+        for batch, batch_offset in iter_batches(sequence_iter, batch_size=args.batch_size):
+            if step >= args.max_optimizer_steps:
+                break
+            device_batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            should_probe = (step + 1) % args.probe_every == 0 and micro_count == args.grad_accum - 1
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                output = model(
+                    **device_batch,
+                    output_hidden_states=should_probe,
+                    return_dict=True,
+                )
+            if output.loss is None or not torch.isfinite(output.loss):
+                raise RuntimeError(f"non-finite training loss at optimizer step {step}")
+            targets = count_causal_targets(device_batch["labels"])
+            (output.loss / args.grad_accum).backward()
+            accumulated_targets += targets
+            accumulated_weighted_loss += float(output.loss.detach().cpu()) * targets
+            micro_count += 1
+            offset = batch_offset
+
+            if should_probe:
+                if not isinstance(output.hidden_states, torch.Tensor):
+                    raise RuntimeError("requested hidden-state probe was unavailable")
+                probes = observe_hidden_sequence(
+                    output.hidden_states, device_batch["input_ids"], segment_tokens=64
+                )
+                with state_probe_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "optimizer_step_before_update": step,
+                                "offset": offset.to_dict(),
+                                "records": [record.to_dict() for record in probes],
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+
+            if micro_count < args.grad_accum:
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            step += 1
+            train_loss = accumulated_weighted_loss / accumulated_targets
+            elapsed = max(time.time() - started, 1e-6)
+            logger.log_metrics(
+                {
+                    "train/loss": train_loss,
+                    "train/ppl": math.exp(min(train_loss, 20)),
+                    "train/causal_targets_seen": float(offset.causal_targets_emitted),
+                    "train/source_raw_utf8_bytes_read": float(offset.raw_utf8_bytes_read),
+                    "train/causal_targets_per_second": offset.causal_targets_emitted / elapsed,
+                    "system/peak_vram_bytes": float(torch.cuda.max_memory_allocated()),
+                },
+                step=step,
+            )
+            micro_count = 0
+            accumulated_targets = 0
+            accumulated_weighted_loss = 0.0
+
+            if step % args.eval_every == 0:
+                last_validation = evaluate(
+                    model,
+                    tokenizer,
+                    stream,
+                    validation_rows=args.validation_rows,
+                    validation_batches=args.validation_batches,
+                    batch_size=args.batch_size,
+                    device=device,
+                )
+                logger.log_metrics(
+                    {f"val/{key}": value for key, value in last_validation.items()},
+                    step=step,
+                    phase="validation",
+                )
+                model.train()
+
+            if step % args.checkpoint_every == 0:
+                save_checkpoint(
+                    run_root / "checkpoints" / f"step-{step:08d}.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    step=step,
+                    offset=offset,
+                    run_contract=run_contract,
+                )
+
+        save_checkpoint(
+            run_root / "checkpoints" / "terminal.pt",
+            model=model,
+            optimizer=optimizer,
+            step=step,
+            offset=offset,
+            run_contract=run_contract,
+        )
+    except BaseException:
+        run_status = "FAILED"
+        raise
+    finally:
+        logger.finish(status=run_status)
+
+    terminal = {
+        "schema": "helix.sutra-100m-baseline-terminal.v0",
+        "status": "PASS",
+        "run_name": run_name,
+        "run_contract_root": contract_root,
+        "optimizer_steps": step,
+        "offset": offset.to_dict(),
+        "last_validation": last_validation,
+        "peak_vram_bytes": int(torch.cuda.max_memory_allocated()),
+        "mlflow_run_id": logger.run_id,
+        "mlflow_errors": logger.mlflow_errors,
+        "state_probe_path": str(state_probe_path),
+        "production_effect": "none",
+    }
+    terminal["terminal_root"] = canonical_root(terminal)
+    (run_root / "terminal.json").write_text(
+        json.dumps(terminal, indent=2, sort_keys=True) + "\n"
+    )
+    print(json.dumps(terminal, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

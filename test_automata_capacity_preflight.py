@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from automata_state_probe import compression_accounting, observe_hidden_sequence
+from run_sutra_100m_baseline import count_causal_targets, iter_batches
 from sutra_100m_preflight import EXPECTED_PARAMETER_COUNT, dataset_court, model_court
 from sutra_stream import SutraStreamOffset, iter_packed_sequences
 
@@ -85,6 +86,18 @@ class SutraPreflightCourt(unittest.TestCase):
                     start=SutraStreamOffset(row_index=0, token_offset=99),
                 )
             )
+
+    def test_training_batches_preserve_exact_causal_target_count(self):
+        sequences = iter(
+            [
+                (torch.arange(8, dtype=torch.int64), SutraStreamOffset(sequences_emitted=1)),
+                (torch.arange(8, dtype=torch.int64), SutraStreamOffset(sequences_emitted=2)),
+            ]
+        )
+        batch, offset = next(iter_batches(sequences, batch_size=2))
+        self.assertEqual(list(batch["input_ids"].shape), [2, 8])
+        self.assertEqual(count_causal_targets(batch["labels"]), 14)
+        self.assertEqual(offset.sequences_emitted, 2)
 
 
 if __name__ == "__main__":
