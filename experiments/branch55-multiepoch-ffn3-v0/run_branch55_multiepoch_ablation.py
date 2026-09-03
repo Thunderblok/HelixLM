@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent
 SOURCE = Path(__file__).resolve().parents[2]
 RUN_ROOT = Path(
     os.environ.get(
-        "HELIX_BRANCH53_RUN_ROOT",
-        "/home/mo/DEV/experiments/helix-branch53-ffn-expansion-v0",
+        "HELIX_BRANCH55_RUN_ROOT",
+        "/home/mo/DEV/experiments/helix-branch55-multiepoch-ffn3-v0",
     )
 )
 BASELINE_ROOT = Path("/home/mo/DEV/experiments/helix-branch49-5080-scaling-v0")
@@ -1085,7 +1085,7 @@ def main() -> None:
     harness_sha = sha256(Path(__file__))
     logger = RealtimeMLflowLogger(
         tracking_uri=args.mlflow_uri,
-        experiment="helix-branch53-ffn-expansion-v0",
+        experiment="helix-branch55-multiepoch-ffn3-v0",
         run_name=run_name,
         spool_path=run_root / "mlflow_spool.jsonl",
         params={
@@ -1175,7 +1175,7 @@ def main() -> None:
         },
         tags={
             "run_kind": (
-                "branch53_promoted_full_corpus_v0"
+                "branch55_multiepoch_full_corpus_v0"
                 if promotion_manifest is not None and args.full_corpus_pass
                 else (
                     "branch53_promoted_combined_pilot_v0"
