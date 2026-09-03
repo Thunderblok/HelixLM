@@ -56,3 +56,56 @@ shape, corpus order, optimizer, seed, and evaluation. It must record both raw
 bytes observed and causal target tokens observed. A tokenizer-efficiency result
 alone is not a model-quality result.
 
+## Matched-model pilot
+
+`launch_matched_tokenizer_pilot.py` runs two independently initialized training
+processes while proving that their initial parameter bytes are identical. The
+only intended experimental variable is the tokenizer and its resulting token
+stream.
+
+Frozen comparison:
+
+```text
+architecture=Branch-49 d512 s512 k8 nl3 ffn2.5
+parameters=53,592,340
+seed=42
+optimizer=AdamW
+learning_rate=1.5e-4
+weight_decay=0.05
+batch_size=12
+gradient_accumulation=7
+optimizer_steps=110
+causal_targets_per_arm=4,721,640
+corpus_order=same raw Parquet rows in original order
+evaluator=same validation routine and raw validation rows
+```
+
+The preparation step tokenizes the same raw rows into separate uint16 streams
+and refuses the experiment unless row count, raw UTF-8 byte count, and the
+length-prefixed raw-record stream hash match across arms. Token windows cannot
+be position-identical because the tokenizers segment bytes differently; their
+source row order remains identical.
+
+Perplexity is reported only as a within-tokenizer training diagnostic. The
+cross-tokenizer quality projection is `val/estimated_bits_per_byte`, using the
+materialized split's tokens-per-raw-byte ratio. Raw-byte exposure during
+training is likewise explicitly estimated and is never described as exact
+per-window byte accounting.
+
+The run refuses to start without a live MLflow run for each arm:
+
+```bash
+./launch_matched_tokenizer_pilot.py
+```
+
+MLflow experiment:
+
+```text
+helix-lengthmax-matched-model-pilot-v0
+```
+
+The pair terminal is written beneath:
+
+```text
+/home/mo/DEV/experiments/helix-lengthmax-matched-pilot-artifacts-v0/
+```
