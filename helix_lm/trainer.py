@@ -647,6 +647,9 @@ class PretrainTrainer(Trainer):
             If None, a constant LR after warmup is used (min_lr_ratio=1.0).
         min_lr_ratio: Minimum learning rate ratio for cosine decay (only used if total_optimizer_steps is not None).
         buffer_size: Size of shuffle buffer for continuous window dataset.
+        count_first: If True, perform a deterministic counting pass before the first
+            training epoch to obtain the total number of batches. This enables an exact
+            progress bar from epoch 1. If False, the count is learned after epoch 1.
     """
     def __init__(
         self,
@@ -664,36 +667,32 @@ class PretrainTrainer(Trainer):
         num_workers=0,
         total_optimizer_steps=None,
         min_lr_ratio=1.0,
+        count_first: bool = False,
         **kwargs,
     ):
         from torch.utils.data import DataLoader
         from .dataset import ContinuousWindowDataset, collate_continuous
 
-        # Build continuous loaders
-        train_dataset = ContinuousWindowDataset(
+        # Build datasets and keep references for potential recounting
+        self._train_dataset = ContinuousWindowDataset(
             train_texts, tokenizer, cfg.seq_len,
             buffer_size=buffer_size, seed=seed, shuffle=True
         )
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg.batch_size,
-            collate_fn=collate_continuous,
-            num_workers=num_workers,
-            shuffle=False,  # dataset already shuffles
-        )
-
-        self.val_loader = None
+        self._val_dataset = None
         if val_texts is not None:
-            val_dataset = ContinuousWindowDataset(
+            self._val_dataset = ContinuousWindowDataset(
                 val_texts, tokenizer, cfg.seq_len,
                 buffer_size=buffer_size, seed=seed, shuffle=False
             )
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=cfg.batch_size,
-                collate_fn=collate_continuous,
-                num_workers=num_workers,
-                shuffle=False,
+
+        # Create loaders
+        self.train_loader = self._make_loader(
+            self._train_dataset, cfg.batch_size, num_workers, collate_continuous
+        )
+        self.val_loader = None
+        if self._val_dataset is not None:
+            self.val_loader = self._make_loader(
+                self._val_dataset, cfg.batch_size, num_workers, collate_continuous
             )
 
         # Call parent with our pre-built loaders
@@ -711,15 +710,53 @@ class PretrainTrainer(Trainer):
         )
 
         self.total_optimizer_steps = total_optimizer_steps
-        # Override scheduler min_lr_ratio
         self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
+
+        self.count_first = count_first
+        self._known_train_batches = None  # set after first epoch (or after counting pass)
+
+    @staticmethod
+    def _make_loader(dataset, batch_size, num_workers, collate_fn):
+        from torch.utils.data import DataLoader
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            shuffle=False,  # dataset handles shuffling
+        )
+
+    def _count_batches(self, loader):
+        """Returns the number of batches in the loader without training."""
+        count = 0
+        for _ in loader:
+            count += 1
+        return count
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        Override train_epoch to avoid using len(self.train_loader).
-        Handles gradient accumulation correctly for any number of micro-batches,
-        including a final partial group.
+        Override train_epoch to avoid relying on len(self.train_loader).
+        Handles gradient accumulation correctly for any number of micro-batches.
         """
+        # Determine total batches for progress bar
+        total_batches = None
+        if self._known_train_batches is not None:
+            total_batches = self._known_train_batches
+        elif self.count_first:
+            # Counting pass before first epoch
+            if self.verbose:
+                print("Counting training batches (first pass)...")
+            count = self._count_batches(self.train_loader)
+            # Recreate loader for actual training
+            self.train_loader = self._make_loader(
+                self._train_dataset,
+                self.cfg.batch_size,
+                self.train_loader.num_workers,
+                self.train_loader.collate_fn,
+            )
+            self._known_train_batches = count
+            total_batches = count
+
         self.model.train()
         total_loss = 0.0
         raw_count = 0
@@ -746,6 +783,7 @@ class PretrainTrainer(Trainer):
             desc=f"Epoch {epoch}",
             unit="batch",
             disable=not self.verbose,
+            total=total_batches,   # None if unknown, exact if known
         )
 
         for batch_idx, batch in enumerate(pbar):
@@ -781,7 +819,7 @@ class PretrainTrainer(Trainer):
                     print(f"  WARNING: NaN/Inf loss at batch {batch_idx}. Skipping.")
                 continue
 
-            # Backward pass WITHOUT scaling; we will divide gradients manually
+            # Backward without scaling; we will divide gradients manually
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
             else:
@@ -813,6 +851,10 @@ class PretrainTrainer(Trainer):
         if accum_count > 0:
             self._step(accum_count)
 
+        # After first epoch, store actual batch count (if not already set from count_first)
+        if self._known_train_batches is None:
+            self._known_train_batches = batch_idx + 1  # exact number of batches processed
+
         avg_loss = total_loss / max(raw_count, 1)
         return {
             "loss": avg_loss,
@@ -821,33 +863,67 @@ class PretrainTrainer(Trainer):
             "skipped_batches": skipped_batches,
         }
 
+    def evaluate(self) -> Dict[str, float]:
+        """
+        Override evaluate to avoid len(self.val_loader) (IterableDataset has no len).
+        Uses token-weighted averaging.
+        """
+        if self.val_loader is None:
+            return {}
+
+        self.model.eval()
+        total_loss = 0.0
+        total_tokens = 0
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+
+                if self.use_amp:
+                    with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype):
+                        outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
+                else:
+                    outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
+
+                loss = outputs["loss"]
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    valid_tokens = (labels != -100).sum().item()
+                    total_loss += loss.item() * valid_tokens
+                    total_tokens += valid_tokens
+                    num_batches += 1
+
+        avg_loss = total_loss / max(total_tokens, 1)
+        return {
+            "loss": avg_loss,
+            "perplexity": compute_perplexity(avg_loss),
+            "total_tokens": total_tokens,
+        }
+
     def _step(self, group_size: int):
         """
         Divide accumulated gradients by the actual number of micro-batches in the group,
         then clip, optimizer step, scheduler step, zero_grad.
         """
-        # Unscale gradients if using AMP GradScaler
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
 
-        # Divide gradients by group size
         for param in self.model.parameters():
             if param.grad is not None:
                 param.grad.div_(group_size)
 
-        # Clip gradients
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
 
-        # Optimizer step
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             self.optimizer.step()
 
-        # Scheduler step
         self.scheduler.step()
-
-        # Zero gradients
         self.optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
