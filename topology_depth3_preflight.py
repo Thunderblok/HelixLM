@@ -174,6 +174,11 @@ def run_preflight() -> dict[str, Any]:
                 "report parameter and active-parameter deltas rather than claiming an "
                 "identical-parameter ablation"
             ),
+            "rng_coupling": "not_preserved_by_same_seed_when_candidate_edges_change_draw_order",
+            "depth_pilot_prerequisite": (
+                "freeze an explicit topology manifest or key random decisions by edge identity "
+                "so the depth3 candidate differs only by admitted distance-3 edges"
+            ),
             "reference_role": "recipe_and_quality_anchor_not_depth_matched_checkpoint",
         },
     }

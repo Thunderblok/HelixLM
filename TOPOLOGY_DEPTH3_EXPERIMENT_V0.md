@@ -60,6 +60,13 @@ raised. Moving that four-column graph from depth 2 to depth 3 adds another
 1,769,472 parameters at this seed because predecessor-dependent merge layers
 change width.
 
+The shared seed does not create a coupled graph pair. Adding depth-3 candidate
+edges changes the random-number draw order, and the observed four-column
+depth-2/depth-3 graphs contain 37 and 36 edges respectively. Before a quality
+ablation, freeze an explicit topology manifest or key each random decision by
+edge identity. The candidate must differ from its control only by admitted
+distance-3 edges; seed equality alone is not sufficient.
+
 The 768-wide treatments use 12 heads to preserve the reference 64-element
 attention-head width. That is a preflight choice and must be reconciled with
 David's final production configuration before a full run.
@@ -71,10 +78,12 @@ David's final production configuration before a full run.
    depth-2 candidate.
 3. If memory, throughput, finite-gradient, and checkpoint courts pass, run the
    width-first matched pilot and compare it with the frozen evaluator.
-4. Only after width-first admission, run bounded four-column depth-2 and
-   depth-3 topology pilots from identical source, seed, corpus order, optimizer,
-   evaluator, and stopping rule.
-5. A full-corpus depth-3 run requires a positive pilot terminal; it is not
+4. Freeze a coupled four-column topology pair whose common edges are identical
+   and whose candidate-only edges have predecessor distance three.
+5. Only after width-first admission, run bounded four-column depth-2 and
+   depth-3 topology pilots from identical source, topology manifest, corpus
+   order, optimizer, evaluator, and stopping rule.
+6. A full-corpus depth-3 run requires a positive pilot terminal; it is not
    implied by the structural preflight.
 
 The probability treatment (`lateral_p` and `vertical_p`) remains a separate
@@ -126,7 +135,7 @@ CUDA_VISIBLE_DEVICES="" python topology_depth3_preflight.py \
 Observed terminal root:
 
 ```text
-11997496724f2e2ffeef60a779e799bc7017bd52c0f29b53d915ef84ce1a9370
+737a4a9606aa765403006f832455b06209bee8a0c5bfb6212a2f669f9e92a3ce
 ```
 
 ```text
