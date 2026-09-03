@@ -37,13 +37,18 @@ gradient accumulation 8. The learning rate warms linearly over 2,000
 microbatches (250 optimizer steps) to `1.5e-4`, then remains constant. A
 different budget or schedule produces a different checkpoint identity.
 
-The first matched topology ablation after this control completes will raise
-the two edge probabilities together to the established Helix production
-posture while holding every other declared variable fixed:
+This Sutra checkpoint is an automata-state-capacity exploration subject, not
+the control for the deferred topology ablation. The later topology study uses
+the completed FFN `3.0`, learning-rate `2e-4` full-corpus run
+`8ad467637b8b407aaa1c5ced49d6384f` as its reference configuration. When Mo's
+current exploration is complete, its matched candidate will raise the two edge
+probabilities together while holding every other declared variable fixed:
 
 ```text
+deferred_control_run=8ad467637b8b407aaa1c5ced49d6384f
 control=(lateral_p=0.5, vertical_p=0.7, vertical_depth=2)
 candidate=(lateral_p=0.8, vertical_p=0.9, vertical_depth=2)
+execution_status=deferred_until_current_exploration_completes
 ```
 
 This must be a fresh matched training arm, not an in-place mutation of the
