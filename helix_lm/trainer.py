@@ -867,46 +867,68 @@ class PretrainTrainer(Trainer):
             "skipped_batches": skipped_batches,
         }
 
-    def evaluate(self) -> Dict[str, float]:
-        """
-        Override evaluate to avoid len(self.val_loader) (IterableDataset has no len).
-        Uses token-weighted averaging.
-        """
-        if self.val_loader is None:
-            return {}
+def evaluate(self) -> Dict[str, float]:
+    """
+    Override evaluate to avoid len(self.val_loader) (IterableDataset has no len).
+    Uses token-weighted averaging and a tqdm progress bar.
+    """
+    if self.val_loader is None:
+        return {}
 
-        self.model.eval()
-        total_loss = 0.0
-        total_tokens = 0
-        num_batches = 0
+    self.model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    num_batches = 0
 
-        with torch.no_grad():
-            for batch in self.val_loader:
-                input_ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                attention_mask = batch.get("attention_mask")
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
+    # Determine total batches for progress bar (None if unknown)
+    total_batches = self._known_val_batches
 
-                if self.use_amp:
-                    with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype):
-                        outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
-                else:
+    pbar = tqdm(
+        self.val_loader,
+        desc="Validation",
+        unit="batch",
+        disable=not self.verbose,
+        total=total_batches,
+    )
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(self.device)
+            labels = batch["labels"].to(self.device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            if self.use_amp:
+                with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype):
                     outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
+            else:
+                outputs = self.model(input_ids, labels=labels, attention_mask=attention_mask)
 
-                loss = outputs["loss"]
-                if not (torch.isnan(loss) or torch.isinf(loss)):
-                    valid_tokens = (labels != -100).sum().item()
-                    total_loss += loss.item() * valid_tokens
-                    total_tokens += valid_tokens
-                    num_batches += 1
+            loss = outputs["loss"]
+            if not (torch.isnan(loss) or torch.isinf(loss)):
+                valid_tokens = (labels != -100).sum().item()
+                total_loss += loss.item() * valid_tokens
+                total_tokens += valid_tokens
+                num_batches += 1
 
-        avg_loss = total_loss / max(total_tokens, 1)
-        return {
-            "loss": avg_loss,
-            "perplexity": compute_perplexity(avg_loss),
-            "total_tokens": total_tokens,
-        }
+            # Update progress bar
+            avg = total_loss / max(total_tokens, 1)
+            pbar.set_postfix({
+                "loss": f"{avg:.4f}",
+                "ppl": f"{compute_perplexity(avg):.2f}",
+            })
+
+    # Store actual batch count for future evaluations
+    if self._known_val_batches is None:
+        self._known_val_batches = batch_idx + 1
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    return {
+        "loss": avg_loss,
+        "perplexity": compute_perplexity(avg_loss),
+        "total_tokens": total_tokens,
+    }
 
     def _step(self, group_size: int):
         """
