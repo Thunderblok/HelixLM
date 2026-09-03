@@ -3,6 +3,7 @@
 HelixLM 100M (approx) — 3B token pretraining, production run.
 Single training job with 3 epochs, each at a distinct learning rate.
 Multi-scale windowed attention.
+Uses PretrainTrainer for continuous token windows.
 """
 
 import math
@@ -25,7 +26,7 @@ from helix_lm import (
     HelixTokenizer,
     HelixConfig,
     HelixForCausalLM,
-    Trainer,
+    PretrainTrainer,          # <-- changed import
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -103,8 +104,8 @@ PUSH_RETRY_DELAY = 90
 
 # Streaming dataset settings
 STREAMING = True
-PREPROCESS_BATCH_SIZE = 1000
-CLEANUP_SHARDS = True
+PREPROCESS_BATCH_SIZE = 1000       # not used by PretrainTrainer, but kept for logging
+CLEANUP_SHARDS = True              # not used by PretrainTrainer
 NUM_WORKERS = 16
 
 # Tokenizer
@@ -175,7 +176,8 @@ def push_checkpoint(model, tokenizer, stage_num, local_dir):
 def main():
     # Log configuration summary
     logger.info("=" * 70)
-    logger.info("HelixLM 100M Training — d%d, cols=%d, seq=%d, n_loops=%d", D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
+    logger.info("HelixLM 100M Pretraining — d%d, cols=%d, seq=%d, n_loops=%d",
+                D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
@@ -189,7 +191,7 @@ def main():
                 BATCH_SIZE, SEQ_LEN, GRAD_ACCUM, BATCH_SIZE * GRAD_ACCUM)
     logger.info("LR stages:  %s", LR_STAGES)
     logger.info("AMP:        %s (dtype=%s)", USE_AMP, AMP_DTYPE)
-    logger.info("Streaming:  %s (preprocess_batch=%d, workers=%d)", STREAMING, PREPROCESS_BATCH_SIZE, NUM_WORKERS)
+    logger.info("Data mode:  continuous windows (no document boundaries, no padding)")
 
     # ── Seed ────────────────────────────────────────────────────────────
     random.seed(SEED)
@@ -230,7 +232,7 @@ def main():
 
     logger.info("Train:      IterableColumn (streaming)")
     logger.info("Val:        IterableColumn (streaming)")
-    logger.info("Note:       Using sharded preprocessing to accommodate dataset > memory")
+    logger.info("Note:       Using PretrainTrainer with continuous token windows")
 
     # ── Training loop ────────────────────────────────────────────────────
     all_results = []
@@ -313,9 +315,12 @@ def main():
         logger.info("Parameters: %s total, %s trainable",
                     f"{params['total']:,}", f"{params['trainable']:,}")
 
-        # ── Create Trainer ────────────────────────────────────────────
+        # ── Create PretrainTrainer ────────────────────────────────────
         stage_output_dir = str(OUTPUT_DIR / f"epoch{stage_num}")
-        trainer = Trainer(
+
+        # PretrainTrainer uses continuous windows; these args are not used:
+        #   min_tail_len, preprocess_batch_size, cleanup_shards
+        trainer = PretrainTrainer(
             model=model,
             cfg=cfg,
             train_texts=train_iterable,        # IterableColumn — streaming mode
@@ -325,12 +330,8 @@ def main():
             grad_accum_steps=GRAD_ACCUM,
             use_amp=USE_AMP,
             amp_dtype=AMP_DTYPE,
-            min_tail_len=SEQ_LEN // 4,
             verbose=True,
-            # Streaming-specific options
-            preprocess_batch_size=PREPROCESS_BATCH_SIZE,
-            cleanup_shards=CLEANUP_SHARDS,
-            num_workers=NUM_WORKERS,
+            num_workers=NUM_WORKERS,           # passed to DataLoader
         )
 
         # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup
@@ -414,6 +415,7 @@ def main():
             "lr_stages": LR_STAGES, "warmup_stages": WARMUP_STAGES,
             "streaming": STREAMING, "preprocess_batch_size": PREPROCESS_BATCH_SIZE,
             "use_amp": USE_AMP, "amp_dtype": AMP_DTYPE,
+            "data_mode": "continuous_windows",
         },
         "total_time_h": total_time_h,
         "best_val_ppl": best_epoch["val_ppl"],
