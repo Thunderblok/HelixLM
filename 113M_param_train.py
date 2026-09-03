@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
 """
-
-HelixLM 104M — 3B token pretraining, production run.
+HelixLM 100M (approx) — 3B token pretraining, production run.
 Single training job with 3 epochs, each at a distinct learning rate.
-
+Multi-scale windowed attention.
 """
+
 import math
 import json
 import sys
@@ -11,9 +12,11 @@ import os
 import time
 import logging
 import traceback
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from safetensors.torch import load_file as load_safetensors
@@ -22,7 +25,7 @@ from helix_lm import (
     HelixTokenizer,
     HelixConfig,
     HelixForCausalLM,
-    Trainer
+    Trainer,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -30,62 +33,64 @@ from helix_lm import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 # 3B token dataset with train/val splits — STREAMING MODE
-
+PUSH_TO_HUB = True
 DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
+HF_USERNAME = "david-thrower"
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if PUSH_TO_HUB:
+    if not HF_TOKEN:
+        raise ValueError("Env var HF_TOKEN must be set to push the model to HF Hub.")
 
 # Set to None to use full dataset
 NUM_SAMPLES = None
 
-
+# Reproducibility
 SEED = 42
-HF_USERNAME = "david-thrower"
 
-ATTENTION_MODE = "linear"
+# Attention mechanism node selection
+ATTENTION_MODE = "multi_scale_windowed"
 
-# Architecture: production configuration
-D_MODEL = 1024                              # High dim > many columns
-N_COLUMNS = 3                               
-NODES_PER_COLUMN = (3, 3, 3)                # Balanced 2-column graph
-N_HEADS = D_MODEL // 64                     # 16 (1024/64 per head)
-FFN_EXPANSION = 3                           # Per PanGu-π + 0.3 for architectural reasons
-SEQ_LEN = 512                               # Target context length
-N_LOOPS = 4                                 # Production: 4 recurrent loops
-DROPOUT = .1                                # Slight reduction at scale
-GRAD_BUFFER_RATIO = 0.0
+# Basic model structural configuration
+D_MODEL = 768
+N_COLUMNS = 3
+NODES_PER_COLUMN = (3, 3, 3)  # WAS (2, 3, 2)
+N_HEADS = D_MODEL // 64          # 12 heads for d_model=768
+FFN_EXPANSION = 3                # Per PanGu-π + 0.3 for architectural reasons
+SEQ_LEN = 1024                   # Target context length
+N_LOOPS = 4                      # Production: 4 recurrent loops
+DROPOUT = 0.1
+ATTENTION_DROPOUT = 0.05
+GRAD_BUFFER_RATIO = 0.0          # Standard weight tying (no gradient buffer)
 
-# Topology — dense 
-# (validated at 41M params, could potentially be optimized at this scale, but we are hitting a hardware ceiling)
+# Multi-scale linear attention args
+LOCAL_WINDOW = 64
+COARSE_WINDOW = 128
+COMPRESSED_WINDOWS = 8
+COMPRESSED_VIEWS = 8
+CONSENSUS_TYPE = "cosine"
+CORRECTOR_TYPE = "ffn"
+
+# Topology — dense
 LATERAL_P = 0.8
 VERTICAL_P = 0.9
 VERTICAL_DEPTH = 2
 
-
-
 # --- Training ---
-BATCH_SIZE = 64
-GRAD_ACCUM = 2                             # effective = 128
-WEIGHT_DECAY = 0.10
+BATCH_SIZE = 12
+GRAD_ACCUM = 7                     # Effective batch size = 12*7 = 84
+WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
 
-LR_STAGES = [8e-3, 3e-3, 1e-3]
-WARMUP_STAGES = [1000, 200, 100]
-# Increasing n_loops apparently has a huge effect on 
-# stabilizing batches and making the loss surface
-# isotropic. Or model size ... In any case, 2e-3,
-# the 1st epoch progressed smooth as glass, only 4 bathces out of 
-# first 13520 batches had a perplexity > the last batch, and the
-# perplexity declined VERY slowly. We can probbaly tolerate a 
-# much higher LR ...
-
-# KITA / spike scheduler disabled, uncomment if rabbit holes appear
-USE_KITA = False
-SPIKE_HEIGHT = 6.0
-SPIKE_WIDTH = 100
-SPIKE_INTERVAL_PCT = 0.02
+EPOCHS = 3
+EPOCH_1_LR = 0.0002
+LR_STAGES = [EPOCH_1_LR * (1/3) ** i for i in range(EPOCHS)]
+WARMUP_STAGES = [500, 100, 50]
 
 # AMP
 USE_AMP = True
 AMP_DTYPE = "bfloat16"
+D_TYPE = "float32"
 
 # Flags
 USE_CCA = False
@@ -96,31 +101,23 @@ USE_TITANS = False
 PUSH_RETRY_ATTEMPTS = 3
 PUSH_RETRY_DELAY = 90
 
-
-
 # Streaming dataset settings
-STREAMING = True                            # Load dataset as streaming 3B token dataset (IterableDataset)
-PREPROCESS_BATCH_SIZE = 1000                # Batch size for streaming preprocessing
-CLEANUP_SHARDS = True                       # Clean up temporary shards after training
+STREAMING = True
+PREPROCESS_BATCH_SIZE = 1000
+CLEANUP_SHARDS = True
 NUM_WORKERS = 16
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SAFEGUARD
-# ═══════════════════════════════════════════════════════════════════════════
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-if not HF_TOKEN:
-    print("❌ HF_TOKEN environment variable is empty or not set!", file=sys.stderr)
-    sys.exit(1)
+# Tokenizer
+TOKENIZER_NAME = "gpt2"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SETUP
 # ═══════════════════════════════════════════════════════════════════════════
 RUN_TS = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-OUTPUT_DIR = Path("production_run_104M_1024_nloops4")
+OUTPUT_DIR = Path("production_run_HelixLM-100M_1024_nloops4")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = OUTPUT_DIR / f"production_train_104M_1024_nl4_{RUN_TS}.log"
-RESULTS_JSON = OUTPUT_DIR / f"production_results_104M_1024_nl4_{RUN_TS}.json"
+LOG_FILE = OUTPUT_DIR / f"production_train_{RUN_TS}.log"
+RESULTS_JSON = OUTPUT_DIR / f"production_results_{RUN_TS}.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,10 +128,10 @@ logger = logging.getLogger(__name__)
 
 # ── Dynamic repo naming ──────────────────────────────────────────────────
 REPO_BASE = (
-    f"HelixLM-104M-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-h{N_HEADS}-nl{N_LOOPS}"
+    f"HelixLM-100M-{RUN_TS}-d{D_MODEL}-col{N_COLUMNS}-nl{N_LOOPS}"
     f"-ffn{int(FFN_EXPANSION)}-s{SEQ_LEN}-3BT"
 )
-REPO_BASE_ALT = f"HelixLM-104M-{RUN_TS}-prod"
+REPO_BASE_ALT = f"HelixLM-100M-{RUN_TS}-prod"
 
 
 def make_repo_name(epoch: int, use_alt: bool = False) -> str:
@@ -142,37 +139,9 @@ def make_repo_name(epoch: int, use_alt: bool = False) -> str:
     return f"{HF_USERNAME}/{base}-ep{epoch}"
 
 
-# ── KITA scheduler (disabled by default) ─────────────────────────────────
-if USE_KITA:
-    from torch.optim.lr_scheduler import LambdaLR
-
-    def _make_spike_schedule(warmup_steps, total_steps,
-                             spike_interval_steps, spike_width, spike_height):
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
-            cycle_step = (current_step - warmup_steps) % spike_interval_steps
-            if cycle_step < spike_width:
-                progress = cycle_step / spike_width
-                if progress < 0.5:
-                    return 1.0 + (spike_height - 1.0) * (progress * 2.0)
-                else:
-                    return 1.0 + (spike_height - 1.0) * ((1.0 - progress) * 2.0)
-            return 1.0
-        return lr_lambda
-
-    def _create_spike_scheduler(optimizer, warmup_steps, total_steps,
-                                spike_interval_pct, spike_width, spike_height):
-        interval = max(1, int(total_steps * spike_interval_pct))
-        interval = max(interval, spike_width + 1)
-        return LambdaLR(optimizer, _make_spike_schedule(
-            warmup_steps, total_steps, interval, spike_width, spike_height))
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # HUB PUSH HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-
 def push_to_hub_safe(model, tokenizer, repo_name):
     for attempt in range(1, PUSH_RETRY_ATTEMPTS + 1):
         try:
@@ -203,14 +172,10 @@ def push_checkpoint(model, tokenizer, stage_num, local_dir):
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
-
 def main():
-    # Calculate effective stride (Trainer will auto-apply: 512 for seq_len>512)
-    effective_stride = 512 if SEQ_LEN > 512 else SEQ_LEN
-    overlap_pct = (1 - effective_stride/SEQ_LEN) * 100
-
+    # Log configuration summary
     logger.info("=" * 70)
-    logger.info("HelixLM 104M Training — d%d, cols=%d, seq=%d, n_loops=%d", D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
+    logger.info("HelixLM 100M Training — d%d, cols=%d, seq=%d, n_loops=%d", D_MODEL, N_COLUMNS, SEQ_LEN, N_LOOPS)
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
@@ -218,17 +183,17 @@ def main():
                 D_MODEL, N_COLUMNS, N_HEADS, FFN_EXPANSION, SEQ_LEN, N_LOOPS)
     logger.info("Topology:   lateral=%.1f vertical=%.1f depth=%d",
                 LATERAL_P, VERTICAL_P, VERTICAL_DEPTH)
-    logger.info("Chunking:   stride=%d (%.0f%% overlap) [auto for seq_len=%d]",
-                effective_stride, overlap_pct, SEQ_LEN)
-    logger.info("Regularize: dropout=%.2f wd=%.2f grad_buffer=%.2f",
-                DROPOUT, WEIGHT_DECAY, GRAD_BUFFER_RATIO)
+    logger.info("Regularize: dropout=%.2f attn_dropout=%.2f wd=%.2f grad_buffer=%.2f",
+                DROPOUT, ATTENTION_DROPOUT, WEIGHT_DECAY, GRAD_BUFFER_RATIO)
     logger.info("Batch:      %d x %d  grad_accum=%d (effective %d)",
                 BATCH_SIZE, SEQ_LEN, GRAD_ACCUM, BATCH_SIZE * GRAD_ACCUM)
     logger.info("LR stages:  %s", LR_STAGES)
-    logger.info("AMP:        %s", AMP_DTYPE)
-    logger.info("Streaming:  %s (preprocess_batch=%d)", STREAMING, PREPROCESS_BATCH_SIZE)
+    logger.info("AMP:        %s (dtype=%s)", USE_AMP, AMP_DTYPE)
+    logger.info("Streaming:  %s (preprocess_batch=%d, workers=%d)", STREAMING, PREPROCESS_BATCH_SIZE, NUM_WORKERS)
 
     # ── Seed ────────────────────────────────────────────────────────────
+    random.seed(SEED)
+    np.random.seed(SEED)
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
@@ -241,80 +206,83 @@ def main():
         gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info("GPU:        %s (%.1f GB VRAM)", gpu_name, gpu_mem_gb)
         if gpu_mem_gb < 40:
-            logger.warning("⚠️  GPU < 40 GB VRAM: needs A100 (80GB).")
+            logger.warning("⚠️  GPU < 40 GB VRAM: may need A100 (80GB) for this configuration.")
 
     # ── Tokenizer ───────────────────────────────────────────────────────
-    tokenizer = HelixTokenizer("gpt2")
+    tokenizer = HelixTokenizer(TOKENIZER_NAME)
     vocab_size = len(tokenizer)
     logger.info("Vocab:      %d", vocab_size)
 
-    # ── Dataset (STREAMING MODE) ────────────────────────────────────────
-    logger.info("Loading dataset (streaming=True): %s", DATASET)
+    # ── Dataset (STREAMING MODE) ───────────────────────────────────────
+    logger.info("Loading dataset (streaming=%s): %s", STREAMING, DATASET)
     try:
-        # Load as streaming dataset — returns IterableDataset
         hf_ds = load_dataset(DATASET, streaming=STREAMING)
     except Exception as e:
         logger.error("❌ Failed to load dataset: %s", e)
         sys.exit(1)
 
-    # Extract the 'text' column as IterableColumn — DO NOT MATERIALIZE
-    # The Trainer will handle streaming preprocessing via create_unified_data_loader
-    # which uses _handle_streaming_iterable to shard/process on-the-fly
+    # Extract text columns as iterables (do not materialize)
     if NUM_SAMPLES:
-        train_iterable = hf_ds['train'].take(NUM_SAMPLES)['text']  # datasets.iterable_dataset.IterableColumn
+        train_iterable = hf_ds['train'].take(NUM_SAMPLES)['text']
     else:
         train_iterable = hf_ds['train']['text']
-    val_iterable = hf_ds['validation']['text']  # datasets.iterable_dataset.IterableColumn
+    val_iterable = hf_ds['validation']['text']
 
     logger.info("Train:      IterableColumn (streaming)")
     logger.info("Val:        IterableColumn (streaming)")
-    logger.info("Note:       Using sharded preprocessing to validate capibility to accomodate Dataset > memory")
+    logger.info("Note:       Using sharded preprocessing to accommodate dataset > memory")
 
-    # ── Shared config kwargs ────────────────────────────────────────────
-    cfg_kwargs = dict(
-        vocab_size=vocab_size,
-        tokenizer_name="gpt2",
-        d_model=D_MODEL,
-        n_columns=N_COLUMNS,
-        nodes_per_column=NODES_PER_COLUMN,
-        n_heads=N_HEADS,
-        n_loops=N_LOOPS,
-        seq_len=SEQ_LEN,
-        dropout=DROPOUT,
-        ffn_expansion=FFN_EXPANSION,
-        weight_decay=WEIGHT_DECAY,
-        grad_clip=GRAD_CLIP,
-        grad_buffer_ratio=GRAD_BUFFER_RATIO,
-        batch_size=BATCH_SIZE,
-        use_cca=USE_CCA,
-        use_ssm=USE_SSM,
-        use_titans_memory=USE_TITANS,
-        seed=SEED,
-        device="auto",
-        amp_dtype=AMP_DTYPE,
-        lateral_p=LATERAL_P,
-        vertical_p=VERTICAL_P,
-        vertical_depth=VERTICAL_DEPTH,
-        attention_mode=ATTENTION_MODE
-    )
-
-    # ── Training ────────────────────────────────────────────────────────
+    # ── Training loop ────────────────────────────────────────────────────
     all_results = []
     prev_ckpt_dir = None
 
-    for stage_idx in range(len(LR_STAGES)):
+    for stage_idx, (lr, warmup) in enumerate(zip(LR_STAGES, WARMUP_STAGES)):
         stage_num = stage_idx + 1
-        lr = LR_STAGES[stage_idx]
-        warmup = WARMUP_STAGES[stage_idx]
-
         logger.info("\n" + "=" * 70)
-        kita_str = f"KITA {SPIKE_HEIGHT:.0f}x every {SPIKE_INTERVAL_PCT*100:.0f}%" if USE_KITA else "constant"
-        logger.info("EPOCH %d/%d | LR=%.1e | Warmup=%d | %s",
-                    stage_num, len(LR_STAGES), lr, warmup, kita_str)
+        logger.info("EPOCH %d/%d | LR=%.1e | Warmup=%d", stage_num, EPOCHS, lr, warmup)
         logger.info("=" * 70)
 
-        # ── Build config ────────────────────────────────────────────
-        cfg = HelixConfig(**cfg_kwargs, lr=lr, epochs=1, warmup_steps=warmup)
+        # ── Build config ─────────────────────────────────────────────
+        cfg = HelixConfig.small_v2(
+            vocab_size=vocab_size,
+            tokenizer_name=TOKENIZER_NAME,
+            d_model=D_MODEL,
+            n_columns=N_COLUMNS,
+            nodes_per_column=NODES_PER_COLUMN,
+            n_heads=N_HEADS,
+            n_loops=N_LOOPS,
+            seq_len=SEQ_LEN,
+            dropout=DROPOUT,
+            attn_dropout=ATTENTION_DROPOUT,
+            ffn_expansion=FFN_EXPANSION,
+            weight_decay=WEIGHT_DECAY,
+            grad_clip=GRAD_CLIP,
+            grad_buffer_ratio=GRAD_BUFFER_RATIO,
+            batch_size=BATCH_SIZE,
+            lr=lr,
+            warmup_steps=warmup,
+            epochs=1,  # we train one epoch per stage
+            use_cca=USE_CCA,
+            use_ssm=USE_SSM,
+            use_titans_memory=USE_TITANS,
+            seed=SEED,
+            device="auto",
+            dtype=D_TYPE,
+            amp_dtype=AMP_DTYPE,
+            lateral_p=LATERAL_P,
+            vertical_p=VERTICAL_P,
+            vertical_depth=VERTICAL_DEPTH,
+            attention_mode=ATTENTION_MODE,
+            local_window=LOCAL_WINDOW,
+            coarse_window=COARSE_WINDOW,
+            compressed_windows=COMPRESSED_WINDOWS,
+            compressed_views=COMPRESSED_VIEWS,
+            consensus_type=CONSENSUS_TYPE,
+            corrector_type=CORRECTOR_TYPE,
+            tie_word_embeddings=True,
+        )
+
+        # Set token IDs
         cfg.pad_token_id = tokenizer.pad_token_id
         cfg.eos_token_id = tokenizer.eos_token_id
         cfg.bos_token_id = tokenizer.bos_token_id
@@ -322,13 +290,12 @@ def main():
         logger.info("Topology check: lateral=%.1f vertical=%.1f depth=%d",
                     cfg.lateral_p, cfg.vertical_p, cfg.vertical_depth)
 
-        # ── Create model ─────────────────────────────────────────────
+        # ── Create model (only once per stage) ────────────────────────
         model = HelixForCausalLM(cfg)
-        # Torch compile regressed throughput catastrophically on n_loops = 4
-        # model.model.recurrent = torch.compile(model.model.recurrent, mode="max-autotune", fullgraph=False)
         graph_info = model.model.recurrent.graph.get_graph_info()
         logger.info("Graph: %d nodes, %d edges", graph_info["n_nodes"], graph_info["n_edges"])
 
+        # Load previous checkpoint if available
         if prev_ckpt_dir is not None:
             st_path = os.path.join(prev_ckpt_dir, "model.safetensors")
             if os.path.exists(st_path):
@@ -346,8 +313,7 @@ def main():
         logger.info("Parameters: %s total, %s trainable",
                     f"{params['total']:,}", f"{params['trainable']:,}")
 
-        # ── Create Trainer ───────────────────────────────────────────
-        # Pass IterableColumn directly — Trainer will use streaming path
+        # ── Create Trainer ────────────────────────────────────────────
         stage_output_dir = str(OUTPUT_DIR / f"epoch{stage_num}")
         trainer = Trainer(
             model=model,
@@ -364,30 +330,13 @@ def main():
             # Streaming-specific options
             preprocess_batch_size=PREPROCESS_BATCH_SIZE,
             cleanup_shards=CLEANUP_SHARDS,
-            num_workers=NUM_WORKERS,  # DataLoader workers for prefetching
+            num_workers=NUM_WORKERS,
         )
 
-        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup (Worked on 41M param model, may not be effective here)
-        trainer._scheduler_min_lr = 0.3 # Balance of stability safety and high LR
+        # Constant LR: cosine with min_lr_ratio=1.0 = flat after warmup
+        trainer._scheduler_min_lr = 1.0
 
-        # KITA override (if enabled)
-        if USE_KITA:
-            # For streaming, estimate steps based on token count
-            # 3B tokens / (64 batch * 1024 seq_len) ≈ ~45k steps
-            estimated_steps = 3_000_000_000 // (BATCH_SIZE * GRAD_ACCUM * SEQ_LEN) # 3B fallback estimate
-            logger.info("KITA estimated steps (3B tokens): ~%d", estimated_steps)
-            trainer.scheduler = _create_spike_scheduler(
-                optimizer=trainer.optimizer,
-                warmup_steps=warmup,
-                total_steps=estimated_steps,
-                spike_interval_pct=SPIKE_INTERVAL_PCT,
-                spike_width=SPIKE_WIDTH,
-                spike_height=SPIKE_HEIGHT,
-            )
-            logger.info("KITA scheduler injected: %.0fx spikes, width=%d, interval=%.0f%%",
-                        SPIKE_HEIGHT, SPIKE_WIDTH, SPIKE_INTERVAL_PCT * 100)
-
-        # ── Train ────────────────────────────────────────────────────
+        # ── Train ─────────────────────────────────────────────────────
         t0 = time.time()
         history = trainer.train(num_epochs=1)
         elapsed = time.time() - t0
@@ -429,6 +378,7 @@ def main():
         with open(RESULTS_JSON, "w") as f:
             json.dump(all_results, f, indent=2)
 
+        # Cleanup
         del trainer, model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -457,11 +407,13 @@ def main():
             "d_model": D_MODEL, "n_columns": N_COLUMNS, "nodes_per_column": NODES_PER_COLUMN,
             "n_heads": N_HEADS, "ffn_expansion": FFN_EXPANSION,
             "seq_len": SEQ_LEN, "n_loops": N_LOOPS, "dropout": DROPOUT,
+            "attn_dropout": ATTENTION_DROPOUT,
             "weight_decay": WEIGHT_DECAY, "grad_buffer_ratio": GRAD_BUFFER_RATIO,
             "lateral_p": LATERAL_P, "vertical_p": VERTICAL_P, "vertical_depth": VERTICAL_DEPTH,
             "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
-            "lr_stages": LR_STAGES, "kita": USE_KITA,
+            "lr_stages": LR_STAGES, "warmup_stages": WARMUP_STAGES,
             "streaming": STREAMING, "preprocess_batch_size": PREPROCESS_BATCH_SIZE,
+            "use_amp": USE_AMP, "amp_dtype": AMP_DTYPE,
         },
         "total_time_h": total_time_h,
         "best_val_ppl": best_epoch["val_ppl"],
