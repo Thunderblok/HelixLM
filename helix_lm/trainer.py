@@ -631,3 +631,75 @@ class Trainer:
         
         return self.history
 
+
+class PretrainTrainer(Trainer):
+    """
+    Trainer for causal LM pretraining using continuous token windows.
+    Mirrors the data regime of the cofounder's script:
+      - Documents concatenated with eos_token
+      - Fixed seq_len windows, no padding
+      - labels = input_ids (no loss masking)
+      - Non-overlapping windows
+    Works with both List[str] / Column and IterableColumn inputs.
+    """
+    def __init__(
+        self,
+        model,
+        cfg,
+        train_texts,
+        val_texts=None,
+        tokenizer=None,
+        output_dir="./checkpoints",
+        grad_accum_steps=1,
+        use_amp=False,
+        amp_dtype="bfloat16",
+        buffer_size=50000,
+        seed=42,
+        num_workers=0,          # Keep 0 for simplicity; tokenization in main process.
+        **kwargs,
+    ):
+        # Build continuous loaders before calling super
+        train_loader = self._build_continuous_loader(
+            train_texts, tokenizer, cfg.seq_len, cfg.batch_size,
+            buffer_size=buffer_size, seed=seed, num_workers=num_workers,
+            shuffle=True,
+        )
+        val_loader = None
+        if val_texts is not None:
+            val_loader = self._build_continuous_loader(
+                val_texts, tokenizer, cfg.seq_len, cfg.batch_size,
+                buffer_size=buffer_size, seed=seed, num_workers=num_workers,
+                shuffle=False,
+            )
+
+        super().__init__(
+            model=model,
+            cfg=cfg,
+            tokenizer=tokenizer,
+            output_dir=output_dir,
+            grad_accum_steps=grad_accum_steps,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _build_continuous_loader(
+        texts, tokenizer, seq_len, batch_size,
+        buffer_size, seed, num_workers, shuffle,
+    ):
+        from torch.utils.data import DataLoader
+        from .dataset import ContinuousWindowDataset, collate_continuous
+
+        dataset = ContinuousWindowDataset(
+            texts, tokenizer, seq_len, buffer_size=buffer_size, seed=seed
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collate_continuous,
+            num_workers=num_workers,
+            shuffle=False,  # shuffle is already handled inside the dataset
+        )
