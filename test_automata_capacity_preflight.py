@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import unittest
+
+import torch
+
+from automata_state_probe import compression_accounting, observe_hidden_sequence
+from sutra_100m_preflight import EXPECTED_PARAMETER_COUNT, dataset_court, model_court
+from sutra_stream import SutraStreamOffset, iter_packed_sequences
+
+
+class FakeTokenizer:
+    eos_token_id = 0
+
+    def encode(self, text, *, add_special_tokens=False):
+        self.assert_special_tokens = add_special_tokens
+        return [ord(char) for char in text]
+
+
+class StateProbeCourt(unittest.TestCase):
+    def test_probe_is_segmented_bounded_and_mutation_sensitive(self):
+        hidden = torch.arange(2 * 128 * 768, dtype=torch.float32).reshape(2, 128, 768)
+        tokens = torch.arange(2 * 128, dtype=torch.int64).reshape(2, 128)
+        records = observe_hidden_sequence(hidden, tokens, segment_tokens=64)
+        self.assertEqual(len(records), 2)
+        self.assertEqual([record.source_end_token for record in records], [64, 128])
+        self.assertTrue(all(record.register_count == 32 for record in records))
+        self.assertNotEqual(records[0].transition_root, records[1].transition_root)
+        accounting = compression_accounting(raw_history_bytes=1_000_000, records=records)
+        self.assertGreater(accounting["state_compression_ratio"], 1)
+        self.assertEqual(accounting["candidate_live_state_bytes"], records[-1].state_bytes)
+        self.assertEqual(
+            accounting["transition_log_bytes"], sum(record.state_bytes for record in records)
+        )
+
+    def test_nonfinite_state_is_unavailable(self):
+        hidden = torch.zeros((1, 64, 768))
+        hidden[0, 0, 0] = float("nan")
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            observe_hidden_sequence(hidden, torch.zeros((1, 64), dtype=torch.int64))
+
+
+class SutraPreflightCourt(unittest.TestCase):
+    def test_exact_parameter_count(self):
+        result = model_court()
+        self.assertEqual(result["parameter_count_total"], EXPECTED_PARAMETER_COUNT)
+        self.assertEqual(result["seq_len"], 1_024)
+
+    def test_dataset_court_binds_order_and_rejects_missing_text(self):
+        rows = [{"text": "alpha", "domain": "a"}, {"text": "beta", "domain": "b"}]
+        first = dataset_court(rows, limit=2)
+        second = dataset_court(reversed(rows), limit=2)
+        self.assertNotEqual(first["ordered_row_text_root"], second["ordered_row_text_root"])
+        with self.assertRaisesRegex(RuntimeError, "nonempty text"):
+            dataset_court([{"not_text": "no"}], limit=1)
+
+    def test_stream_resume_matches_uninterrupted_token_sequence(self):
+        rows = [{"text": "abcdefgh"}, {"text": "ijklmnop"}, {"text": "qrstuv"}]
+        tokenizer = FakeTokenizer()
+        uninterrupted = list(iter_packed_sequences(rows, tokenizer, seq_len=5))
+        first_tokens, first_offset = uninterrupted[0]
+        resumed_rows = rows[first_offset.row_index :]
+        resumed = list(
+            iter_packed_sequences(
+                resumed_rows,
+                tokenizer,
+                seq_len=5,
+                start=first_offset,
+            )
+        )
+        self.assertEqual(first_tokens.tolist(), uninterrupted[0][0].tolist())
+        self.assertEqual(
+            [tokens.tolist() for tokens, _ in resumed],
+            [tokens.tolist() for tokens, _ in uninterrupted[1:]],
+        )
+        self.assertEqual(resumed[-1][1].causal_targets_emitted, 20)
+
+    def test_stream_rejects_unreadable_resume_offset(self):
+        with self.assertRaisesRegex(RuntimeError, "exceeds encoded row length"):
+            list(
+                iter_packed_sequences(
+                    [{"text": "abc"}],
+                    FakeTokenizer(),
+                    seq_len=4,
+                    start=SutraStreamOffset(row_index=0, token_offset=99),
+                )
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
