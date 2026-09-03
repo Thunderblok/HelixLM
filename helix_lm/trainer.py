@@ -709,6 +709,10 @@ class PretrainTrainer(Trainer):
             **kwargs,
         )
 
+        # Ensure shard cleanup attributes exist (not used, but prevents AttributeError)
+        self._train_shard_dir = None
+        self._val_shard_dir = None
+
         self.total_optimizer_steps = total_optimizer_steps
         self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
 
@@ -927,3 +931,75 @@ class PretrainTrainer(Trainer):
         self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
+
+    def train(self, num_epochs: Optional[int] = None, eval_every: int = 1) -> Dict[str, Any]:
+        """
+        Override train to avoid using boolean context on self.val_loader.
+        """
+        epochs = num_epochs or self.cfg.epochs
+        effective_batch = self.cfg.batch_size * self.grad_accum_steps
+
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"Training HelixLM on {self.device}")
+            print(f"Parameters: {self.model.count_parameters()['total']:,}")
+            print(
+                f"Epochs: {epochs} | Batch: {self.cfg.batch_size} | "
+                f"Accum: {self.grad_accum_steps} | Effective: {effective_batch}"
+            )
+            print(f"LR: {self.cfg.lr} | AMP: {self.use_amp}")
+            print(f"{'='*60}\n")
+
+        for epoch in range(1, epochs + 1):
+            if self.verbose:
+                print(f"\nEpoch {epoch}/{epochs}")
+                print("-" * 40)
+
+            train_metrics = self.train_epoch(epoch)
+            skip_info = ""
+            if train_metrics.get("skipped_batches", 0) > 0:
+                skip_info = f" | Skipped: {train_metrics['skipped_batches']}"
+            if self.verbose:
+                print(
+                    f"Train Loss: {train_metrics['loss']:.4f} | "
+                    f"PPL: {train_metrics['perplexity']:.2f} | "
+                    f"Time: {format_time(train_metrics['time'])}"
+                    f"{skip_info}"
+                )
+            self.history["train_loss"].append(train_metrics["loss"])
+            self.history["perplexity"].append(train_metrics["perplexity"])
+
+            # Only evaluate if val_loader is not None (avoid boolean context)
+            if self.val_loader is not None and epoch % eval_every == 0:
+                val_metrics = self.evaluate()
+                if self.verbose:
+                    print(
+                        f"Val Loss: {val_metrics['loss']:.4f} | "
+                        f"Val PPL: {val_metrics['perplexity']:.2f}"
+                    )
+                self.history["val_loss"].append(val_metrics["loss"])
+                if val_metrics["loss"] < self.best_val_loss:
+                    self.best_val_loss = val_metrics["loss"]
+                    self.save_checkpoint(epoch, "best_model")
+
+            if epoch % 10 == 0:
+                self.save_checkpoint(epoch)
+
+            if self.tokenizer and epoch % eval_every == 0 and self.verbose:
+                print("\nGeneration samples:")
+                for prompt in self.example_prompts:
+                    if self.generated_example_length:
+                        try:
+                            generated = self.generate_sample(
+                                prompt,
+                                max_new_tokens=self.generated_example_length,
+                            )
+                            print(f"  '{prompt}' -> '{generated}'")
+                        except Exception as e:
+                            print(f"  '{prompt}' -> [Error: {e}]")
+                print()
+
+        self.save_checkpoint(epochs, "final_model")
+        if self.verbose:
+            print(f"\nTraining complete!")
+        return self.history
