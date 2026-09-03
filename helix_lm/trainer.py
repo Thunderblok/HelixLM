@@ -15,7 +15,7 @@ import os
 import math
 import time
 import warnings
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from .config import HelixConfig
 from .hf_model import HelixForCausalLM
-from .dataset import create_document_loader
+from .dataset import create_document_loader, create_unified_data_loader, _is_iterable_column
 
 
 def get_cosine_schedule_with_warmup(
@@ -73,8 +73,8 @@ class Trainer:
         self,
         model: HelixForCausalLM,
         cfg: HelixConfig,
-        train_texts: Optional[List[str]] = None,
-        val_texts: Optional[List[str]] = None,
+        train_texts: Optional[Union[List[str], Any]] = None,
+        val_texts: Optional[Union[List[str], Any]] = None,
         tokenizer=None,
         output_dir: str = "./checkpoints",
         example_prompts: Optional[List[str]] = None,
@@ -83,9 +83,17 @@ class Trainer:
         use_amp: bool = False,
         amp_dtype: Optional[str] = None,
         min_tail_len: Optional[int] = None,
+        stride: Optional[int] = None,
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
+        # Sharding options for IterableColumn stream
+        shard_cache_dir: Optional[str] = None,
+        preprocess_num_proc: int = 5,
+        preprocess_batch_size: int = 1000,
+        cleanup_shards: bool = True,
+        # DataLoader performance options
+        num_workers: int = 4,  # Number of DataLoader workers for prefetching
     ):
         """
         Initialize Trainer.
@@ -94,7 +102,9 @@ class Trainer:
             model: HelixForCausalLM instance.
             cfg: HelixConfig with training hyperparameters.
             train_texts: List of training document texts (used if train_loader not provided).
+                         Can also be IterableColumn from streaming dataset.
             val_texts: List of validation document texts (used if val_loader not provided).
+                       Can also be IterableColumn from streaming dataset.
             tokenizer: Tokenizer instance.
             output_dir: Directory to save checkpoints.
             example_prompts: Prompts for generation samples during training.
@@ -103,10 +113,28 @@ class Trainer:
             use_amp: Whether to use torch.amp automatic mixed precision.
             amp_dtype: AMP autocast dtype: "float16" or "bfloat16" (default: "float16").
             min_tail_len: Minimum tail length for DocumentAwareDataset.
+            stride: Chunking stride for document sliding window. If None:
+                    - Defaults to seq_len if seq_len <= 512 (no overlap)
+                    - Defaults to 512 if seq_len > 512 (~50% overlap for longer contexts)
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
             verbose: Whether to show tqdm progress bars and print logs.
+            shard_cache_dir: Directory for temporary shard storage (streaming only).
+            preprocess_num_proc: Number of processes for preprocessing (streaming only).
+            preprocess_batch_size: Batch size for streaming preprocessing.
+            cleanup_shards: Whether to auto-cleanup shards after training.
+            num_workers: Number of DataLoader worker processes for background data loading.
+                        Higher values enable more prefetching but use more CPU/RAM.
+                        Set to 0 for single-threaded loading (default: 4).
         """
+        # Apply intelligent stride default based on seq_len
+        if stride is None:
+            if cfg.seq_len > 512:
+                stride = 512  # Standard: 50% overlap for longer contexts
+            else:
+                stride = cfg.seq_len  # No overlap for shorter contexts
+        self._stride = stride
+
         self.model = model
         self.cfg = cfg
         self.tokenizer = tokenizer
@@ -117,6 +145,12 @@ class Trainer:
         _amp_dtype = amp_dtype if amp_dtype is not None else getattr(cfg, "amp_dtype", "float16")
         self.amp_dtype = getattr(torch, _amp_dtype) if isinstance(_amp_dtype, str) else _amp_dtype
         self.verbose = verbose
+
+        # Store shard cleanup settings
+        self._shard_cache_dir = shard_cache_dir
+        self._cleanup_shards = cleanup_shards
+        self._train_texts_is_streaming = False
+        self._val_texts_is_streaming = False
 
         if example_prompts:
             self.example_prompts = example_prompts
@@ -140,30 +174,89 @@ class Trainer:
         else:
             if train_texts is None:
                 raise ValueError("Either train_loader or train_texts must be provided.")
-            self.train_loader = create_document_loader(
-                train_texts,
-                tokenizer,
-                cfg.seq_len,
-                cfg.batch_size,
-                shuffle=True,
-                min_tail_len=min_tail_len,
-                lazy=True,
-            )
+            
+            # Check if streaming data
+            if _is_iterable_column(train_texts):
+                self._train_texts_is_streaming = True
+                result = create_unified_data_loader(
+                    train_texts,
+                    tokenizer,
+                    cfg.seq_len,
+                    cfg.batch_size,
+                    stride=stride,
+                    shuffle=True,
+                    drop_last=True,
+                    num_workers=num_workers,
+                    min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
+                    shard_cache_dir=shard_cache_dir,
+                    preprocess_num_proc=preprocess_num_proc,
+                    preprocess_batch_size=preprocess_batch_size,
+                    cleanup_shards=cleanup_shards,
+                )
+                if isinstance(result, tuple):
+                    self.train_loader, self._train_shard_dir = result
+                else:
+                    self.train_loader = result
+                    self._train_shard_dir = None
+            else:
+                self.train_loader = create_document_loader(
+                    train_texts,
+                    tokenizer,
+                    cfg.seq_len,
+                    cfg.batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
+                    lazy=True,
+                    stride=stride,
+                )
+                self._train_shard_dir = None
 
         self.val_loader = None
         if val_loader is not None:
             self.val_loader = val_loader
         elif val_texts is not None:
-            self.val_loader = create_document_loader(
-                val_texts,
-                tokenizer,
-                cfg.seq_len,
-                cfg.batch_size,
-                shuffle=False,
-                drop_last=False,
-                min_tail_len=min_tail_len,
-                lazy=True,
-            )
+            # Check if streaming data
+            if _is_iterable_column(val_texts):
+                self._val_texts_is_streaming = True
+                result = create_unified_data_loader(
+                    val_texts,
+                    tokenizer,
+                    cfg.seq_len,
+                    cfg.batch_size,
+                    stride=stride,
+                    shuffle=False,
+                    drop_last=False,
+                    num_workers=num_workers,
+                    min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
+                    shard_cache_dir=shard_cache_dir,
+                    preprocess_num_proc=preprocess_num_proc,
+                    preprocess_batch_size=preprocess_batch_size,
+                    cleanup_shards=cleanup_shards,
+                )
+                if isinstance(result, tuple):
+                    self.val_loader, self._val_shard_dir = result
+                else:
+                    self.val_loader = result
+                    self._val_shard_dir = None
+            else:
+                self.val_loader = create_document_loader(
+                    val_texts,
+                    tokenizer,
+                    cfg.seq_len,
+                    cfg.batch_size,
+                    shuffle=False,
+                    drop_last=False,
+                    num_workers=num_workers,
+                    min_tail_len=min_tail_len,
+                    seed=getattr(cfg, 'seed', 42),  # Use cfg.seed for determinism
+                    lazy=True,
+                    stride=stride,
+                )
+                self._val_shard_dir = None
 
         # AdamW with standard betas (0.9, 0.999)
         self.optimizer = AdamW(
@@ -363,11 +456,16 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
-        """Evaluate on validation set with progress bar."""
+        """Evaluate on validation set with progress bar.
+        
+        Uses token-weighted averaging instead of simple batch averaging
+        for more accurate perplexity calculation.
+        """
         if self.val_loader is None:
             return {}
         self.model.eval()
         total_loss = 0.0
+        total_tokens = 0
         num_batches = 0
 
         pbar = tqdm(
@@ -393,16 +491,24 @@ class Trainer:
 
             loss = outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):
-                total_loss += loss.item()
+                # Count valid (non -100) tokens for weighting
+                valid_tokens = (labels != -100).sum().item()
+                
+                # Weight loss by token count
+                total_loss += loss.item() * valid_tokens
+                total_tokens += valid_tokens
                 num_batches += 1
-                avg = total_loss / max(num_batches, 1)
+                
+                # Use token-weighted average for display
+                avg = total_loss / max(total_tokens, 1)
                 pbar.set_postfix({
                     "loss": f"{avg:.4f}",
                     "ppl": f"{compute_perplexity(avg):.2f}",
                 })
 
-        avg_loss = total_loss / max(num_batches, 1)
-        return {"loss": avg_loss, "perplexity": compute_perplexity(avg_loss)}
+        # Token-weighted average
+        avg_loss = total_loss / max(total_tokens, 1)
+        return {"loss": avg_loss, "perplexity": compute_perplexity(avg_loss), "total_tokens": total_tokens}
 
     @torch.no_grad()
     def generate_sample(
@@ -509,5 +615,19 @@ class Trainer:
         self.save_checkpoint(epochs, "final_model")
         if self.verbose:
             print(f"\nTraining complete!")
+        
+        # Cleanup shards if requested (for streaming datasets)
+        if self._cleanup_shards:
+            import shutil
+            for shard_dir in [self._train_shard_dir, self._val_shard_dir]:
+                if shard_dir is not None and os.path.exists(shard_dir):
+                    try:
+                        shutil.rmtree(shard_dir)
+                        if self.verbose:
+                            print(f"Cleaned up shard cache: {shard_dir}")
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Warning: Failed to cleanup shard cache {shard_dir}: {e}")
+        
         return self.history
 

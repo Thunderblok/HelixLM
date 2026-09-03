@@ -1,5 +1,12 @@
 """
 HelixGraph: Biological brain-inspired heterogeneous graph executor.
+
+REMEDIATION (2026-08-22):
+  - Issue 5: removed root-node cache pre-population so the first multi-scale
+    node (and every root computation node) actually executes with raw x.
+  - Issue 6: stopped passing output_ffn_dim to ErrorCorrectingMultiScaleAttnNode.
+  - Passes new compressed-branch params (compressed_views, compressed_dim,
+    compressed_heads, strict_nan_check) to the multi-scale node.
 """
 import math
 import random
@@ -13,7 +20,8 @@ import torch.nn.functional as F
 from .config import HelixConfig
 from .nodes import (
     HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode, RMSNorm
+    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode,
+    RMSNorm, ErrorCorrectingMultiScaleAttnNode
 )
 
 
@@ -120,19 +128,39 @@ class HelixGraph(nn.Module):
         # ────────────────────────────────────────────────────────────
 
     def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
-        # ... (unchanged — omitted for brevity but keep the existing implementation)
         cfg = self.cfg
         spec = []
         for ci in range(cfg.n_columns):
             column = []
             use_full_attn = False
+            use_multi_scale = False
             if cfg.attention_mode == "full":
                 use_full_attn = True
             elif cfg.attention_mode == "hybrid":
                 use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
+            elif cfg.attention_mode == "multi_scale_windowed":
+                use_multi_scale = True
 
             attn_drop = getattr(cfg, 'attn_dropout', cfg.dropout)
-            if use_full_attn:
+            if use_multi_scale:
+                column.append(("error_correcting_multi_scale_attn", {
+                    "d_model": cfg.d_model,
+                    "n_heads": cfg.n_heads,
+                    "local_window": getattr(cfg, "local_window", 64),
+                    "coarse_window": getattr(cfg, "coarse_window", 128),
+                    "compressed_windows": getattr(cfg, "compressed_windows", 8),
+                    "compressed_views": getattr(cfg, "compressed_views", 8),
+                    "compressed_dim": getattr(cfg, "compressed_dim", None),
+                    "compressed_heads": getattr(cfg, "compressed_heads", None),
+                    "corrector_dim": getattr(cfg, "corrector_dim", None),
+                    "consensus_type": getattr(cfg, "consensus_type", "cosine"),
+                    "corrector_type": getattr(cfg, "corrector_type", "ffn"),
+                    "dropout": cfg.dropout,
+                    "attn_dropout": attn_drop,
+                    "strict_nan_check": getattr(cfg, "strict_nan_check", False),
+                    # Issue 6: output_ffn_dim intentionally NOT passed.
+                }))
+            elif use_full_attn:
                 column.append(("full_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
@@ -200,6 +228,8 @@ class HelixGraph(nn.Module):
             return TitansMemoryNode(**ncfg)
         elif ntype == "gate":
             return GateNode(**ncfg)
+        elif ntype == "error_correcting_multi_scale_attn":
+            return ErrorCorrectingMultiScaleAttnNode(**ncfg)
         raise ValueError(f"Unknown node type: {ntype}")
 
     def _topsort(self) -> List[str]:
@@ -229,14 +259,14 @@ class HelixGraph(nn.Module):
         new_states = {}
         cache: Dict[str, torch.Tensor] = {}
 
-        for name in self.nodes:
-            if not self.graph[name]:
-                if not isinstance(self.nodes[name], (SSMNode, Mamba2Node, TitansMemoryNode)):
-                    cache[name] = x
+        # Issue 5: REMOVED root-node cache pre-population.
+        # Previously, every non-stateful root node was cached with raw x, which
+        # caused the execution loop to skip it (``if name in cache: continue``).
+        # The first multi-scale node in column 0 was therefore instantiated and
+        # counted in parameters but never forwarded. Root nodes now execute with
+        # merged = x via the ``len(feats) == 0`` branch below.
 
         for name in self.order:
-            if name in cache:
-                continue
             preds = self.graph[name]
             if not preds:
                 feats = []

@@ -14,6 +14,8 @@ from .trainer import Trainer
 from .dataset import (
     HelixDataset, HelixDatasetFromTokens, HelixHFDataset,
     DocumentAwareDataset, create_helix_dataloader, create_document_loader,
+    create_unified_data_loader, HelixPrechunkedDataset,
+    _is_iterable_column, _process_and_shard_batch,
 )
 
 __version__ = "0.1.0"
@@ -29,4 +31,8 @@ __all__ = [
     "DocumentAwareDataset",
     "create_helix_dataloader",
     "create_document_loader",
+    "create_unified_data_loader",
+    "HelixPrechunkedDataset",
+    "_is_iterable_column",
+    "_process_and_shard_batch",
 ]
