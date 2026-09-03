@@ -52,14 +52,6 @@ def _collate_batch(batch):
     }
 
 
-def collate_continuous(batch: List[Dict[str, torch.Tensor]]):
-    return {
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "labels": torch.stack([b["labels"] for b in batch]),
-        "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
-    }
-
-
 def _build_attention_mask(seq_len: int, pad_len: int) -> torch.Tensor:
     """
     Issue 4: attention_mask marks every REAL token as visible (1), including
@@ -456,8 +448,9 @@ class ContinuousWindowDataset(IterableDataset):
         seq_len: Sequence length of the model.
         buffer_size: Size of the shuffle buffer (number of windows). Larger = better shuffle, more RAM.
         seed: Seed for the shuffle buffer.
+        shuffle: If True, apply a shuffle buffer before yielding samples (for training). If False, yield in deterministic order (for validation).
     """
-    def __init__(self, texts, tokenizer, seq_len: int, buffer_size: int = 50000, seed: int = 42):
+    def __init__(self, texts, tokenizer, seq_len, buffer_size=50000, seed=42, shuffle=True):
         super().__init__()
         self.texts = texts
         self.tokenizer = tokenizer
@@ -465,20 +458,18 @@ class ContinuousWindowDataset(IterableDataset):
         self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
         self.buffer_size = buffer_size
         self.seed = seed
+        self.shuffle = shuffle
 
     def _token_stream(self):
-        """Yield individual token ids from the concatenated corpus."""
         for text in self.texts:
-            text = text.strip()
-            if not text:
+            if not text.strip():
                 continue
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            ids = self.tokenizer.encode(text.strip(), add_special_tokens=False)
             yield from ids
             if self.eos_token_id is not None:
                 yield self.eos_token_id
 
     def _windowed_stream(self):
-        """Accumulate tokens and yield exactly seq_len windows."""
         buf = []
         for token_id in self._token_stream():
             buf.append(token_id)
@@ -490,10 +481,13 @@ class ContinuousWindowDataset(IterableDataset):
                     "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
                 }
                 buf = []
-        # Drop tail (< seq_len tokens). Standard for pretraining.
+        # Drop incomplete tail
 
     def __iter__(self):
-        # Shuffle buffer with reservoir-style sampling.
+        if not self.shuffle:
+            yield from self._windowed_stream()
+            return
+
         rng = random.Random(self.seed)
         buf = []
         for sample in self._windowed_stream():
@@ -506,6 +500,15 @@ class ContinuousWindowDataset(IterableDataset):
         rng.shuffle(buf)
         for sample in buf:
             yield sample
+
+
+def collate_continuous(batch):
+    """Stack dicts of tensors for continuous-window batches."""
+    return {
+        "input_ids": torch.stack([b["input_ids"] for b in batch]),
+        "labels": torch.stack([b["labels"] for b in batch]),
+        "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+    }
 
 ##########
 
