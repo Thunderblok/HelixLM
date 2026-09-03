@@ -10,12 +10,13 @@ from .config import HelixConfig
 from .tokenizer import HelixTokenizer
 from .model import HelixLMCore
 from .hf_model import HelixForCausalLM
-from .trainer import Trainer
+from .trainer import Trainer, PretrainTrainer
 from .dataset import (
     HelixDataset, HelixDatasetFromTokens, HelixHFDataset,
     DocumentAwareDataset, create_helix_dataloader, create_document_loader,
     create_unified_data_loader, HelixPrechunkedDataset,
-    _is_iterable_column, _process_and_shard_batch,
+    _is_iterable_column, _process_and_shard_batch, 
+    ContinuousWindowDataset, collate_continuous,
 )
 
 __version__ = "0.1.0"
