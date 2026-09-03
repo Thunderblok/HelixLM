@@ -295,15 +295,24 @@ def main() -> None:
         "weight_decay": args.weight_decay,
         "seed": seed,
         "state_probe_posture": "detached_observer_only_no_model_feedback",
-        "storage_court": storage,
     }
     contract_root = canonical_root(run_contract)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+    step = 0
+    offset = SutraStreamOffset()
+    if args.resume:
+        step, offset = load_checkpoint(
+            args.resume, model=model, optimizer=optimizer, expected_contract=run_contract
+        )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     run_name = f"hlx-b49-sutra100m-t1024-l3-k8-f25-s42-{stamp}"
     run_root = args.artifacts_root / run_name
     run_root.mkdir(parents=True, exist_ok=False)
     (run_root / "run_contract.json").write_text(
         json.dumps(run_contract, indent=2, sort_keys=True) + "\n"
+    )
+    (run_root / "storage_court.json").write_text(
+        json.dumps(storage, indent=2, sort_keys=True) + "\n"
     )
 
     logger = RealtimeMLflowLogger(
@@ -311,7 +320,11 @@ def main() -> None:
         experiment=EXPERIMENT,
         run_name=run_name,
         spool_path=run_root / "mlflow-events.jsonl",
-        params={**run_contract, "run_contract_root": contract_root},
+        params={
+            **run_contract,
+            "run_contract_root": contract_root,
+            **{f"storage_{key}": value for key, value in storage.items()},
+        },
         tags={
             "run_kind": "sutra100m_baseline_with_passive_state_probe_v0",
             "production_effect": "none",
@@ -326,12 +339,6 @@ def main() -> None:
     stream = load_dataset(
         DATASET, split="train", revision=DATASET_REVISION, streaming=True
     )
-    step = 0
-    offset = SutraStreamOffset()
-    if args.resume:
-        step, offset = load_checkpoint(
-            args.resume, model=model, optimizer=optimizer, expected_contract=run_contract
-        )
     train_rows = resume_rows(stream.skip(args.validation_rows), offset)
     sequence_iter = iter_packed_sequences(
         train_rows, tokenizer, seq_len=SEQ_LEN, start=offset
