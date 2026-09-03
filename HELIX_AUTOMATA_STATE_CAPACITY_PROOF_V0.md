@@ -21,6 +21,9 @@ d_model=768
 heads=12
 loops=3
 topology=(2,3,2)
+lateral_p=0.5
+vertical_p=0.7
+vertical_depth=2
 ffn_expansion=2.5
 parameters=101,228,948
 ```
@@ -33,6 +36,21 @@ to 1,500,028,992 targets across 45,822 complete optimizer steps at batch 4 and
 gradient accumulation 8. The learning rate warms linearly over 2,000
 microbatches (250 optimizer steps) to `1.5e-4`, then remains constant. A
 different budget or schedule produces a different checkpoint identity.
+
+The first matched topology ablation after this control completes will raise
+the two edge probabilities together to the established Helix production
+posture while holding every other declared variable fixed:
+
+```text
+control=(lateral_p=0.5, vertical_p=0.7, vertical_depth=2)
+candidate=(lateral_p=0.8, vertical_p=0.9, vertical_depth=2)
+```
+
+This must be a fresh matched training arm, not an in-place mutation of the
+control checkpoint: the probabilities determine the graph constructed at
+model initialization. The ablation therefore holds seed, corpus order,
+tokenizer, optimizer, schedule, training budget, evaluator, and vertical depth
+constant while changing only the paired connection-probability treatment.
 
 The streaming packer binds an exact dataset revision and ordered row stream.
 It checkpoints only at full 1,024-token boundaries and records the next unread
