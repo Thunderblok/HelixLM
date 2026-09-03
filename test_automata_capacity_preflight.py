@@ -9,8 +9,11 @@ import torch
 from automata_state_probe import compression_accounting, observe_hidden_sequence
 from run_sutra_100m_baseline import (
     ESTIMATED_CHECKPOINT_BYTES,
+    aligned_training_budget,
     count_causal_targets,
     iter_batches,
+    scheduler_state,
+    set_optimizer_lr,
     storage_court,
 )
 from sutra_100m_preflight import EXPECTED_PARAMETER_COUNT, dataset_court, model_court
@@ -116,6 +119,36 @@ class SutraPreflightCourt(unittest.TestCase):
             )
         self.assertEqual(result["planned_periodic_checkpoints"], 10)
         self.assertEqual(result["required_free_bytes"], ESTIMATED_CHECKPOINT_BYTES * 13)
+
+    def test_budget_aligns_to_complete_optimizer_steps(self):
+        result = aligned_training_budget(
+            target_causal_targets=10_000, batch_size=2, grad_accum=3
+        )
+        self.assertEqual(result["causal_targets_per_optimizer_step"], 6_138)
+        self.assertEqual(result["optimizer_steps"], 2)
+        self.assertEqual(result["aligned_causal_targets"], 12_276)
+
+    def test_scheduler_warms_then_holds_constant(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.AdamW([parameter], lr=1.5e-4)
+        schedule = scheduler_state(
+            base_lr=1.5e-4, warmup_microbatches=2_000, grad_accum=8
+        )
+        self.assertEqual(schedule["warmup_optimizer_steps"], 250)
+        first = set_optimizer_lr(
+            optimizer,
+            base_lr=1.5e-4,
+            optimizer_step_number=1,
+            warmup_optimizer_steps=250,
+        )
+        terminal = set_optimizer_lr(
+            optimizer,
+            base_lr=1.5e-4,
+            optimizer_step_number=251,
+            warmup_optimizer_steps=250,
+        )
+        self.assertAlmostEqual(first, 6.0e-7)
+        self.assertAlmostEqual(terminal, 1.5e-4)
 
 
 if __name__ == "__main__":

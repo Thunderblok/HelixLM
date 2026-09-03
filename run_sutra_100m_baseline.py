@@ -122,6 +122,49 @@ def count_causal_targets(labels: torch.Tensor) -> int:
     return int((labels[:, 1:] != -100).sum().item())
 
 
+def aligned_training_budget(
+    *, target_causal_targets: int, batch_size: int, grad_accum: int
+) -> dict[str, int]:
+    if min(target_causal_targets, batch_size, grad_accum) <= 0:
+        raise ValueError("training budget values must be positive")
+    causal_targets_per_optimizer_step = batch_size * grad_accum * (SEQ_LEN - 1)
+    optimizer_steps = math.ceil(target_causal_targets / causal_targets_per_optimizer_step)
+    return {
+        "requested_causal_targets": target_causal_targets,
+        "aligned_causal_targets": optimizer_steps * causal_targets_per_optimizer_step,
+        "causal_targets_per_optimizer_step": causal_targets_per_optimizer_step,
+        "optimizer_steps": optimizer_steps,
+    }
+
+
+def scheduler_state(
+    *, base_lr: float, warmup_microbatches: int, grad_accum: int
+) -> dict[str, Any]:
+    if base_lr <= 0 or warmup_microbatches <= 0 or grad_accum <= 0:
+        raise ValueError("scheduler values must be positive")
+    return {
+        "type": "linear_warmup_then_constant",
+        "base_lr": base_lr,
+        "warmup_microbatches": warmup_microbatches,
+        "grad_accum": grad_accum,
+        "warmup_optimizer_steps": max(1, warmup_microbatches // grad_accum),
+        "minimum_lr_ratio_after_warmup": 1.0,
+    }
+
+
+def set_optimizer_lr(
+    optimizer: torch.optim.Optimizer,
+    *,
+    base_lr: float,
+    optimizer_step_number: int,
+    warmup_optimizer_steps: int,
+) -> float:
+    lr = base_lr * min(1.0, max(1, optimizer_step_number) / warmup_optimizer_steps)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
 def rng_state() -> dict[str, Any]:
     return {
         "python": random.getstate(),
@@ -218,11 +261,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-source-head", required=True)
     parser.add_argument("--expected-source-tree", required=True)
     parser.add_argument("--artifacts-root", type=Path, required=True)
-    parser.add_argument("--max-optimizer-steps", type=int, default=1_000)
+    parser.add_argument("--target-causal-targets", type=int, default=1_500_000_000)
+    parser.add_argument("--max-optimizer-steps", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--warmup-microbatches", type=int, default=2_000)
     parser.add_argument("--validation-rows", type=int, default=1_024)
     parser.add_argument("--validation-batches", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=100)
@@ -238,9 +283,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if min(
-        args.max_optimizer_steps,
+        args.target_causal_targets,
         args.batch_size,
         args.grad_accum,
+        args.warmup_microbatches,
         args.validation_rows,
         args.validation_batches,
         args.eval_every,
@@ -248,15 +294,24 @@ def main() -> None:
         args.probe_every,
     ) <= 0:
         raise SystemExit("REFUSED: counts and intervals must be positive")
+    if args.max_optimizer_steps < 0:
+        raise SystemExit("REFUSED: --max-optimizer-steps cannot be negative")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (12, 0):
         raise SystemExit("UNAVAILABLE: exact RTX 5080 CUDA runtime is absent")
     if not torch.cuda.is_bf16_supported():
         raise SystemExit("UNAVAILABLE: BF16 is unsupported")
 
     source = verify_source(args.expected_source_head, args.expected_source_tree)
+    budget = aligned_training_budget(
+        target_causal_targets=args.target_causal_targets,
+        batch_size=args.batch_size,
+        grad_accum=args.grad_accum,
+    )
+    bounded_optimizer_steps = args.max_optimizer_steps or budget["optimizer_steps"]
+    bounded_optimizer_steps = min(bounded_optimizer_steps, budget["optimizer_steps"])
     storage = storage_court(
         args.artifacts_root,
-        max_optimizer_steps=args.max_optimizer_steps,
+        max_optimizer_steps=bounded_optimizer_steps,
         checkpoint_every=args.checkpoint_every,
     )
     seed = 42
@@ -278,6 +333,11 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
+    schedule = scheduler_state(
+        base_lr=args.learning_rate,
+        warmup_microbatches=args.warmup_microbatches,
+        grad_accum=args.grad_accum,
+    )
 
     run_contract = {
         **source,
@@ -293,6 +353,8 @@ def main() -> None:
         "grad_accum": args.grad_accum,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "training_budget": budget,
+        "scheduler": schedule,
         "seed": seed,
         "state_probe_posture": "detached_observer_only_no_model_feedback",
     }
@@ -303,6 +365,12 @@ def main() -> None:
         step, offset = load_checkpoint(
             args.resume, model=model, optimizer=optimizer, expected_contract=run_contract
         )
+    set_optimizer_lr(
+        optimizer,
+        base_lr=args.learning_rate,
+        optimizer_step_number=step + 1,
+        warmup_optimizer_steps=int(schedule["warmup_optimizer_steps"]),
+    )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     run_name = f"hlx-b49-sutra100m-t1024-l3-k8-f25-s42-{stamp}"
@@ -356,7 +424,9 @@ def main() -> None:
     state_probe_path = run_root / "state-probes.jsonl"
     try:
         for batch, batch_offset in iter_batches(sequence_iter, batch_size=args.batch_size):
-            if step >= args.max_optimizer_steps:
+            if step >= bounded_optimizer_steps:
+                break
+            if offset.causal_targets_emitted >= budget["aligned_causal_targets"]:
                 break
             device_batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             should_probe = (step + 1) % args.probe_every == 0 and micro_count == args.grad_accum - 1
@@ -397,6 +467,12 @@ def main() -> None:
             if micro_count < args.grad_accum:
                 continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            current_lr = set_optimizer_lr(
+                optimizer,
+                base_lr=args.learning_rate,
+                optimizer_step_number=step + 1,
+                warmup_optimizer_steps=int(schedule["warmup_optimizer_steps"]),
+            )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
@@ -410,6 +486,7 @@ def main() -> None:
                     "train/causal_targets_seen": float(offset.causal_targets_emitted),
                     "train/source_raw_utf8_bytes_read": float(offset.raw_utf8_bytes_read),
                     "train/causal_targets_per_second": offset.causal_targets_emitted / elapsed,
+                    "train/lr": current_lr,
                     "system/peak_vram_bytes": float(torch.cuda.max_memory_allocated()),
                 },
                 step=step,
@@ -444,6 +521,12 @@ def main() -> None:
                     offset=offset,
                     run_contract=run_contract,
                 )
+            set_optimizer_lr(
+                optimizer,
+                base_lr=args.learning_rate,
+                optimizer_step_number=step + 1,
+                warmup_optimizer_steps=int(schedule["warmup_optimizer_steps"]),
+            )
 
         periodic_terminal = run_root / "checkpoints" / f"step-{step:08d}.pt"
         if step > 0 and periodic_terminal.exists():
@@ -470,6 +553,8 @@ def main() -> None:
         "run_name": run_name,
         "run_contract_root": contract_root,
         "optimizer_steps": step,
+        "training_budget": budget,
+        "scheduler": schedule,
         "offset": offset.to_dict(),
         "last_validation": last_validation,
         "peak_vram_bytes": int(torch.cuda.max_memory_allocated()),
