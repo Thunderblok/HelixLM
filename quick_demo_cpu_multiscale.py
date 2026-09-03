@@ -2,6 +2,7 @@
 """
 Minimal CPU demo for ErrorCorrectingMultiScaleAttnNode.
 Tests multi-scale windowed attention on a small model (seq_len=96).
+Uses PretrainTrainer for continuous token windows (no padding, no document-aware chunking).
 """
 import random
 import os
@@ -13,7 +14,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
+from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, PretrainTrainer
 
 
 EPOCHS = 10
@@ -51,7 +52,6 @@ def main():
         compressed_windows=16,
         compressed_views=8,
         corrector_dim=128,      # d_model // 2
-        output_ffn_dim=1024,    # 4 * d_model
         consensus_type="cosine",
         corrector_type="ffn",
         dropout=0.1,
@@ -77,7 +77,8 @@ def main():
     train_texts = texts[:split_idx]
     val_texts = texts[split_idx:]
 
-    trainer = Trainer(
+    # Use PretrainTrainer (continuous windows) instead of the legacy Trainer
+    trainer = PretrainTrainer(
         model=model,
         cfg=cfg,
         train_texts=train_texts,
