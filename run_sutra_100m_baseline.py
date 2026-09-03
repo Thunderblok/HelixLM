@@ -71,8 +71,20 @@ def canonical_root(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def storage_court(
-    artifacts_root: Path, *, max_optimizer_steps: int, checkpoint_every: int
+    artifacts_root: Path,
+    *,
+    max_optimizer_steps: int,
+    checkpoint_every: int,
+    estimated_checkpoint_bytes: int = ESTIMATED_CHECKPOINT_BYTES,
 ) -> dict[str, int | str]:
     existing = artifacts_root.resolve()
     while not existing.exists():
@@ -80,7 +92,7 @@ def storage_court(
             raise RuntimeError(f"no existing parent for artifacts root {artifacts_root}")
         existing = existing.parent
     periodic_checkpoints = math.ceil(max_optimizer_steps / checkpoint_every)
-    required = ESTIMATED_CHECKPOINT_BYTES * (periodic_checkpoints + 3)
+    required = estimated_checkpoint_bytes * (periodic_checkpoints + 3)
     free = shutil.disk_usage(existing).free
     if free < required:
         raise SystemExit(
@@ -90,7 +102,7 @@ def storage_court(
     return {
         "filesystem_root": str(existing),
         "free_bytes": free,
-        "estimated_checkpoint_bytes": ESTIMATED_CHECKPOINT_BYTES,
+        "estimated_checkpoint_bytes": estimated_checkpoint_bytes,
         "planned_periodic_checkpoints": periodic_checkpoints,
         "required_free_bytes": required,
     }
@@ -266,6 +278,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
+    parser.add_argument("--ffn-expansion", type=float, default=2.5)
+    parser.add_argument("--expected-parameter-count", type=int, default=EXPECTED_PARAMETER_COUNT)
+    parser.add_argument("--tokenizer", choices=("gpt2", "lengthmax"), default="gpt2")
+    parser.add_argument("--tokenizer-artifact", type=Path)
+    parser.add_argument("--tokenizer-artifact-sha256")
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup-microbatches", type=int, default=2_000)
     parser.add_argument("--validation-rows", type=int, default=1_024)
@@ -296,6 +313,27 @@ def main() -> None:
         raise SystemExit("REFUSED: counts and intervals must be positive")
     if args.max_optimizer_steps < 0:
         raise SystemExit("REFUSED: --max-optimizer-steps cannot be negative")
+    if args.ffn_expansion <= 0 or args.expected_parameter_count <= 0:
+        raise SystemExit("REFUSED: FFN expansion and expected parameter count must be positive")
+    if args.tokenizer == "lengthmax":
+        if args.tokenizer_artifact is None or args.tokenizer_artifact_sha256 is None:
+            raise SystemExit("REFUSED: LengthMAX requires an artifact path and expected SHA-256")
+        tokenizer_artifact = args.tokenizer_artifact.resolve()
+        if not tokenizer_artifact.is_file():
+            raise SystemExit(f"REFUSED: LengthMAX artifact is absent: {tokenizer_artifact}")
+        observed_tokenizer_sha256 = file_sha256(tokenizer_artifact)
+        if observed_tokenizer_sha256 != args.tokenizer_artifact_sha256:
+            raise SystemExit(
+                "REFUSED: LengthMAX artifact hash mismatch: "
+                f"{observed_tokenizer_sha256} != {args.tokenizer_artifact_sha256}"
+            )
+        tokenizer_spec = f"lengthmax:{tokenizer_artifact}"
+    else:
+        if args.tokenizer_artifact is not None or args.tokenizer_artifact_sha256 is not None:
+            raise SystemExit("REFUSED: GPT-2 does not accept a LengthMAX artifact")
+        tokenizer_artifact = None
+        observed_tokenizer_sha256 = None
+        tokenizer_spec = "gpt2"
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (12, 0):
         raise SystemExit("UNAVAILABLE: exact RTX 5080 CUDA runtime is absent")
     if not torch.cuda.is_bf16_supported():
@@ -313,6 +351,7 @@ def main() -> None:
         args.artifacts_root,
         max_optimizer_steps=bounded_optimizer_steps,
         checkpoint_every=args.checkpoint_every,
+        estimated_checkpoint_bytes=args.expected_parameter_count * 12,
     )
     seed = 42
     random.seed(seed)
@@ -320,16 +359,24 @@ def main() -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    tokenizer = HelixTokenizer("gpt2", local_files_only=True)
+    tokenizer = HelixTokenizer(tokenizer_spec, local_files_only=True)
     if len(tokenizer) != 50_257 or tokenizer.eos_token_id != 50_256:
-        raise SystemExit("REFUSED: GPT-2 tokenizer identity mismatch")
-    config = build_config(batch_size=args.batch_size)
+        raise SystemExit("REFUSED: tokenizer identity mismatch")
+    config = build_config(
+        batch_size=args.batch_size,
+        ffn_expansion=args.ffn_expansion,
+        tokenizer_name=tokenizer_spec,
+    )
     config.lr = args.learning_rate
     config.weight_decay = args.weight_decay
     config.memory_efficient_forward = True
     model = HelixForCausalLM(config).to("cuda")
-    if model.count_parameters()["total"] != EXPECTED_PARAMETER_COUNT:
-        raise SystemExit("REFUSED: model parameter-count drift")
+    observed_parameter_count = model.count_parameters()["total"]
+    if observed_parameter_count != args.expected_parameter_count:
+        raise SystemExit(
+            "REFUSED: model parameter-count drift: "
+            f"{observed_parameter_count} != {args.expected_parameter_count}"
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -345,9 +392,20 @@ def main() -> None:
         "dataset_revision": DATASET_REVISION,
         "validation_posture": "first_ordered_rows_held_out_from_training",
         "validation_rows": args.validation_rows,
-        "tokenizer": "gpt2",
+        "tokenizer": args.tokenizer,
+        "tokenizer_artifact_sha256": observed_tokenizer_sha256,
         "tokenizer_vocab_size": len(tokenizer),
-        "parameter_count": EXPECTED_PARAMETER_COUNT,
+        "parameter_count": observed_parameter_count,
+        "d_model": config.d_model,
+        "n_heads": config.n_heads,
+        "n_columns": config.n_columns,
+        "nodes_per_column": list(config.nodes_per_column),
+        "n_loops": config.n_loops,
+        "ffn_expansion": config.ffn_expansion,
+        "local_window": config.local_window,
+        "coarse_window": config.coarse_window,
+        "compressed_windows": config.compressed_windows,
+        "compressed_views": config.compressed_views,
         "sequence_length": SEQ_LEN,
         "lateral_p": config.lateral_p,
         "vertical_p": config.vertical_p,
@@ -376,7 +434,10 @@ def main() -> None:
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    run_name = f"hlx-b49-sutra100m-t1024-l3-k8-f25-s42-{stamp}"
+    tokenizer_code = "g2" if args.tokenizer == "gpt2" else "lm"
+    ffn_code = str(args.ffn_expansion).replace(".", "")
+    lr_code = f"{args.learning_rate:.0e}".replace("-", "m")
+    run_name = f"hlx-b49-sutra100m-{tokenizer_code}-t1024-l3-f{ffn_code}-lr{lr_code}-s42-{stamp}"
     run_root = args.artifacts_root / run_name
     run_root.mkdir(parents=True, exist_ok=False)
     (run_root / "run_contract.json").write_text(
@@ -385,6 +446,11 @@ def main() -> None:
     (run_root / "storage_court.json").write_text(
         json.dumps(storage, indent=2, sort_keys=True) + "\n"
     )
+    if tokenizer_artifact is not None:
+        copied_artifact = run_root / "lengthmax-tokenizer.json"
+        shutil.copy2(tokenizer_artifact, copied_artifact)
+        if file_sha256(copied_artifact) != observed_tokenizer_sha256:
+            raise RuntimeError("LengthMAX artifact changed while entering run custody")
 
     logger = RealtimeMLflowLogger(
         tracking_uri=args.mlflow_uri,
@@ -397,7 +463,8 @@ def main() -> None:
             **{f"storage_{key}": value for key, value in storage.items()},
         },
         tags={
-            "run_kind": "sutra100m_baseline_with_passive_state_probe_v0",
+            "run_kind": "sutra100m_compound_candidate_with_passive_state_probe_v0",
+            "comparison_posture": "exploratory_compound_not_single_factor",
             "production_effect": "none",
             "automata_feedback": "disabled",
         },

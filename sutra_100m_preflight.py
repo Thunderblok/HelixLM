@@ -59,7 +59,12 @@ def git_identity(root: Path) -> dict[str, str]:
     }
 
 
-def build_config(*, batch_size: int = 1) -> HelixConfig:
+def build_config(
+    *,
+    batch_size: int = 1,
+    ffn_expansion: float = 2.5,
+    tokenizer_name: str = TOKENIZER,
+) -> HelixConfig:
     return HelixConfig.small_v2(
         vocab_size=VOCAB_SIZE,
         d_model=768,
@@ -81,12 +86,12 @@ def build_config(*, batch_size: int = 1) -> HelixConfig:
         amp_dtype="bfloat16",
         dropout=0.05,
         attn_dropout=0.05,
-        ffn_expansion=2.5,
+        ffn_expansion=ffn_expansion,
         lr=1.5e-4,
         warmup_steps=2_000,
         weight_decay=0.05,
         grad_clip=1.0,
-        tokenizer_name=TOKENIZER,
+        tokenizer_name=tokenizer_name,
         pad_token_id=50_256,
         eos_token_id=50_256,
         bos_token_id=50_256,

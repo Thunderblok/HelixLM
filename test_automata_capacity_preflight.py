@@ -16,7 +16,12 @@ from run_sutra_100m_baseline import (
     set_optimizer_lr,
     storage_court,
 )
-from sutra_100m_preflight import EXPECTED_PARAMETER_COUNT, dataset_court, model_court
+from sutra_100m_preflight import (
+    EXPECTED_PARAMETER_COUNT,
+    build_config,
+    dataset_court,
+    model_court,
+)
 from sutra_stream import SutraStreamOffset, iter_packed_sequences
 
 
@@ -59,6 +64,13 @@ class SutraPreflightCourt(unittest.TestCase):
         self.assertEqual(result["lateral_p"], 0.5)
         self.assertEqual(result["vertical_p"], 0.7)
         self.assertEqual(result["vertical_depth"], 2)
+
+    def test_ffn_expansion_is_an_explicit_candidate_knob(self):
+        baseline = build_config(ffn_expansion=2.5)
+        candidate = build_config(ffn_expansion=3.0, tokenizer_name="lengthmax:/tmp/exact.json")
+        self.assertEqual(baseline.ffn_expansion, 2.5)
+        self.assertEqual(candidate.ffn_expansion, 3.0)
+        self.assertEqual(candidate.tokenizer_name, "lengthmax:/tmp/exact.json")
 
     def test_dataset_court_binds_order_and_rejects_missing_text(self):
         rows = [{"text": "alpha", "domain": "a"}, {"text": "beta", "domain": "b"}]
