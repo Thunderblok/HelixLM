@@ -56,6 +56,7 @@ def main():
         corrector_type="ffn",
         dropout=0.1,
         attn_dropout=0.1,
+        warmup_steps=30,
     )
 
     cfg.pad_token_id = tokenizer.pad_token_id
