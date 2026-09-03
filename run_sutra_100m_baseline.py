@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import time
 from dataclasses import asdict
@@ -34,6 +35,7 @@ from sutra_stream import SutraStreamOffset, iter_packed_sequences, resume_rows
 
 ROOT = Path(__file__).resolve().parent
 EXPERIMENT = "helix-sutra100m-automata-capacity-v0"
+ESTIMATED_CHECKPOINT_BYTES = EXPECTED_PARAMETER_COUNT * 12
 
 
 def git_value(*args: str) -> str:
@@ -67,6 +69,31 @@ def canonical_root(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), default=str, allow_nan=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def storage_court(
+    artifacts_root: Path, *, max_optimizer_steps: int, checkpoint_every: int
+) -> dict[str, int | str]:
+    existing = artifacts_root.resolve()
+    while not existing.exists():
+        if existing.parent == existing:
+            raise RuntimeError(f"no existing parent for artifacts root {artifacts_root}")
+        existing = existing.parent
+    periodic_checkpoints = math.ceil(max_optimizer_steps / checkpoint_every)
+    required = ESTIMATED_CHECKPOINT_BYTES * (periodic_checkpoints + 3)
+    free = shutil.disk_usage(existing).free
+    if free < required:
+        raise SystemExit(
+            "UNAVAILABLE: checkpoint filesystem lacks bounded free space: "
+            f"free={free} required={required} root={existing}"
+        )
+    return {
+        "filesystem_root": str(existing),
+        "free_bytes": free,
+        "estimated_checkpoint_bytes": ESTIMATED_CHECKPOINT_BYTES,
+        "planned_periodic_checkpoints": periodic_checkpoints,
+        "required_free_bytes": required,
+    }
 
 
 def iter_batches(
@@ -227,6 +254,11 @@ def main() -> None:
         raise SystemExit("UNAVAILABLE: BF16 is unsupported")
 
     source = verify_source(args.expected_source_head, args.expected_source_tree)
+    storage = storage_court(
+        args.artifacts_root,
+        max_optimizer_steps=args.max_optimizer_steps,
+        checkpoint_every=args.checkpoint_every,
+    )
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -263,6 +295,7 @@ def main() -> None:
         "weight_decay": args.weight_decay,
         "seed": seed,
         "state_probe_posture": "detached_observer_only_no_model_feedback",
+        "storage_court": storage,
     }
     contract_root = canonical_root(run_contract)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
@@ -405,14 +438,19 @@ def main() -> None:
                     run_contract=run_contract,
                 )
 
-        save_checkpoint(
-            run_root / "checkpoints" / "terminal.pt",
-            model=model,
-            optimizer=optimizer,
-            step=step,
-            offset=offset,
-            run_contract=run_contract,
-        )
+        periodic_terminal = run_root / "checkpoints" / f"step-{step:08d}.pt"
+        if step > 0 and periodic_terminal.exists():
+            terminal_checkpoint = periodic_terminal
+        else:
+            terminal_checkpoint = run_root / "checkpoints" / "terminal.pt"
+            save_checkpoint(
+                terminal_checkpoint,
+                model=model,
+                optimizer=optimizer,
+                step=step,
+                offset=offset,
+                run_contract=run_contract,
+            )
     except BaseException:
         run_status = "FAILED"
         raise
@@ -431,6 +469,7 @@ def main() -> None:
         "mlflow_run_id": logger.run_id,
         "mlflow_errors": logger.mlflow_errors,
         "state_probe_path": str(state_probe_path),
+        "terminal_checkpoint": str(terminal_checkpoint),
         "production_effect": "none",
     }
     terminal["terminal_root"] = canonical_root(terminal)

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 from automata_state_probe import compression_accounting, observe_hidden_sequence
-from run_sutra_100m_baseline import count_causal_targets, iter_batches
+from run_sutra_100m_baseline import (
+    ESTIMATED_CHECKPOINT_BYTES,
+    count_causal_targets,
+    iter_batches,
+    storage_court,
+)
 from sutra_100m_preflight import EXPECTED_PARAMETER_COUNT, dataset_court, model_court
 from sutra_stream import SutraStreamOffset, iter_packed_sequences
 
@@ -98,6 +105,17 @@ class SutraPreflightCourt(unittest.TestCase):
         self.assertEqual(list(batch["input_ids"].shape), [2, 8])
         self.assertEqual(count_causal_targets(batch["labels"]), 14)
         self.assertEqual(offset.sequences_emitted, 2)
+
+    def test_storage_court_accounts_for_periodic_and_atomic_images(self):
+        with patch(
+            "run_sutra_100m_baseline.shutil.disk_usage",
+            return_value=type("Usage", (), {"free": ESTIMATED_CHECKPOINT_BYTES * 20})(),
+        ):
+            result = storage_court(
+                Path("/tmp"), max_optimizer_steps=1_000, checkpoint_every=100
+            )
+        self.assertEqual(result["planned_periodic_checkpoints"], 10)
+        self.assertEqual(result["required_free_bytes"], ESTIMATED_CHECKPOINT_BYTES * 13)
 
 
 if __name__ == "__main__":
