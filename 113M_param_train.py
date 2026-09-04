@@ -34,8 +34,12 @@ from helix_lm import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 # 3B token dataset with train/val splits — STREAMING MODE
-PUSH_TO_HUB = True
-DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
+PUSH_TO_HUB = os.getenv("HELIX_PUSH_TO_HUB", "0") == "1"
+DATASET = os.getenv("HELIX_DATASET", "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1")
+DATASET_REVISION = os.getenv("HELIX_DATASET_REVISION")
+PRETRAIN_STORE_DIR = os.getenv("HELIX_PRETRAIN_STORE_DIR")
+RESUME_TRAINING_STATE = os.getenv("HELIX_RESUME_TRAINING_STATE")
+VALIDATION_SAMPLES = int(os.getenv("HELIX_VALIDATION_SAMPLES", "252"))
 HF_USERNAME = "david-thrower"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
@@ -106,7 +110,7 @@ PUSH_RETRY_DELAY = 90
 STREAMING = True
 PREPROCESS_BATCH_SIZE = 1000       # not used by PretrainTrainer, but kept for logging
 CLEANUP_SHARDS = True              # not used by PretrainTrainer
-NUM_WORKERS = 16
+NUM_WORKERS = int(os.getenv("HELIX_NUM_WORKERS", "4" if PRETRAIN_STORE_DIR else "0"))
 
 # Tokenizer
 TOKENIZER_NAME = "gpt2"
@@ -170,6 +174,54 @@ def push_checkpoint(model, tokenizer, stage_num, local_dir):
     return ""
 
 
+def build_stage_config(tokenizer, vocab_size, stage_idx):
+    """Build one declared LR-stage config without changing the model topology."""
+    lr = LR_STAGES[stage_idx]
+    warmup = WARMUP_STAGES[stage_idx]
+    cfg = HelixConfig.small_v2(
+        vocab_size=vocab_size,
+        tokenizer_name=TOKENIZER_NAME,
+        d_model=D_MODEL,
+        n_columns=N_COLUMNS,
+        nodes_per_column=NODES_PER_COLUMN,
+        n_heads=N_HEADS,
+        n_loops=N_LOOPS,
+        seq_len=SEQ_LEN,
+        dropout=DROPOUT,
+        attn_dropout=ATTENTION_DROPOUT,
+        ffn_expansion=FFN_EXPANSION,
+        weight_decay=WEIGHT_DECAY,
+        grad_clip=GRAD_CLIP,
+        grad_buffer_ratio=GRAD_BUFFER_RATIO,
+        batch_size=BATCH_SIZE,
+        lr=lr,
+        warmup_steps=warmup,
+        epochs=1,
+        use_cca=USE_CCA,
+        use_ssm=USE_SSM,
+        use_titans_memory=USE_TITANS,
+        seed=SEED,
+        device="auto",
+        dtype=D_TYPE,
+        amp_dtype=AMP_DTYPE,
+        lateral_p=LATERAL_P,
+        vertical_p=VERTICAL_P,
+        vertical_depth=VERTICAL_DEPTH,
+        attention_mode=ATTENTION_MODE,
+        local_window=LOCAL_WINDOW,
+        coarse_window=COARSE_WINDOW,
+        compressed_windows=COMPRESSED_WINDOWS,
+        compressed_views=COMPRESSED_VIEWS,
+        consensus_type=CONSENSUS_TYPE,
+        corrector_type=CORRECTOR_TYPE,
+        tie_word_embeddings=True,
+    )
+    cfg.pad_token_id = tokenizer.pad_token_id
+    cfg.eos_token_id = tokenizer.eos_token_id
+    cfg.bos_token_id = tokenizer.bos_token_id
+    return cfg
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -181,6 +233,7 @@ def main():
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
+    logger.info("Revision:   %s", DATASET_REVISION or "provider default (not release-admissible)")
     logger.info("Config:     d=%d cols=%d heads=%d ffn=%.1f seq=%d loops=%d",
                 D_MODEL, N_COLUMNS, N_HEADS, FFN_EXPANSION, SEQ_LEN, N_LOOPS)
     logger.info("Topology:   lateral=%.1f vertical=%.1f depth=%d",
@@ -216,81 +269,101 @@ def main():
     logger.info("Vocab:      %d", vocab_size)
 
     # ── Dataset (STREAMING MODE) ───────────────────────────────────────
-    logger.info("Loading dataset (streaming=%s): %s", STREAMING, DATASET)
-    try:
-        hf_ds = load_dataset(DATASET, streaming=STREAMING)
-    except Exception as e:
-        logger.error("❌ Failed to load dataset: %s", e)
-        sys.exit(1)
-
-    # Extract text columns as iterables (do not materialize)
-    if NUM_SAMPLES:
-        train_iterable = hf_ds['train'].take(NUM_SAMPLES)['text']
+    if PRETRAIN_STORE_DIR:
+        hf_ds = None
+        train_iterable = None
+        val_iterable = None
+        logger.info("Train store: %s", PRETRAIN_STORE_DIR)
     else:
-        train_iterable = hf_ds['train']['text']
-    val_iterable = hf_ds['validation']['text']
+        logger.info("Loading dataset (streaming=%s): %s", STREAMING, DATASET)
+        try:
+            load_kwargs = {"streaming": STREAMING}
+            if DATASET_REVISION:
+                load_kwargs["revision"] = DATASET_REVISION
+            hf_ds = load_dataset(DATASET, **load_kwargs)
+        except Exception as e:
+            logger.error("❌ Failed to load dataset: %s", e)
+            sys.exit(1)
+        if NUM_SAMPLES:
+            train_iterable = hf_ds['train'].take(NUM_SAMPLES)['text']
+        else:
+            train_iterable = hf_ds['train']['text']
+        val_iterable = hf_ds['validation']['text']
 
-    logger.info("Train:      IterableColumn (streaming)")
-    logger.info("Val:        IterableColumn (streaming)")
+    logger.info("Train:      %s", "indexed sample store" if PRETRAIN_STORE_DIR else "IterableColumn (streaming)")
+    logger.info(
+        "Val:        %s",
+        f"fixed epoch-0 permutation tail ({VALIDATION_SAMPLES} samples)"
+        if PRETRAIN_STORE_DIR
+        else "IterableColumn (streaming)",
+    )
     logger.info("Note:       Using PretrainTrainer with continuous token windows")
 
     # ── Training loop ────────────────────────────────────────────────────
     all_results = []
     prev_ckpt_dir = None
+    start_stage_idx = 0
+    resume_current_stage = False
+    completed_resume_state = None
+    if RESUME_TRAINING_STATE:
+        if not PRETRAIN_STORE_DIR:
+            raise ValueError(
+                "HELIX_RESUME_TRAINING_STATE requires HELIX_PRETRAIN_STORE_DIR"
+            )
+        resume_metadata = PretrainTrainer.load_training_state(RESUME_TRAINING_STATE)
+        start_stage_idx, resume_current_stage = PretrainTrainer.resume_stage_plan(
+            resume_metadata,
+            len(LR_STAGES),
+        )
+        if not resume_current_stage:
+            prior_stage_idx = start_stage_idx - 1
+            prior_cfg = build_stage_config(tokenizer, vocab_size, prior_stage_idx)
+            resume_validator = PretrainTrainer(
+                model=HelixForCausalLM(prior_cfg),
+                cfg=prior_cfg,
+                train_texts=None,
+                train_store_dir=PRETRAIN_STORE_DIR,
+                train_permutation_epoch=prior_stage_idx,
+                resume_training_state=RESUME_TRAINING_STATE,
+                validation_sample_count=VALIDATION_SAMPLES,
+                tokenizer=tokenizer,
+                output_dir=str(OUTPUT_DIR / "resume-validation"),
+                grad_accum_steps=GRAD_ACCUM,
+                use_amp=USE_AMP,
+                amp_dtype=AMP_DTYPE,
+                verbose=False,
+                num_workers=NUM_WORKERS,
+            )
+            completed_resume_state = resume_metadata
+            del resume_validator
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        if start_stage_idx == len(LR_STAGES):
+            logger.info("Exact indexed resume already completed every configured LR stage")
+            return
+        logger.info(
+            "Exact indexed resume: next stage=%d state=%s",
+            start_stage_idx + 1,
+            RESUME_TRAINING_STATE,
+        )
 
-    for stage_idx, (lr, warmup) in enumerate(zip(LR_STAGES, WARMUP_STAGES)):
+    stages = list(enumerate(zip(LR_STAGES, WARMUP_STAGES)))
+    for stage_idx, (lr, warmup) in stages[start_stage_idx:]:
         stage_num = stage_idx + 1
         logger.info("\n" + "=" * 70)
         logger.info("EPOCH %d/%d | LR=%.1e | Warmup=%d", stage_num, EPOCHS, lr, warmup)
         logger.info("=" * 70)
 
         # ── Build config ─────────────────────────────────────────────
-        cfg = HelixConfig.small_v2(
-            vocab_size=vocab_size,
-            tokenizer_name=TOKENIZER_NAME,
-            d_model=D_MODEL,
-            n_columns=N_COLUMNS,
-            nodes_per_column=NODES_PER_COLUMN,
-            n_heads=N_HEADS,
-            n_loops=N_LOOPS,
-            seq_len=SEQ_LEN,
-            dropout=DROPOUT,
-            attn_dropout=ATTENTION_DROPOUT,
-            ffn_expansion=FFN_EXPANSION,
-            weight_decay=WEIGHT_DECAY,
-            grad_clip=GRAD_CLIP,
-            grad_buffer_ratio=GRAD_BUFFER_RATIO,
-            batch_size=BATCH_SIZE,
-            lr=lr,
-            warmup_steps=warmup,
-            epochs=1,  # we train one epoch per stage
-            use_cca=USE_CCA,
-            use_ssm=USE_SSM,
-            use_titans_memory=USE_TITANS,
-            seed=SEED,
-            device="auto",
-            dtype=D_TYPE,
-            amp_dtype=AMP_DTYPE,
-            lateral_p=LATERAL_P,
-            vertical_p=VERTICAL_P,
-            vertical_depth=VERTICAL_DEPTH,
-            attention_mode=ATTENTION_MODE,
-            local_window=LOCAL_WINDOW,
-            coarse_window=COARSE_WINDOW,
-            compressed_windows=COMPRESSED_WINDOWS,
-            compressed_views=COMPRESSED_VIEWS,
-            consensus_type=CONSENSUS_TYPE,
-            corrector_type=CORRECTOR_TYPE,
-            tie_word_embeddings=True,
-        )
-
-        # Set token IDs
-        cfg.pad_token_id = tokenizer.pad_token_id
-        cfg.eos_token_id = tokenizer.eos_token_id
-        cfg.bos_token_id = tokenizer.bos_token_id
+        cfg = build_stage_config(tokenizer, vocab_size, stage_idx)
 
         logger.info("Topology check: lateral=%.1f vertical=%.1f depth=%d",
                     cfg.lateral_p, cfg.vertical_p, cfg.vertical_depth)
+
+        completed_model_state = None
+        if completed_resume_state is not None and stage_idx == start_stage_idx:
+            completed_model_state = completed_resume_state["model"]
+            completed_resume_state = None
 
         # ── Create model (only once per stage) ────────────────────────
         model = HelixForCausalLM(cfg)
@@ -298,7 +371,15 @@ def main():
         logger.info("Graph: %d nodes, %d edges", graph_info["n_nodes"], graph_info["n_edges"])
 
         # Load previous checkpoint if available
-        if prev_ckpt_dir is not None:
+        stage_resume_state = (
+            RESUME_TRAINING_STATE
+            if resume_current_stage and stage_idx == start_stage_idx
+            else None
+        )
+        if completed_model_state is not None:
+            model.load_state_dict(completed_model_state)
+            del completed_model_state
+        if prev_ckpt_dir is not None and stage_resume_state is None:
             st_path = os.path.join(prev_ckpt_dir, "model.safetensors")
             if os.path.exists(st_path):
                 sd = load_safetensors(st_path)
@@ -323,7 +404,11 @@ def main():
         trainer = PretrainTrainer(
             model=model,
             cfg=cfg,
-            train_texts=train_iterable,        # IterableColumn — streaming mode
+            train_texts=train_iterable,
+            train_store_dir=PRETRAIN_STORE_DIR,
+            train_permutation_epoch=stage_idx,
+            resume_training_state=stage_resume_state,
+            validation_sample_count=VALIDATION_SAMPLES if PRETRAIN_STORE_DIR else 0,
             val_texts=val_iterable,            # IterableColumn — streaming mode
             tokenizer=tokenizer,
             output_dir=stage_output_dir,
@@ -343,8 +428,8 @@ def main():
         elapsed = time.time() - t0
 
         # ── Metrics ──────────────────────────────────────────────────
-        train_loss = history.get("train_loss", [float("nan")])[-1]
-        val_loss = history.get("val_loss", [float("nan")])[-1]
+        train_loss = (history.get("train_loss") or [float("nan")])[-1]
+        val_loss = (history.get("val_loss") or [float("nan")])[-1]
         train_ppl = math.exp(min(train_loss, 20)) if not math.isnan(train_loss) else float("nan")
         val_ppl = math.exp(min(val_loss, 20)) if not math.isnan(val_loss) else float("nan")
 
@@ -358,7 +443,11 @@ def main():
         prev_ckpt_dir = canonical_ckpt
 
         # ── Push ─────────────────────────────────────────────────────
-        hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
+        if PUSH_TO_HUB:
+            hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
+        else:
+            hub_repo = ""
+            logger.info("Hub publication disabled; local checkpoint retained at %s", canonical_ckpt)
 
         # ── Track ────────────────────────────────────────────────────
         stage_result = {
@@ -414,6 +503,10 @@ def main():
             "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
             "lr_stages": LR_STAGES, "warmup_stages": WARMUP_STAGES,
             "streaming": STREAMING, "preprocess_batch_size": PREPROCESS_BATCH_SIZE,
+            "dataset": DATASET, "dataset_revision": DATASET_REVISION,
+            "pretrain_store_dir": PRETRAIN_STORE_DIR,
+            "resume_training_state": RESUME_TRAINING_STATE,
+            "validation_sample_count": VALIDATION_SAMPLES if PRETRAIN_STORE_DIR else None,
             "use_amp": USE_AMP, "amp_dtype": AMP_DTYPE,
             "data_mode": "continuous_windows",
         },

@@ -651,11 +651,81 @@ class PretrainTrainer(Trainer):
             training epoch to obtain the total number of batches. This enables an exact
             progress bar from epoch 1. If False, the count is learned after epoch 1.
     """
+    TRAINING_STATE_VERSION = "helix.pretrain.training-state.v1"
+    TRAINING_STATE_FIELDS = frozenset(
+        {
+            "epoch",
+            "global_step",
+            "sample_cursor",
+            "usable_sample_count",
+            "dataset_manifest_sha256",
+            "permutation_sha256",
+            "permutation_epoch",
+            "permutation_seed",
+            "validation_sample_count",
+            "validation_sample_ids_sha256",
+            "model",
+            "optimizer",
+            "best_val_loss",
+            "history",
+            "scheduler",
+            "scheduler_config",
+            "training_config",
+            "torch_rng_state",
+            "cuda_rng_state_all",
+            "scaler",
+        }
+    )
+
+    @staticmethod
+    def load_training_state(path) -> Dict[str, Any]:
+        """Load and structurally validate a trusted local indexed checkpoint."""
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise ValueError("Indexed pretraining checkpoint must contain a state mapping")
+        if state.get("format_version") != PretrainTrainer.TRAINING_STATE_VERSION:
+            raise ValueError("Unsupported indexed pretraining checkpoint format")
+        missing_fields = sorted(PretrainTrainer.TRAINING_STATE_FIELDS - state.keys())
+        if missing_fields:
+            raise ValueError(
+                "Indexed pretraining checkpoint is missing fields: "
+                + ", ".join(missing_fields)
+            )
+        history = state["history"]
+        expected_history_keys = {"train_loss", "val_loss", "perplexity"}
+        if (
+            not isinstance(history, dict)
+            or set(history) != expected_history_keys
+            or not all(isinstance(values, list) for values in history.values())
+        ):
+            raise ValueError("Indexed pretraining checkpoint history is malformed")
+        return state
+
+    @staticmethod
+    def training_state_epoch_complete(state: Dict[str, Any]) -> bool:
+        """Return whether a structurally validated state consumed its usable epoch."""
+        cursor = int(state["sample_cursor"])
+        usable_samples = int(state["usable_sample_count"])
+        if cursor < 0 or cursor > usable_samples:
+            raise ValueError("Indexed pretraining checkpoint cursor is outside its epoch")
+        return cursor == usable_samples
+
+    @staticmethod
+    def resume_stage_plan(state: Dict[str, Any], stage_count: int) -> tuple[int, bool]:
+        """Return the next LR-stage index and whether exact in-stage restore is needed."""
+        stage_index = int(state["permutation_epoch"])
+        resume_current_stage = not PretrainTrainer.training_state_epoch_complete(state)
+        if not resume_current_stage:
+            stage_index += 1
+        if stage_index < 0 or stage_index > int(stage_count):
+            raise ValueError("Resume checkpoint permutation epoch is outside LR_STAGES")
+        return stage_index, resume_current_stage
+
     def __init__(
         self,
         model,
         cfg,
-        train_texts,
+        train_texts=None,
         val_texts=None,
         tokenizer=None,
         output_dir="./checkpoints",
@@ -668,29 +738,191 @@ class PretrainTrainer(Trainer):
         total_optimizer_steps=None,
         min_lr_ratio=1.0,
         count_first: bool = False,
+        train_store_dir=None,
+        train_permutation_path=None,
+        train_permutation_epoch: int = 0,
+        train_cursor: int = 0,
+        validation_sample_count: int = 0,
+        resume_training_state=None,
+        verify_train_store: bool = True,
+        pin_memory: bool = True,
+        prefetch_factor: int = 4,
         **kwargs,
     ):
-        from torch.utils.data import DataLoader
+        from torch.utils.data import DataLoader, Subset
         from .dataset import ContinuousWindowDataset, collate_continuous
-
-        # Build datasets and keep references for potential recounting
-        self._train_dataset = ContinuousWindowDataset(
-            train_texts, tokenizer, cfg.seq_len,
-            buffer_size=buffer_size, seed=seed, shuffle=True
+        from .pretrain_data import (
+            PretrainIndexedDataset,
+            PretrainPermutation,
+            collate_pretrain_samples,
+            create_pretrain_indexed_loader,
         )
+
+        resume_state = None
+        resume_epoch_complete = False
+        if resume_training_state is not None:
+            resume_state = self.load_training_state(resume_training_state)
+            if train_store_dir is None:
+                raise ValueError("resume_training_state requires train_store_dir")
+            train_permutation_epoch = int(resume_state["permutation_epoch"])
+            train_cursor = int(resume_state["sample_cursor"])
+
+        self._indexed_train = train_store_dir is not None
+        self._train_permutation = None
+        self._train_cursor = int(train_cursor)
+        self._train_store_dir = os.fspath(train_store_dir) if train_store_dir is not None else None
+        self._train_seed = int(seed)
+        self._initial_train_permutation_epoch = int(train_permutation_epoch)
+        resume_train_epoch = int(resume_state["epoch"]) if resume_state is not None else None
+        self._train_permutation_base_epoch = (
+            int(train_permutation_epoch) - (resume_train_epoch - 1)
+            if resume_train_epoch is not None
+            else int(train_permutation_epoch)
+        )
+        if self._train_permutation_base_epoch < 0:
+            raise ValueError("Indexed pretraining checkpoint epoch identity mismatch")
+        self._train_permutation_epoch = int(train_permutation_epoch)
+        self._start_train_epoch = resume_train_epoch or 1
+        self._initial_train_permutation_path = train_permutation_path
+        self._indexed_num_workers = int(num_workers)
+        self._indexed_pin_memory = bool(pin_memory)
+        self._indexed_prefetch_factor = int(prefetch_factor)
+        self._resume_scheduler_state = None
+        self._validation_sample_ids = ()
+        self._validation_sample_ids_sha256 = None
+
+        # The indexed path is pretraining-only. It replays one persisted global
+        # sample order and does not alter the legacy Trainer/SFT data path.
+        if self._indexed_train:
+            self._train_dataset = PretrainIndexedDataset(
+                train_store_dir,
+                verify=verify_train_store,
+            )
+            if self._train_dataset.seq_len != cfg.seq_len:
+                raise ValueError(
+                    "Compiled pretraining seq_len does not match the model config: "
+                    f"{self._train_dataset.seq_len} != {cfg.seq_len}"
+                )
+            if train_permutation_path is None:
+                train_permutation_path = os.path.join(
+                    train_store_dir,
+                    "permutations",
+                    f"epoch-{int(train_permutation_epoch):04d}-seed-{int(seed)}.u32",
+                )
+            if os.path.exists(train_permutation_path):
+                self._train_permutation = PretrainPermutation.load(train_permutation_path)
+            else:
+                self._train_permutation = PretrainPermutation.create(
+                    train_permutation_path,
+                    len(self._train_dataset),
+                    seed,
+                    epoch=train_permutation_epoch,
+                )
+            self._validate_permutation_identity(
+                self._train_permutation,
+                expected_epoch=train_permutation_epoch,
+                expected_seed=seed,
+            )
+            validation_sample_count = int(validation_sample_count)
+            if validation_sample_count < 0 or validation_sample_count >= len(self._train_dataset):
+                raise ValueError("validation_sample_count must leave training samples")
+            if validation_sample_count:
+                import hashlib
+                import numpy as np
+
+                validation_permutation_path = os.path.join(
+                    train_store_dir,
+                    "permutations",
+                    f"epoch-0000-seed-{int(seed)}.u32",
+                )
+                if os.path.exists(validation_permutation_path):
+                    validation_permutation = PretrainPermutation.load(
+                        validation_permutation_path
+                    )
+                else:
+                    validation_permutation = PretrainPermutation.create(
+                        validation_permutation_path,
+                        len(self._train_dataset),
+                        seed,
+                        epoch=0,
+                    )
+                self._validate_permutation_identity(
+                    validation_permutation,
+                    expected_epoch=0,
+                    expected_seed=seed,
+                )
+                validation_values = validation_permutation.values()
+                validation_ids = np.asarray(
+                    validation_values[-validation_sample_count:],
+                    dtype=np.dtype("<u4"),
+                )
+                self._validation_sample_ids = tuple(int(value) for value in validation_ids)
+                self._validation_sample_ids_sha256 = hashlib.sha256(
+                    validation_ids.tobytes(order="C")
+                ).hexdigest()
+            self.train_loader = create_pretrain_indexed_loader(
+                self._train_dataset,
+                self._train_permutation,
+                cfg.batch_size,
+                cursor=self._train_cursor,
+                excluded_sample_ids=self._validation_sample_ids,
+                num_workers=num_workers,
+                drop_last=True,
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor,
+            )
+            self._usable_sample_count = (
+                (len(self._train_dataset) - len(self._validation_sample_ids))
+                // int(cfg.batch_size)
+            ) * int(cfg.batch_size)
+            if self._train_cursor < 0 or self._train_cursor > self._usable_sample_count:
+                raise ValueError("Indexed pretraining cursor is outside the usable sample range")
+            resume_epoch_complete = (
+                resume_state is not None
+                and self.training_state_epoch_complete(resume_state)
+            )
+            if (
+                resume_state is not None
+                and int(resume_state["usable_sample_count"]) != self._usable_sample_count
+            ):
+                raise ValueError("Indexed pretraining checkpoint usable sample count mismatch")
+            if len(self.train_loader) == 0 and not resume_epoch_complete:
+                raise ValueError("Indexed pretraining cursor leaves no complete training batch")
+        else:
+            if train_texts is None:
+                raise ValueError("train_texts or train_store_dir must be provided")
+            self._train_dataset = ContinuousWindowDataset(
+                train_texts, tokenizer, cfg.seq_len,
+                buffer_size=buffer_size, seed=seed, shuffle=True
+            )
+            self.train_loader = self._make_loader(
+                self._train_dataset, cfg.batch_size, num_workers, collate_continuous
+            )
+
         self._val_dataset = None
-        if val_texts is not None:
+        if self._indexed_train and self._validation_sample_ids:
+            self._val_dataset = Subset(
+                self._train_dataset,
+                list(self._validation_sample_ids),
+            )
+        elif val_texts is not None:
             self._val_dataset = ContinuousWindowDataset(
                 val_texts, tokenizer, cfg.seq_len,
                 buffer_size=buffer_size, seed=seed, shuffle=False
             )
 
-        # Create loaders
-        self.train_loader = self._make_loader(
-            self._train_dataset, cfg.batch_size, num_workers, collate_continuous
-        )
         self.val_loader = None
-        if self._val_dataset is not None:
+        if self._indexed_train and self._validation_sample_ids:
+            self.val_loader = DataLoader(
+                self._val_dataset,
+                batch_size=int(cfg.batch_size),
+                shuffle=False,
+                drop_last=False,
+                collate_fn=collate_pretrain_samples,
+                num_workers=int(num_workers),
+                pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            )
+        elif self._val_dataset is not None:
             self.val_loader = self._make_loader(
                 self._val_dataset, cfg.batch_size, num_workers, collate_continuous
             )
@@ -717,8 +949,59 @@ class PretrainTrainer(Trainer):
         self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
 
         self.count_first = count_first
-        self._known_train_batches = None
+        self._known_train_batches = len(self.train_loader) if self._indexed_train else None
         self._known_val_batches = None   # <-- add this for validation progress bar
+
+        if resume_state is not None:
+            if resume_state["scheduler_config"] != self._scheduler_config():
+                raise ValueError("Indexed pretraining checkpoint scheduler configuration mismatch")
+            if resume_state["training_config"] != self._training_config():
+                raise ValueError("Indexed pretraining checkpoint training configuration mismatch")
+            if (
+                resume_state["dataset_manifest_sha256"]
+                != self._train_dataset.manifest.manifest_sha256
+            ):
+                raise ValueError("Indexed pretraining checkpoint dataset manifest mismatch")
+            if (
+                resume_state["permutation_sha256"]
+                != self._train_permutation.metadata["sha256"]
+            ):
+                raise ValueError("Indexed pretraining checkpoint permutation mismatch")
+            if int(resume_state["validation_sample_count"]) != len(
+                self._validation_sample_ids
+            ):
+                raise ValueError("Indexed pretraining checkpoint validation count mismatch")
+            if (
+                resume_state["validation_sample_ids_sha256"]
+                != self._validation_sample_ids_sha256
+            ):
+                raise ValueError("Indexed pretraining checkpoint validation identity mismatch")
+            self.model.load_state_dict(resume_state["model"])
+            self.optimizer.load_state_dict(resume_state["optimizer"])
+            self.global_step = int(resume_state["global_step"])
+            self.best_val_loss = float(resume_state["best_val_loss"])
+            self.history = {
+                key: list(values)
+                for key, values in resume_state["history"].items()
+            }
+            torch.set_rng_state(resume_state["torch_rng_state"])
+            saved_cuda_rng = resume_state["cuda_rng_state_all"]
+            current_cuda = self.device.type == "cuda"
+            if current_cuda != (saved_cuda_rng is not None):
+                raise ValueError("Indexed pretraining checkpoint CUDA RNG configuration mismatch")
+            if current_cuda:
+                torch.cuda.set_rng_state_all(saved_cuda_rng)
+            saved_scaler = resume_state["scaler"]
+            if (self.scaler is not None) != (saved_scaler is not None):
+                raise ValueError("Indexed pretraining checkpoint AMP scaler configuration mismatch")
+            if self.scaler is not None:
+                self.scaler.load_state_dict(saved_scaler)
+            self._resume_scheduler_state = resume_state.get("scheduler")
+            if resume_epoch_complete:
+                self._activate_indexed_epoch(
+                    int(resume_state["permutation_epoch"]) + 1,
+                )
+                self._start_train_epoch = int(resume_state["epoch"]) + 1
 
     @staticmethod
     def _make_loader(dataset, batch_size, num_workers, collate_fn):
@@ -738,11 +1021,108 @@ class PretrainTrainer(Trainer):
             count += 1
         return count
 
+    def _scheduler_config(self) -> Dict[str, Any]:
+        return {
+            "total_optimizer_steps": (
+                int(self.total_optimizer_steps)
+                if self.total_optimizer_steps is not None
+                else None
+            ),
+            "warmup_steps": int(self._scheduler_warmup),
+            "cycles": float(self._scheduler_cycles),
+            "min_lr_ratio": float(self._scheduler_min_lr),
+        }
+
+    def _training_config(self) -> Dict[str, Any]:
+        return {
+            "learning_rate": float(self.cfg.lr),
+            "weight_decay": float(self.cfg.weight_decay),
+            "optimizer_betas": [0.9, 0.999],
+            "batch_size": int(self.cfg.batch_size),
+            "grad_accum_steps": int(self.grad_accum_steps),
+            "grad_clip": float(self.cfg.grad_clip),
+            "use_amp": bool(self.use_amp),
+            "amp_dtype": str(self.amp_dtype),
+            "device_type": self.device.type,
+            "validation_sample_count": len(self._validation_sample_ids),
+        }
+
+    @staticmethod
+    def _validate_permutation_identity(
+        permutation,
+        *,
+        expected_epoch: int,
+        expected_seed: int,
+    ) -> None:
+        if int(permutation.metadata["epoch"]) != int(expected_epoch):
+            raise ValueError("Indexed pretraining permutation epoch mismatch")
+        if int(permutation.metadata["seed"]) != int(expected_seed):
+            raise ValueError("Indexed pretraining permutation seed mismatch")
+
+    def _activate_indexed_epoch(
+        self,
+        permutation_epoch: int,
+        *,
+        cursor: int = 0,
+    ) -> None:
+        """Activate one persisted global order for an indexed pretraining epoch."""
+        from .pretrain_data import PretrainPermutation, create_pretrain_indexed_loader
+
+        if not self._indexed_train:
+            raise ValueError("Indexed epoch activation requires train_store_dir")
+        if (
+            permutation_epoch == self._initial_train_permutation_epoch
+            and self._initial_train_permutation_path
+        ):
+            permutation_path = os.fspath(self._initial_train_permutation_path)
+        else:
+            permutation_path = os.path.join(
+                self._train_store_dir,
+                "permutations",
+                f"epoch-{int(permutation_epoch):04d}-seed-{self._train_seed}.u32",
+            )
+        if os.path.exists(permutation_path):
+            permutation = PretrainPermutation.load(permutation_path)
+        else:
+            permutation = PretrainPermutation.create(
+                permutation_path,
+                len(self._train_dataset),
+                self._train_seed,
+                epoch=permutation_epoch,
+            )
+        self._validate_permutation_identity(
+            permutation,
+            expected_epoch=permutation_epoch,
+            expected_seed=self._train_seed,
+        )
+        self._train_permutation = permutation
+        self._train_permutation_epoch = int(permutation_epoch)
+        self._train_cursor = int(cursor)
+        self.train_loader = create_pretrain_indexed_loader(
+            self._train_dataset,
+            permutation,
+            self.cfg.batch_size,
+            cursor=self._train_cursor,
+            excluded_sample_ids=self._validation_sample_ids,
+            num_workers=self._indexed_num_workers,
+            drop_last=True,
+            pin_memory=self._indexed_pin_memory,
+            prefetch_factor=self._indexed_prefetch_factor,
+        )
+        if len(self.train_loader) == 0:
+            raise ValueError("Indexed pretraining cursor leaves no complete training batch")
+        self._known_train_batches = len(self.train_loader)
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
         Override train_epoch to avoid relying on len(self.train_loader).
         Handles gradient accumulation correctly for any number of micro-batches.
         """
+        if self._indexed_train:
+            desired_epoch = self._train_permutation_base_epoch + int(epoch) - 1
+            if desired_epoch != self._train_permutation_epoch:
+                self._activate_indexed_epoch(desired_epoch)
+
         # Determine total batches for progress bar
         total_batches = None
         if self._known_train_batches is not None:
@@ -782,6 +1162,9 @@ class PretrainTrainer(Trainer):
                 num_cycles=self._scheduler_cycles,
                 min_lr_ratio=self._scheduler_min_lr,
             )
+            if self._resume_scheduler_state is not None:
+                self.scheduler.load_state_dict(self._resume_scheduler_state)
+                self._resume_scheduler_state = None
 
         pbar = tqdm(
             self.train_loader,
@@ -794,6 +1177,8 @@ class PretrainTrainer(Trainer):
         for batch_idx, batch in enumerate(pbar):
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
+            if self._indexed_train:
+                self._train_cursor += int(input_ids.shape[0])
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self.device)
@@ -867,6 +1252,53 @@ class PretrainTrainer(Trainer):
             "time": time.time() - epoch_start,
             "skipped_batches": skipped_batches,
         }
+
+    def save_checkpoint(self, epoch: int, filename: Optional[str] = None):
+        """Save model state plus the exact indexed-data cursor when applicable."""
+        super().save_checkpoint(epoch, filename)
+        if not self._indexed_train:
+            return
+        checkpoint_name = filename or f"helixlm_epoch_{epoch}.pt"
+        checkpoint_dir = os.path.join(self.output_dir, checkpoint_name)
+        state = {
+            "format_version": "helix.pretrain.cursor.v1",
+            "epoch": int(epoch),
+            "global_step": int(self.global_step),
+            "sample_cursor": int(self._train_cursor),
+            "usable_sample_count": int(self._usable_sample_count),
+            "dataset_manifest_sha256": self._train_dataset.manifest.manifest_sha256,
+            "permutation_sha256": self._train_permutation.metadata["sha256"],
+            "permutation_epoch": int(self._train_permutation.metadata["epoch"]),
+            "permutation_seed": int(self._train_permutation.metadata["seed"]),
+            "validation_sample_count": len(self._validation_sample_ids),
+            "validation_sample_ids_sha256": self._validation_sample_ids_sha256,
+        }
+        path = os.path.join(checkpoint_dir, "pretrain_data_state.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            import json
+            json.dump(state, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+        os.replace(path + ".tmp", path)
+
+        training_state = {
+            **state,
+            "format_version": self.TRAINING_STATE_VERSION,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "best_val_loss": float(self.best_val_loss),
+            "history": self.history,
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scheduler_config": self._scheduler_config(),
+            "training_config": self._training_config(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": (
+                torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+            ),
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+        }
+        training_state_path = os.path.join(checkpoint_dir, "pretrain_training_state.pt")
+        torch.save(training_state, training_state_path + ".tmp")
+        os.replace(training_state_path + ".tmp", training_state_path)
 
     def evaluate(self) -> Dict[str, float]:
         """
@@ -960,6 +1392,9 @@ class PretrainTrainer(Trainer):
         Override train to avoid using boolean context on self.val_loader.
         """
         epochs = num_epochs or self.cfg.epochs
+        start_epoch = self._start_train_epoch if self._indexed_train else 1
+        if start_epoch > epochs:
+            return self.history
         effective_batch = self.cfg.batch_size * self.grad_accum_steps
 
         if self.verbose:
@@ -973,7 +1408,7 @@ class PretrainTrainer(Trainer):
             print(f"LR: {self.cfg.lr} | AMP: {self.use_amp}")
             print(f"{'='*60}\n")
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             if self.verbose:
                 print(f"\nEpoch {epoch}/{epochs}")
                 print("-" * 40)
