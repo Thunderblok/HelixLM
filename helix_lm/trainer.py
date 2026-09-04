@@ -758,6 +758,11 @@ class PretrainTrainer(Trainer):
         prefetch_factor: int = 4,
         **kwargs,
     ):
+
+      
+        verbose = kwargs.pop('verbose', True)
+        self.verbose = verbose
+
         import tempfile
         from torch.utils.data import DataLoader
         from .dataset import ContinuousWindowDataset, collate_continuous, _is_iterable_column
