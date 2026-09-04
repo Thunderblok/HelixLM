@@ -1017,8 +1017,11 @@ class PretrainTrainer(Trainer):
                 val_texts, tokenizer, cfg.seq_len,
                 buffer_size=buffer_size, seed=seed, shuffle=False
             )
+            # IMPORTANT: Force 0 workers for validation from val_texts.
+            # Iterable continuous‑window validation cannot be sharded safely.
+            # Use val_store_dir if you need multi‑worker validation.
             self.val_loader = self._make_loader(
-                val_dataset, cfg.batch_size, num_workers, collate_continuous
+                val_dataset, cfg.batch_size, 0, collate_continuous
             )
 
         # Call parent with our pre-built loaders
