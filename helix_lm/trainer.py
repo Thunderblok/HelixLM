@@ -1059,6 +1059,9 @@ class PretrainTrainer(Trainer):
             prefix=os.path.basename(store_path) + ".building-",
             dir=parent_dir,
         )
+        # The compiler expects to create its output directory itself, so remove
+        # the empty staging directory we just created.
+        os.rmdir(temp_dir)
         try:
             compiler = PretrainSampleCompiler(
                 tokenizer, seq_len, temp_dir,
