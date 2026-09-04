@@ -734,6 +734,7 @@ class PretrainTrainer(Trainer):
         cfg,
         train_texts=None,
         val_texts=None,
+        val_loader=None,
         val_store_dir=None,
         tokenizer=None,
         output_dir="./checkpoints",
@@ -1006,7 +1007,7 @@ class PretrainTrainer(Trainer):
         If it already exists and is valid, reuse it. If it doesn't exist, compile
         atomically via a temporary sibling directory and rename.
         """
-        from .pretrain_data import PretrainDatasetManifest
+        from .pretrain_data import PretrainDatasetManifest, PretrainSampleCompiler
 
         store_path = os.fspath(store_dir)
 
@@ -1022,11 +1023,12 @@ class PretrainTrainer(Trainer):
                     )
                 # Optionally: verify source identity if provided
                 if source:
+                    stored_source = manifest.value.get("source", {})
                     for k, v in source.items():
-                        if manifest.value.get("source", {}).get(k) != v:
+                        if stored_source.get(k) != v:
                             raise ValueError(
                                 f"Source identity mismatch for key '{k}': "
-                                f"stored {manifest.value.get('source', {}).get(k)!r} != requested {v!r}"
+                                f"stored {stored_source.get(k)!r} != requested {v!r}"
                             )
                 if self.verbose:
                     print("[PretrainStore] REUSING_VERIFIED_STORE:", store_path)
