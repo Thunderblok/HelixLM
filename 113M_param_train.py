@@ -33,12 +33,14 @@ from helix_lm import (
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+
 # 3B token dataset with train/val splits — STREAMING MODE
-PUSH_TO_HUB = os.getenv("HELIX_PUSH_TO_HUB", "0") == "1"
+PUSH_TO_HUB = int(os.getenv("HELIX_PUSH_TO_HUB", "0"))
 DATASET = os.getenv("HELIX_DATASET", "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1")
-DATASET_REVISION = os.getenv("HELIX_DATASET_REVISION")
-PRETRAIN_STORE_DIR = os.getenv("HELIX_PRETRAIN_STORE_DIR")
-RESUME_TRAINING_STATE = os.getenv("HELIX_RESUME_TRAINING_STATE")
+DATASET_REVISION = os.getenv("HELIX_DATASET_REVISION", None)
+PRETRAIN_STORE_DIR = os.getenv("HELIX_PRETRAIN_STORE_DIR", "./pretrain_store")
+RESUME_TRAINING_STATE = os.getenv("HELIX_RESUME_TRAINING_STATE", None)
 VALIDATION_SAMPLES = int(os.getenv("HELIX_VALIDATION_SAMPLES", "252"))
 HF_USERNAME = "david-thrower"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -110,7 +112,7 @@ PUSH_RETRY_DELAY = 90
 STREAMING = True
 PREPROCESS_BATCH_SIZE = 1000       # not used by PretrainTrainer, but kept for logging
 CLEANUP_SHARDS = True              # not used by PretrainTrainer
-NUM_WORKERS = int(os.getenv("HELIX_NUM_WORKERS", "4" if PRETRAIN_STORE_DIR else "0"))
+NUM_WORKERS = int(os.getenv("HELIX_NUM_WORKERS", "4"))
 
 # Tokenizer
 TOKENIZER_NAME = "gpt2"
