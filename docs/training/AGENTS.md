@@ -1,75 +1,57 @@
 # Training documentation guide
 
-## David's compatibility decisions
+## API and Hardware Compatibility Pointers
 
 - `helix_lm.trainer.Trainer` remains the legacy document-aware SFT path. Do not
   change or rename it here; David owns the later `SFTTrainer` rename.
 - Continuous, globally ordered causal pretraining belongs to
   `PretrainTrainer`, `pretrain_data.py`, and `prepare_pretrain_dataset.py`.
-- Width is the current priority. The active external Branch 60 experiment uses
-  `d_model=1024` and 16 heads; the checked-in `113M_param_train.py` launcher
-  remains at `d_model=768` and 12 heads. Both use three columns, `(3, 3, 3)`
-  nodes, four loops, FFN expansion 3.0, and vertical depth two. Bind claims to
-  the exact launcher or run contract.
-- Do not add a fourth column or raise vertical depth to three until the current
-  data path and baseline are terminalized. That future topology change needs a
-  matched source, data order, optimizer, tokenizer, and evaluator.
+- For a single 16 GB consumer GPU, the`113M_param_train.py` training script is the baseline for about what we can pre-train:
+  `d_model=768`, 12 heads, three columns, (2, 3, 2) or`(3, 3, 3)` nodes, four loops, FFN
+  expansion 3.0, seq_len 512 and 1024, and vertical depth two. Other launchers or external run
+  contracts may use different widths or topology; do not describe any of them
+  as the single active experiment.
+- Hardware scaling must be explicit in the launcher or run contract. Use the
+  768-width baseline for constrained GPUs, and record any wider or deeper
+  configuration as a separate matched run rather than silently changing the
+  baseline.
+- For a 16 GB GPU, prefer the checked-in 768-width configuration with the
+  smallest supported microbatch, gradient accumulation, activation
+  checkpointing, and reduced ablation scope. Keep sequence length, optimizer,
+  tokenizer, data order, and evaluator fixed when comparing ablations.
+- For an L40S or H200, consider a wider configuration such as `d_model=1024`
+  with 16 heads. A four-column topology and `vertical_depth=3` may also be
+  evaluated, but only as an explicitly named hardware-scaled ablation with its
+  own launcher or run contract. Report memory, throughput, effective batch,
+  and convergence separately from the 768-width baseline.
+- Do not treat additional GPU memory as evidence that a wider or deeper model
+  is comparable to the baseline. A topology change needs a matched source,
+  data order, optimizer, tokenizer, sequence length, evaluator, and documented
+  compute or token budget.
 - Save checkpoints locally before any optional Hugging Face upload. Publication
   is never a prerequisite for local training or recovery.
 
-## Pretraining data contract
+## Hardware-scaled ablation guidance
 
-The comparable disk path is:
+Use these as starting points, not implicit defaults. Every selected value must
+be recorded in the launcher and run contract.
+
+| Hardware class | Starting configuration | Recommended ablations |
+|---|---|---|
+| 16 GB GPU | `d_model=768`, 12 heads, three columns, vertical depth two | Baseline versus data-order, optimizer, or regularization changes; use gradient accumulation and activation checkpointing as needed |
+| L40S-class GPU | `d_model=1024`, 16 heads, three or four columns, vertical depth two | Compare width first; then test four columns and `vertical_depth=3` independently |
+| H200-class GPU | `d_model=1024`, 16 heads, four columns, vertical depth two or three | Compare width, column count, and vertical depth under matched token and optimizer budgets; measure scaling efficiency |
+
+## Pretraining data contract
 
 ```text
 pinned ordered source rows
 -> tokenize without tokenizer-added special tokens
 -> append one EOS to each nonempty document
 -> concatenate the token stream
--> emit exact non-overlapping seq_len windows
+-> emit exact non-overlapping seq\_len windows
 -> discard and count the incomplete tail
 -> assign stable sample IDs
 -> persist one global epoch permutation
 -> replay that exact order from disk
 ```
-
-Do not use a bounded reservoir shuffle as a synonym for a global shuffle. Do
-not infer sample-order identity from a shared seed alone.
-
-## Run and checkpoint contract
-
-Record at minimum:
-
-- source commit, source tree, and canonical launcher hash;
-- dataset repository, revision, split, and text column;
-- tokenizer and vocabulary identity;
-- sample-manifest, permutation, and validation-ID roots;
-- sequence length, width, columns, nodes, loops, FFN expansion, lateral and
-  vertical probabilities, and vertical depth;
-- optimizer, learning rate, effective batch, precision, and seed;
-- exact causal-target counts, loss, perplexity, throughput, data wait, step
-  time, checkpoint time, GPU utilization, and memory;
-- checkpoint cursor plus RNG, optimizer, data-manifest, and permutation state.
-
-Count causal next-token targets with `labels[:, 1:] != -100`. A checkpoint is
-not an exact resume object unless its sample cursor agrees with the optimizer
-step and it binds the same run contract.
-
-## Validation and comparison law
-
-- Validation samples must be disjoint from training samples and fixed by ID.
-- Write a recoverable local checkpoint before entering a scheduled validation.
-- Compare runs only through the same evaluator and the same validation IDs.
-- A lower training loss is promising, not a downstream-quality verdict.
-- Missing MLflow telemetry is a tracking defect; it does not erase local
-  checkpoints, but a new long run should refuse to start if its MLflow run
-  cannot be created.
-
-## Active Branch 60 experiment
-
-The exact current source and results are recorded in the run contract and
-MLflow, not inferred from this guide. The current campaign uses Sutra-10B at a
-pinned revision, GPT-2 tokenization, sequence length 1024, BF16, learning rate
-`2e-4`, effective batch 84, and a fixed tail-of-permutation validation holdout.
-See `BRANCH60_PRETRAIN_HANDOFF.md` for the implementation rationale and operator
-entry points.
