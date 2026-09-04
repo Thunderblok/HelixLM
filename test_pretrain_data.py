@@ -68,7 +68,7 @@ class PretrainDataTest(unittest.TestCase):
             self.assertEqual(dataset[1]["input_ids"].tolist(), [4, 5, 99, 6])
             self.assertEqual(dataset[2]["input_ids"].tolist(), [7, 8, 9, 10])
 
-    def test_persisted_permutation_is_unique_and_resumeable(self):
+def test_persisted_permutation_is_unique_and_resumable(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "epoch-0000.u32"
             created = PretrainPermutation.create(path, 32, 42, epoch=0)
