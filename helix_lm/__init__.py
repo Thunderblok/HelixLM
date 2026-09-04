@@ -11,7 +11,7 @@ from .config import HelixConfig
 from .tokenizer import HelixTokenizer
 from .model import HelixLMCore
 from .hf_model import HelixForCausalLM
-from .trainer import Trainer, PretrainTrainer
+from .trainer import Trainer, SFTTrainer, PretrainTrainer
 from .dataset import (
     HelixDataset,
     HelixDatasetFromTokens,
@@ -45,6 +45,7 @@ __all__ = [
     "HelixForCausalLM",
     "Trainer",
     "PretrainTrainer",
+    "SFTTrainer",
     "HelixDataset",
     "HelixDatasetFromTokens",
     "HelixHFDataset",
