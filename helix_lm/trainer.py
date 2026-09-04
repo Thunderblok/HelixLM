@@ -16,6 +16,8 @@ import math
 import time
 import warnings
 import tempfile
+import hashlib
+import json
 from typing import Optional, List, Dict, Any, Union
 
 import torch
@@ -288,15 +290,6 @@ class Trainer:
                 self.scaler = GradScaler("cuda")
             except Exception:
                 pass  # scaler stays None, AMP still works without scaling
-
-        # Deprecation warning for the legacy Trainer class (only when exact class is used)
-        if self.__class__ is Trainer:
-            warnings.warn(
-                "Trainer is deprecated for pretraining. Use PretrainTrainer for causal pretraining. "
-                "For supervised fine-tuning, the class will be renamed SFTTrainer in a future version.",
-                FutureWarning,
-                stacklevel=2,
-            )
 
     def _get_device(self) -> torch.device:
         """Get device from config."""
@@ -666,7 +659,7 @@ class PretrainTrainer(Trainer):
             training epoch to obtain the total number of batches. This enables an exact
             progress bar from epoch 1. If False, the count is learned after epoch 1.
     """
-    TRAINING_STATE_VERSION = "helix.pretrain.training-state.v1"
+    TRAINING_STATE_VERSION = "helix.pretrain.training-state.v2"
     TRAINING_STATE_FIELDS = frozenset(
         {
             "epoch",
@@ -677,6 +670,7 @@ class PretrainTrainer(Trainer):
             "permutation_sha256",
             "permutation_epoch",
             "permutation_seed",
+            "validation_source_root",
             "model",
             "optimizer",
             "best_val_loss",
@@ -740,6 +734,7 @@ class PretrainTrainer(Trainer):
         cfg,
         train_texts=None,
         val_texts=None,
+        val_store_dir=None,
         tokenizer=None,
         output_dir="./checkpoints",
         grad_accum_steps=1,
@@ -781,11 +776,15 @@ class PretrainTrainer(Trainer):
                 store_dir = pretrain_store_dir or tempfile.mkdtemp(
                     prefix="helix_pretrain_"
                 )
-                compiler = PretrainSampleCompiler(
-                    tokenizer, cfg.seq_len, store_dir,
+                # Atomic store publication
+                store_dir = self._ensure_atomic_pretrain_store(
+                    texts=train_texts,
+                    store_dir=store_dir,
+                    tokenizer=tokenizer,
+                    seq_len=cfg.seq_len,
                     source={"auto": "true"},
+                    verify=verify_train_store,
                 )
-                compiler.compile(train_texts)
                 train_store_dir = store_dir
                 auto_compiled_store_dir = store_dir
 
@@ -821,6 +820,10 @@ class PretrainTrainer(Trainer):
         self._indexed_pin_memory = bool(pin_memory)
         self._indexed_prefetch_factor = int(prefetch_factor)
         self._resume_scheduler_state = None
+        self._validation_source_root = self._compute_validation_source_root(
+            val_texts=val_texts,
+            val_store_dir=val_store_dir,
+        )
 
         if self._indexed_train:
             self._train_dataset = PretrainIndexedDataset(
@@ -891,7 +894,22 @@ class PretrainTrainer(Trainer):
 
         # ── Validation ──
         self.val_loader = None
-        if val_texts is not None:
+        if val_loader is not None:
+            self.val_loader = val_loader
+        elif val_store_dir is not None:
+            val_dataset = PretrainIndexedDataset(val_store_dir, verify=verify_train_store)
+            if val_dataset.seq_len != cfg.seq_len:
+                raise ValueError("Validation store seq_len does not match config")
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=int(cfg.batch_size),
+                shuffle=False,
+                drop_last=False,
+                collate_fn=collate_pretrain_samples,
+                num_workers=int(num_workers),
+                pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            )
+        elif val_texts is not None:
             # Always use ContinuousWindowDataset for validation; it works for
             # both materialized and streaming inputs without __len__ issues.
             val_dataset = ContinuousWindowDataset(
@@ -942,6 +960,8 @@ class PretrainTrainer(Trainer):
                 != self._train_permutation.metadata["sha256"]
             ):
                 raise ValueError("Indexed pretraining checkpoint permutation mismatch")
+            if resume_state["validation_source_root"] != self._validation_source_root:
+                raise ValueError("Indexed pretraining checkpoint validation source mismatch")
             self.model.load_state_dict(resume_state["model"])
             self.optimizer.load_state_dict(resume_state["optimizer"])
             self.global_step = int(resume_state["global_step"])
@@ -968,6 +988,111 @@ class PretrainTrainer(Trainer):
                     int(resume_state["permutation_epoch"]) + 1,
                 )
                 self._start_train_epoch = int(resume_state["epoch"]) + 1
+
+    # ------------------------------------------------------------------
+    # Atomic store publication helpers
+    # ------------------------------------------------------------------
+    def _ensure_atomic_pretrain_store(
+        self,
+        texts,
+        store_dir: str,
+        tokenizer,
+        seq_len: int,
+        source: Dict[str, Any],
+        verify: bool,
+    ) -> str:
+        """
+        Ensure that `store_dir` contains a valid, verified pretrain sample store.
+        If it already exists and is valid, reuse it. If it doesn't exist, compile
+        atomically via a temporary sibling directory and rename.
+        """
+        from .pretrain_data import PretrainDatasetManifest
+
+        store_path = os.fspath(store_dir)
+
+        # Check if store_dir already exists
+        if os.path.exists(store_path):
+            try:
+                manifest = PretrainDatasetManifest.load(store_path)
+                if verify:
+                    manifest.verify()
+                if manifest.seq_len != seq_len:
+                    raise ValueError(
+                        f"Existing store seq_len {manifest.seq_len} != requested {seq_len}"
+                    )
+                # Optionally: verify source identity if provided
+                if source:
+                    for k, v in source.items():
+                        if manifest.value.get("source", {}).get(k) != v:
+                            raise ValueError(
+                                f"Source identity mismatch for key '{k}': "
+                                f"stored {manifest.value.get('source', {}).get(k)!r} != requested {v!r}"
+                            )
+                if self.verbose:
+                    print("[PretrainStore] REUSING_VERIFIED_STORE:", store_path)
+                return store_path
+            except Exception as e:
+                if self.verbose:
+                    print("[PretrainStore] REFUSED_STORE_IDENTITY_MISMATCH:", store_path, "-", str(e))
+                raise
+
+        # Store doesn't exist -> compile atomically
+        if self.verbose:
+            print("[PretrainStore] COMPILING_NEW_STORE:", store_path)
+        parent_dir = os.path.dirname(store_path) or "."
+        os.makedirs(parent_dir, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(
+            prefix=os.path.basename(store_path) + ".building-",
+            dir=parent_dir,
+        )
+        try:
+            compiler = PretrainSampleCompiler(
+                tokenizer, seq_len, temp_dir,
+                source=source,
+            )
+            compiler.compile(texts)
+            if verify:
+                manifest = PretrainDatasetManifest.load(temp_dir)
+                manifest.verify()
+            os.rename(temp_dir, store_path)
+            if self.verbose:
+                print("[PretrainStore] Store published atomically to:", store_path)
+            return store_path
+        except Exception as e:
+            if self.verbose:
+                print("[PretrainStore] INCOMPLETE_PRETRAIN_STORE: compilation failed, leaving temp dir:", temp_dir)
+                print("                  Error:", str(e))
+            # Do not delete temp_dir; leave for inspection
+            raise
+
+    @staticmethod
+    def _compute_validation_source_root(
+        val_texts=None,
+        val_store_dir=None,
+    ) -> Optional[str]:
+        """
+        Compute a stable identity string for the validation source.
+        Used for checkpoint binding. Returns None if no validation source.
+        """
+        if val_store_dir is not None:
+            from .pretrain_data import PretrainDatasetManifest
+            manifest = PretrainDatasetManifest.load(val_store_dir)
+            return f"store:{manifest.manifest_sha256}"
+        if val_texts is not None:
+            # Hash the repr of the list (or iterable? For list-like only)
+            if hasattr(val_texts, "__len__") or isinstance(val_texts, list):
+                # Simple deterministic hash
+                try:
+                    text_repr = repr(list(val_texts))
+                except TypeError:
+                    text_repr = repr(val_texts)
+                digest = hashlib.sha256(text_repr.encode("utf-8")).hexdigest()
+                return f"texts:{digest}"
+            else:
+                # For streaming validation, no stable hash without consuming;
+                # we cannot bind precisely, but we can use a placeholder.
+                return "streaming:unknown"
+        return None
 
     @staticmethod
     def _make_loader(dataset, batch_size, num_workers, collate_fn):
@@ -1234,10 +1359,10 @@ class PretrainTrainer(Trainer):
             "permutation_sha256": self._train_permutation.metadata["sha256"],
             "permutation_epoch": int(self._train_permutation.metadata["epoch"]),
             "permutation_seed": int(self._train_permutation.metadata["seed"]),
+            "validation_source_root": self._validation_source_root,
         }
         path = os.path.join(checkpoint_dir, "pretrain_data_state.json")
         with open(path + ".tmp", "w", encoding="utf-8") as handle:
-            import json
             json.dump(state, handle, sort_keys=True, separators=(",", ":"))
             handle.write("\n")
         os.replace(path + ".tmp", path)
