@@ -621,6 +621,62 @@ class PretrainDataTest(unittest.TestCase):
             self.assertEqual(restored._train_permutation_epoch, 1)
             self.assertEqual(restored._train_cursor, len(restored._train_dataset))
 
+    def test_pretrain_trainer_caps_steps_emits_metrics_and_rotates_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12", "13 14 15", "16 17 18"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            observed = []
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+                grad_accum_steps=1,
+                total_optimizer_steps=2,
+                max_optimizer_steps=2,
+                checkpoint_every_steps=1,
+                checkpoint_slots=2,
+                step_callback=observed.append,
+            )
+
+            metrics = trainer.train_epoch(1)
+
+            self.assertEqual(trainer.global_step, 2)
+            self.assertTrue(metrics["step_limit_reached"])
+            self.assertEqual(len(observed), 2)
+            self.assertEqual(observed[-1]["causal_targets_total"], 12.0)
+            self.assertEqual(observed[-1]["sample_cursor"], 4.0)
+            self.assertTrue((temporary / "checkpoints" / "latest-0").is_dir())
+            self.assertTrue((temporary / "checkpoints" / "latest-1").is_dir())
+
+    def test_indexed_pretrain_source_identity_is_checked_before_training(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            self.compile_fixture(root)
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+
+            with self.assertRaisesRegex(ValueError, "Source identity mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                    seed=42, num_workers=0, verbose=False,
+                    pretrain_source={"fixture": "another-corpus"},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
