@@ -779,9 +779,16 @@ class PretrainTrainer(Trainer):
         if train_store_dir is None and train_texts is not None:
             if _is_iterable_column(train_texts):
                 # Streaming iterable -> compile to disk automatically
-                store_dir = pretrain_store_dir or tempfile.mkdtemp(
-                    prefix="helix_pretrain_"
-                )
+                # IMPORTANT: the store path must NOT exist yet; the atomic
+                # publication helper will create it via rename.
+                if pretrain_store_dir:
+                    store_dir = pretrain_store_dir
+                else:
+                    import uuid
+                    store_dir = os.path.join(
+                        tempfile.gettempdir(),
+                        f"helix_pretrain_{uuid.uuid4().hex}"
+                    )
                 # Atomic store publication
                 store_dir = self._ensure_atomic_pretrain_store(
                     texts=train_texts,
