@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -43,6 +44,14 @@ class TinyModel(nn.Module):
     def save_pretrained(self, path):
         Path(path).mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), Path(path) / "model.pt")
+
+
+class StreamingTexts:
+    def __init__(self, values):
+        self.values = tuple(values)
+
+    def __iter__(self):
+        return iter(self.values)
 
 
 class PretrainDataTest(unittest.TestCase):
@@ -158,6 +167,55 @@ class PretrainDataTest(unittest.TestCase):
                 compiled_sample = compiled[sample_id]
                 self.assertTrue(torch.equal(live_sample["input_ids"], compiled_sample["input_ids"]))
                 self.assertTrue(torch.equal(live_sample["labels"], compiled_sample["labels"]))
+
+    def test_streaming_input_auto_compiles_without_an_explicit_store_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+
+            with mock.patch("tempfile.gettempdir", return_value=str(temporary)):
+                trainer = PretrainTrainer(
+                    model=TinyModel(), cfg=cfg,
+                    train_texts=StreamingTexts(
+                        ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+                    ),
+                    tokenizer=IntegerTokenizer(),
+                    output_dir=temporary / "checkpoints",
+                    seed=42, num_workers=0, verbose=False,
+                )
+
+            self.assertTrue(trainer._indexed_train)
+            self.assertIsNotNone(trainer._auto_compiled_store_dir)
+            self.assertTrue(
+                Path(trainer._auto_compiled_store_dir, "manifest.json").is_file()
+            )
+
+    def test_auto_compile_refuses_an_existing_empty_store(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            empty_store = temporary / "existing-empty"
+            empty_store.mkdir()
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+
+            with self.assertRaises(FileNotFoundError):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg,
+                    train_texts=StreamingTexts(["1 2 3", "4 5 6"]),
+                    pretrain_store_dir=empty_store,
+                    tokenizer=IntegerTokenizer(),
+                    output_dir=temporary / "checkpoints",
+                    seed=42, num_workers=0, verbose=False,
+                )
 
     def test_manifest_verification_rejects_mutated_sample_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -656,6 +714,32 @@ class PretrainDataTest(unittest.TestCase):
             self.assertEqual(observed[-1]["sample_cursor"], 4.0)
             self.assertTrue((temporary / "checkpoints" / "latest-0").is_dir())
             self.assertTrue((temporary / "checkpoints" / "latest-1").is_dir())
+
+    def test_indexed_evaluate_reports_causal_targets_and_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "output",
+                seed=42, num_workers=0, verbose=False,
+                validation_sample_count=2,
+            )
+
+            metrics = trainer.evaluate(max_batches=1)
+
+            self.assertEqual(metrics["sample_count"], 2)
+            self.assertEqual(metrics["causal_targets"], 6)
+            self.assertEqual(metrics["loss"], 1.0)
 
     def test_indexed_pretrain_source_identity_is_checked_before_training(self):
         with tempfile.TemporaryDirectory() as temporary:

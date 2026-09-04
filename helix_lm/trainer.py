@@ -470,7 +470,6 @@ class Trainer:
         self.model.eval()
         total_loss = 0.0
         total_tokens = 0
-        total_samples = 0
         num_batches = 0
 
         pbar = tqdm(
@@ -1633,7 +1632,9 @@ class PretrainTrainer(Trainer):
         self.model.eval()
         total_loss = 0.0
         total_tokens = 0
+        total_samples = 0
         num_batches = 0
+        batch_idx = -1
 
         # Determine total batches for progress bar (None if unknown)
         total_batches = self._known_val_batches
@@ -1679,7 +1680,7 @@ class PretrainTrainer(Trainer):
 
         # Store actual batch count for future evaluations
         if self._known_val_batches is None:
-            self._known_val_batches = batch_idx + 1
+            self._known_val_batches = max(batch_idx + 1, 0)
 
         avg_loss = total_loss / max(total_tokens, 1)
         return {

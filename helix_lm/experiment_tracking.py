@@ -134,8 +134,11 @@ class ExperimentTracker:
                 lambda: self.mlflow.log_metrics(clean, step=int(step)),
             )
 
-    def finish(self, status: str) -> None:
+    def finish(self, status: str) -> str:
         """Close the remote projection and record whether it stayed complete."""
+        if self.run_id:
+            mlflow_status = "FINISHED" if status == "FINISHED" else "FAILED"
+            self._remote("end_run", lambda: self.mlflow.end_run(status=mlflow_status))
         projected_status = status if not self.errors else f"{status}_WITH_MLFLOW_ERRORS"
         self._append(
             {
@@ -145,7 +148,4 @@ class ExperimentTracker:
                 "ts": time.time(),
             }
         )
-        if self.run_id:
-            mlflow_status = "FINISHED" if status == "FINISHED" else "FAILED"
-            self._remote("end_run", lambda: self.mlflow.end_run(status=mlflow_status))
-
+        return projected_status

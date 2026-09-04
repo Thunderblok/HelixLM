@@ -154,8 +154,8 @@ python quick_demo_cpu.py
 ## HuggingFace integration
 
 This minimal example shows the document-aware SFT path. See
-`docs/training/BRANCH60_PRETRAIN_HANDOFF.md` for indexed pretraining and its
-exact sample-order and recovery contracts.
+`docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for indexed pretraining and its
+exact sample-order, recovery, checkpoint, and MLflow contracts.
 
 ```python
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
@@ -204,11 +204,45 @@ tokenizer = AutoTokenizer.from_pretrained("./my-helix-model")
 
 ## Training
 
-### Pretraining on a globally ordered disk-backed sample store
+### Continuous pretraining with a globally ordered disk-backed store
 
 Full-corpus causal pretraining uses `PretrainTrainer` with an EOS-joined,
 non-overlapping sample store and a persisted epoch permutation. This is separate
 from the document-aware SFT behavior of `Trainer`.
+
+The normal API accepts a Hugging Face `IterableColumn` as `train_texts` and
+compiles or reuses the verified store automatically:
+
+```python
+from datasets import load_dataset
+from helix_lm import PretrainTrainer
+
+texts = load_dataset(
+    "codelion/sutra-10B",
+    revision="415549cff1a92b69df8b88c6108faa6097457068",
+    split="train",
+    streaming=True,
+)["text"]
+
+trainer = PretrainTrainer(
+    model=model,
+    cfg=cfg,
+    tokenizer=tokenizer,
+    train_texts=texts,
+    pretrain_store_dir="./pretrain_store",
+    pretrain_source={
+        "dataset": "codelion/sutra-10B",
+        "revision": "415549cff1a92b69df8b88c6108faa6097457068",
+        "split": "train",
+        "text_column": "text",
+        "tokenizer": "gpt2",
+    },
+)
+```
+
+`prepare_pretrain_dataset.py` remains an optional operator command for compiling
+and inspecting a store before constructing a trainer; callers do not need it
+for the ordinary `IterableColumn` path.
 
 ```bash
 python prepare_pretrain_dataset.py \
@@ -218,8 +252,8 @@ python prepare_pretrain_dataset.py \
   --seq-len 1024
 ```
 
-See `docs/training/BRANCH60_PRETRAIN_HANDOFF.md` for the exact sample-order,
-resume, checkpoint, and MLflow contracts.
+See `docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for the canonical launcher,
+comparison profiles, exact resume boundary, and MLflow metric vocabulary.
 
 Run the independent fixture equivalence court with:
 

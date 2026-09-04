@@ -60,7 +60,7 @@ class ExperimentTrackerTest(unittest.TestCase):
                 step=7,
                 phase="train",
             )
-            tracker.finish("FINISHED")
+            terminal = tracker.finish("FINISHED")
 
             events = [json.loads(line) for line in spool.read_text().splitlines()]
             metric_event = next(event for event in events if event["event"] == "metrics")
@@ -69,6 +69,7 @@ class ExperimentTrackerTest(unittest.TestCase):
             self.assertEqual(remote.params["d_model"], "768")
             self.assertEqual(remote.tags["source_head"], "abc")
             self.assertEqual(remote.status, "FINISHED")
+            self.assertEqual(terminal, "FINISHED")
 
 
 if __name__ == "__main__":
