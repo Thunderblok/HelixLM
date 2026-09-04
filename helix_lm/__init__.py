@@ -26,6 +26,15 @@ from .dataset import (
     ContinuousWindowDataset,
     collate_continuous,
 )
+from .pretrain_data import (
+    PretrainDatasetManifest,
+    PretrainIndexedDataset,
+    PretrainPermutation,
+    PretrainPermutationSampler,
+    PretrainSampleCompiler,
+    collate_pretrain_samples,
+    create_pretrain_indexed_loader,
+)
 
 __version__ = "0.1.0"
 
@@ -48,4 +57,11 @@ __all__ = [
     "_process_and_shard_batch",
     "ContinuousWindowDataset",
     "collate_continuous",
+    "PretrainDatasetManifest",
+    "PretrainIndexedDataset",
+    "PretrainPermutation",
+    "PretrainPermutationSampler",
+    "PretrainSampleCompiler",
+    "collate_pretrain_samples",
+    "create_pretrain_indexed_loader",
 ]
