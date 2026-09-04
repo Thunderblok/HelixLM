@@ -19,7 +19,7 @@ from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, PretrainTrai
 
 EPOCHS = 10
 MAX_SEQ_LEN = 96
-NUM_SAMPLES = 1_500
+NUM_SAMPLES = 3_750
 VAL_SPLIT = 0.2
 
 EXAMPLE_PROMPTS = [
