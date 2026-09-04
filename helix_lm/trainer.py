@@ -655,7 +655,7 @@ class PretrainTrainer(Trainer):
         self,
         model,
         cfg,
-        train_texts,
+        train_texts=None,
         val_texts=None,
         tokenizer=None,
         output_dir="./checkpoints",
@@ -668,16 +668,77 @@ class PretrainTrainer(Trainer):
         total_optimizer_steps=None,
         min_lr_ratio=1.0,
         count_first: bool = False,
+        train_store_dir=None,
+        train_permutation_path=None,
+        train_permutation_epoch: int = 0,
+        train_cursor: int = 0,
+        verify_train_store: bool = True,
+        pin_memory: bool = True,
+        prefetch_factor: int = 4,
         **kwargs,
     ):
         from torch.utils.data import DataLoader
         from .dataset import ContinuousWindowDataset, collate_continuous
-
-        # Build datasets and keep references for potential recounting
-        self._train_dataset = ContinuousWindowDataset(
-            train_texts, tokenizer, cfg.seq_len,
-            buffer_size=buffer_size, seed=seed, shuffle=True
+        from .pretrain_data import (
+            PretrainIndexedDataset,
+            PretrainPermutation,
+            create_pretrain_indexed_loader,
         )
+
+        self._indexed_train = train_store_dir is not None
+        self._train_permutation = None
+        self._train_cursor = int(train_cursor)
+
+        # The indexed path is pretraining-only. It replays one persisted global
+        # sample order and does not alter the legacy Trainer/SFT data path.
+        if self._indexed_train:
+            self._train_dataset = PretrainIndexedDataset(
+                train_store_dir,
+                verify=verify_train_store,
+            )
+            if self._train_dataset.seq_len != cfg.seq_len:
+                raise ValueError(
+                    "Compiled pretraining seq_len does not match the model config: "
+                    f"{self._train_dataset.seq_len} != {cfg.seq_len}"
+                )
+            if train_permutation_path is None:
+                train_permutation_path = os.path.join(
+                    train_store_dir,
+                    "permutations",
+                    f"epoch-{int(train_permutation_epoch):04d}-seed-{int(seed)}.u32",
+                )
+            if os.path.exists(train_permutation_path):
+                self._train_permutation = PretrainPermutation.load(train_permutation_path)
+            else:
+                self._train_permutation = PretrainPermutation.create(
+                    train_permutation_path,
+                    len(self._train_dataset),
+                    seed,
+                    epoch=train_permutation_epoch,
+                )
+            self.train_loader = create_pretrain_indexed_loader(
+                self._train_dataset,
+                self._train_permutation,
+                cfg.batch_size,
+                cursor=self._train_cursor,
+                num_workers=num_workers,
+                drop_last=True,
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor,
+            )
+            if len(self.train_loader) == 0:
+                raise ValueError("Indexed pretraining cursor leaves no complete training batch")
+        else:
+            if train_texts is None:
+                raise ValueError("train_texts or train_store_dir must be provided")
+            self._train_dataset = ContinuousWindowDataset(
+                train_texts, tokenizer, cfg.seq_len,
+                buffer_size=buffer_size, seed=seed, shuffle=True
+            )
+            self.train_loader = self._make_loader(
+                self._train_dataset, cfg.batch_size, num_workers, collate_continuous
+            )
+
         self._val_dataset = None
         if val_texts is not None:
             self._val_dataset = ContinuousWindowDataset(
@@ -685,10 +746,6 @@ class PretrainTrainer(Trainer):
                 buffer_size=buffer_size, seed=seed, shuffle=False
             )
 
-        # Create loaders
-        self.train_loader = self._make_loader(
-            self._train_dataset, cfg.batch_size, num_workers, collate_continuous
-        )
         self.val_loader = None
         if self._val_dataset is not None:
             self.val_loader = self._make_loader(
@@ -717,7 +774,7 @@ class PretrainTrainer(Trainer):
         self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
 
         self.count_first = count_first
-        self._known_train_batches = None
+        self._known_train_batches = len(self.train_loader) if self._indexed_train else None
         self._known_val_batches = None   # <-- add this for validation progress bar
 
     @staticmethod
@@ -794,6 +851,8 @@ class PretrainTrainer(Trainer):
         for batch_idx, batch in enumerate(pbar):
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
+            if self._indexed_train:
+                self._train_cursor += int(input_ids.shape[0])
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self.device)
@@ -867,6 +926,30 @@ class PretrainTrainer(Trainer):
             "time": time.time() - epoch_start,
             "skipped_batches": skipped_batches,
         }
+
+    def save_checkpoint(self, epoch: int, filename: Optional[str] = None):
+        """Save model state plus the exact indexed-data cursor when applicable."""
+        super().save_checkpoint(epoch, filename)
+        if not self._indexed_train:
+            return
+        checkpoint_name = filename or f"helixlm_epoch_{epoch}.pt"
+        checkpoint_dir = os.path.join(self.output_dir, checkpoint_name)
+        state = {
+            "format_version": "helix.pretrain.cursor.v1",
+            "epoch": int(epoch),
+            "global_step": int(self.global_step),
+            "sample_cursor": int(self._train_cursor),
+            "dataset_manifest_sha256": self._train_dataset.manifest.manifest_sha256,
+            "permutation_sha256": self._train_permutation.metadata["sha256"],
+            "permutation_epoch": int(self._train_permutation.metadata["epoch"]),
+            "permutation_seed": int(self._train_permutation.metadata["seed"]),
+        }
+        path = os.path.join(checkpoint_dir, "pretrain_data_state.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            import json
+            json.dump(state, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+        os.replace(path + ".tmp", path)
 
     def evaluate(self) -> Dict[str, float]:
         """

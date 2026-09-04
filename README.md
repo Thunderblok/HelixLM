@@ -198,6 +198,23 @@ model.push_to_hub(model_id)
 
 ## Training
 
+### Pretraining on a globally ordered disk-backed sample store
+
+Full-corpus causal pretraining uses `PretrainTrainer` with an EOS-joined,
+non-overlapping sample store and a persisted epoch permutation. This is separate
+from the document-aware SFT behavior of `Trainer`.
+
+```bash
+python prepare_pretrain_dataset.py \
+  --dataset codelion/sutra-10B \
+  --revision 415549cff1a92b69df8b88c6108faa6097457068 \
+  --output-dir /data/sutra-gpt2-t1024 \
+  --seq-len 1024
+```
+
+See `docs/training/BRANCH60_PRETRAIN_HANDOFF.md` for the exact sample-order,
+resume, checkpoint, and MLflow contracts.
+
 ### Document-Aware Chunking
 
 `DocumentAwareDataset` splits documents into non-overlapping chunks without crossing document boundaries. Only padding positions are masked in labels, giving 100% token utilization on real text.
