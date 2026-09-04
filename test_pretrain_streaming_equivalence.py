@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 import tempfile
+import uuid
 
 from helix_lm import HelixTokenizer, HelixConfig, HelixForCausalLM, PretrainTrainer
 
@@ -124,9 +125,10 @@ def main():
     print(f"Train Loss: {metrics1['train_loss']:.4f}, Val PPL: {metrics1['val_ppl']:.2f}")
     
     # Case 2: IterableColumn, 1 epoch (auto-compile to temporary store)
+    # Use a non-existent path; the trainer will create it atomically.
     print("\n--- Case 2: IterableColumn (auto-compiled store) ---")
     set_seeds(RANDOM_SEED)
-    temp_store = tempfile.mkdtemp(prefix="pt_stream_store_")
+    temp_store = os.path.join(tempfile.gettempdir(), f"pt_stream_store_{uuid.uuid4().hex}")
     metrics2 = run_training(train_iter, val_iter, 1, cfg, tokenizer, "./pt_c2",
                             auto_compile=True, store_dir=temp_store)
     print(f"Train Loss: {metrics2['train_loss']:.4f}, Val PPL: {metrics2['val_ppl']:.2f}")
@@ -137,7 +139,7 @@ def main():
     # Case 3: IterableColumn, 2 epochs (more steps)
     print("\n--- Case 3: IterableColumn, 2 epochs ---")
     set_seeds(RANDOM_SEED)
-    temp_store3 = tempfile.mkdtemp(prefix="pt_stream_store3_")
+    temp_store3 = os.path.join(tempfile.gettempdir(), f"pt_stream_store_{uuid.uuid4().hex}")
     metrics3 = run_training(train_iter, val_iter, 2, cfg, tokenizer, "./pt_c3",
                             auto_compile=True, store_dir=temp_store3)
     print(f"Train Loss: {metrics3['train_loss']:.4f}, Val PPL: {metrics3['val_ppl']:.2f}")
