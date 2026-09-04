@@ -41,6 +41,10 @@ jobs:
     - name: Smoke Test
       run: |
         python3 helix_lm/smoke_test.py
+    - name: Test safe Iteration on Unknown Len Streaming
+      timeout-minutes: 15
+      run: |
+        python3 text_iter_unknown_len_pretrain.py
     # Test PretrainTrainer and pretrain Dataset tooling
     - name: Pretrain streaming equivalence test
       timeout-minutes: 120
