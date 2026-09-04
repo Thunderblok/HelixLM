@@ -15,6 +15,7 @@ import os
 import math
 import time
 import warnings
+import tempfile
 from typing import Optional, List, Dict, Any, Union
 
 import torch
@@ -287,6 +288,15 @@ class Trainer:
                 self.scaler = GradScaler("cuda")
             except Exception:
                 pass  # scaler stays None, AMP still works without scaling
+
+        # Deprecation warning for the legacy Trainer class (only when exact class is used)
+        if self.__class__ is Trainer:
+            warnings.warn(
+                "Trainer is deprecated for pretraining. Use PretrainTrainer for causal pretraining. "
+                "For supervised fine-tuning, the class will be renamed SFTTrainer in a future version.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
     def _get_device(self) -> torch.device:
         """Get device from config."""
@@ -578,7 +588,7 @@ class Trainer:
             self.history["train_loss"].append(train_metrics["loss"])
             self.history["perplexity"].append(train_metrics["perplexity"])
 
-            if self.val_loader and epoch % eval_every == 0:
+            if self.val_loader is not None and epoch % eval_every == 0:
                 val_metrics = self.evaluate()
                 if self.verbose:
                     print(
@@ -642,6 +652,11 @@ class PretrainTrainer(Trainer):
       - Non-overlapping windows
     Works with both List[str] / Column and IterableColumn inputs.
 
+    If `train_texts` is a streaming iterable (no `__len__`), it will be automatically
+    compiled to a disk-backed sample store using `PretrainSampleCompiler`.
+    The compiled store is reused across runs if `pretrain_store_dir` is provided;
+    otherwise a temporary directory is used (not automatically deleted).
+
     Args:
         total_optimizer_steps: Optional known number of total optimizer steps.
             If None, a constant LR after warmup is used (min_lr_ratio=1.0).
@@ -662,8 +677,6 @@ class PretrainTrainer(Trainer):
             "permutation_sha256",
             "permutation_epoch",
             "permutation_seed",
-            "validation_sample_count",
-            "validation_sample_ids_sha256",
             "model",
             "optimizer",
             "best_val_loss",
@@ -739,27 +752,47 @@ class PretrainTrainer(Trainer):
         min_lr_ratio=1.0,
         count_first: bool = False,
         train_store_dir=None,
+        pretrain_store_dir=None,
         train_permutation_path=None,
         train_permutation_epoch: int = 0,
         train_cursor: int = 0,
-        validation_sample_count: int = 0,
         resume_training_state=None,
         verify_train_store: bool = True,
         pin_memory: bool = True,
         prefetch_factor: int = 4,
         **kwargs,
     ):
-        from torch.utils.data import DataLoader, Subset
-        from .dataset import ContinuousWindowDataset, collate_continuous
+        import tempfile
+        from torch.utils.data import DataLoader
+        from .dataset import ContinuousWindowDataset, collate_continuous, _is_iterable_column
         from .pretrain_data import (
             PretrainIndexedDataset,
             PretrainPermutation,
+            PretrainSampleCompiler,
             collate_pretrain_samples,
             create_pretrain_indexed_loader,
         )
 
+        # ── Determine if we need to auto-compile streaming train_texts ──
+        auto_compiled_store_dir = None
+        if train_store_dir is None and train_texts is not None:
+            if _is_iterable_column(train_texts):
+                # Streaming iterable -> compile to disk automatically
+                store_dir = pretrain_store_dir or tempfile.mkdtemp(
+                    prefix="helix_pretrain_"
+                )
+                compiler = PretrainSampleCompiler(
+                    tokenizer, cfg.seq_len, store_dir,
+                    source={"auto": "true"},
+                )
+                compiler.compile(train_texts)
+                train_store_dir = store_dir
+                auto_compiled_store_dir = store_dir
+
+        self._auto_compiled_store_dir = auto_compiled_store_dir
+
+        # ── Indexed path ──
         resume_state = None
-        resume_epoch_complete = False
         if resume_training_state is not None:
             resume_state = self.load_training_state(resume_training_state)
             if train_store_dir is None:
@@ -788,11 +821,7 @@ class PretrainTrainer(Trainer):
         self._indexed_pin_memory = bool(pin_memory)
         self._indexed_prefetch_factor = int(prefetch_factor)
         self._resume_scheduler_state = None
-        self._validation_sample_ids = ()
-        self._validation_sample_ids_sha256 = None
 
-        # The indexed path is pretraining-only. It replays one persisted global
-        # sample order and does not alter the legacy Trainer/SFT data path.
         if self._indexed_train:
             self._train_dataset = PretrainIndexedDataset(
                 train_store_dir,
@@ -823,57 +852,18 @@ class PretrainTrainer(Trainer):
                 expected_epoch=train_permutation_epoch,
                 expected_seed=seed,
             )
-            validation_sample_count = int(validation_sample_count)
-            if validation_sample_count < 0 or validation_sample_count >= len(self._train_dataset):
-                raise ValueError("validation_sample_count must leave training samples")
-            if validation_sample_count:
-                import hashlib
-                import numpy as np
-
-                validation_permutation_path = os.path.join(
-                    train_store_dir,
-                    "permutations",
-                    f"epoch-0000-seed-{int(seed)}.u32",
-                )
-                if os.path.exists(validation_permutation_path):
-                    validation_permutation = PretrainPermutation.load(
-                        validation_permutation_path
-                    )
-                else:
-                    validation_permutation = PretrainPermutation.create(
-                        validation_permutation_path,
-                        len(self._train_dataset),
-                        seed,
-                        epoch=0,
-                    )
-                self._validate_permutation_identity(
-                    validation_permutation,
-                    expected_epoch=0,
-                    expected_seed=seed,
-                )
-                validation_values = validation_permutation.values()
-                validation_ids = np.asarray(
-                    validation_values[-validation_sample_count:],
-                    dtype=np.dtype("<u4"),
-                )
-                self._validation_sample_ids = tuple(int(value) for value in validation_ids)
-                self._validation_sample_ids_sha256 = hashlib.sha256(
-                    validation_ids.tobytes(order="C")
-                ).hexdigest()
             self.train_loader = create_pretrain_indexed_loader(
                 self._train_dataset,
                 self._train_permutation,
                 cfg.batch_size,
                 cursor=self._train_cursor,
-                excluded_sample_ids=self._validation_sample_ids,
                 num_workers=num_workers,
                 drop_last=True,
                 pin_memory=pin_memory,
                 prefetch_factor=prefetch_factor,
             )
             self._usable_sample_count = (
-                (len(self._train_dataset) - len(self._validation_sample_ids))
-                // int(cfg.batch_size)
+                len(self._train_dataset) // int(cfg.batch_size)
             ) * int(cfg.batch_size)
             if self._train_cursor < 0 or self._train_cursor > self._usable_sample_count:
                 raise ValueError("Indexed pretraining cursor is outside the usable sample range")
@@ -899,32 +889,17 @@ class PretrainTrainer(Trainer):
                 self._train_dataset, cfg.batch_size, num_workers, collate_continuous
             )
 
-        self._val_dataset = None
-        if self._indexed_train and self._validation_sample_ids:
-            self._val_dataset = Subset(
-                self._train_dataset,
-                list(self._validation_sample_ids),
-            )
-        elif val_texts is not None:
-            self._val_dataset = ContinuousWindowDataset(
+        # ── Validation ──
+        self.val_loader = None
+        if val_texts is not None:
+            # Always use ContinuousWindowDataset for validation; it works for
+            # both materialized and streaming inputs without __len__ issues.
+            val_dataset = ContinuousWindowDataset(
                 val_texts, tokenizer, cfg.seq_len,
                 buffer_size=buffer_size, seed=seed, shuffle=False
             )
-
-        self.val_loader = None
-        if self._indexed_train and self._validation_sample_ids:
-            self.val_loader = DataLoader(
-                self._val_dataset,
-                batch_size=int(cfg.batch_size),
-                shuffle=False,
-                drop_last=False,
-                collate_fn=collate_pretrain_samples,
-                num_workers=int(num_workers),
-                pin_memory=bool(pin_memory and torch.cuda.is_available()),
-            )
-        elif self._val_dataset is not None:
             self.val_loader = self._make_loader(
-                self._val_dataset, cfg.batch_size, num_workers, collate_continuous
+                val_dataset, cfg.batch_size, num_workers, collate_continuous
             )
 
         # Call parent with our pre-built loaders
@@ -941,7 +916,7 @@ class PretrainTrainer(Trainer):
             **kwargs,
         )
 
-        # Ensure shard cleanup attributes exist (not used, but prevents AttributeError)
+        # Ensure shard cleanup attributes exist
         self._train_shard_dir = None
         self._val_shard_dir = None
 
@@ -950,7 +925,7 @@ class PretrainTrainer(Trainer):
 
         self.count_first = count_first
         self._known_train_batches = len(self.train_loader) if self._indexed_train else None
-        self._known_val_batches = None   # <-- add this for validation progress bar
+        self._known_val_batches = None
 
         if resume_state is not None:
             if resume_state["scheduler_config"] != self._scheduler_config():
@@ -967,15 +942,6 @@ class PretrainTrainer(Trainer):
                 != self._train_permutation.metadata["sha256"]
             ):
                 raise ValueError("Indexed pretraining checkpoint permutation mismatch")
-            if int(resume_state["validation_sample_count"]) != len(
-                self._validation_sample_ids
-            ):
-                raise ValueError("Indexed pretraining checkpoint validation count mismatch")
-            if (
-                resume_state["validation_sample_ids_sha256"]
-                != self._validation_sample_ids_sha256
-            ):
-                raise ValueError("Indexed pretraining checkpoint validation identity mismatch")
             self.model.load_state_dict(resume_state["model"])
             self.optimizer.load_state_dict(resume_state["optimizer"])
             self.global_step = int(resume_state["global_step"])
@@ -1044,7 +1010,6 @@ class PretrainTrainer(Trainer):
             "use_amp": bool(self.use_amp),
             "amp_dtype": str(self.amp_dtype),
             "device_type": self.device.type,
-            "validation_sample_count": len(self._validation_sample_ids),
         }
 
     @staticmethod
@@ -1103,7 +1068,6 @@ class PretrainTrainer(Trainer):
             permutation,
             self.cfg.batch_size,
             cursor=self._train_cursor,
-            excluded_sample_ids=self._validation_sample_ids,
             num_workers=self._indexed_num_workers,
             drop_last=True,
             pin_memory=self._indexed_pin_memory,
@@ -1270,8 +1234,6 @@ class PretrainTrainer(Trainer):
             "permutation_sha256": self._train_permutation.metadata["sha256"],
             "permutation_epoch": int(self._train_permutation.metadata["epoch"]),
             "permutation_seed": int(self._train_permutation.metadata["seed"]),
-            "validation_sample_count": len(self._validation_sample_ids),
-            "validation_sample_ids_sha256": self._validation_sample_ids_sha256,
         }
         path = os.path.join(checkpoint_dir, "pretrain_data_state.json")
         with open(path + ".tmp", "w", encoding="utf-8") as handle:
@@ -1427,7 +1389,6 @@ class PretrainTrainer(Trainer):
             self.history["train_loss"].append(train_metrics["loss"])
             self.history["perplexity"].append(train_metrics["perplexity"])
 
-            # Only evaluate if val_loader is not None (avoid boolean context)
             if self.val_loader is not None and epoch % eval_every == 0:
                 val_metrics = self.evaluate()
                 if self.verbose:
@@ -1461,3 +1422,7 @@ class PretrainTrainer(Trainer):
         if self.verbose:
             print(f"\nTraining complete!")
         return self.history
+
+
+# Alias for supervised fine-tuning (legacy Trainer)
+SFTTrainer = Trainer
