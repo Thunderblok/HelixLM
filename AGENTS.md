@@ -19,7 +19,9 @@
 - Keep the current experiment topology at three columns and vertical depth two.
   A fourth column and depth three are a later, separately admitted ablation.
 - Width takes priority over adding topology in the current campaign. The active
-  Branch 60 configuration uses `d_model=1024`.
+  external Branch 60 experiment uses `d_model=1024`; the checked-in
+  `113M_param_train.py` launcher remains at `d_model=768`. Bind either claim to
+  its launcher or run contract rather than inferring one from the branch name.
 - Compile data locally, save checkpoints locally first, and make Hugging Face
   publication an explicit optional action.
 

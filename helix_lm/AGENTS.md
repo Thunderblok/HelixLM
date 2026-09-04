@@ -37,6 +37,12 @@ Checkpoint data state must identify both the compiled sample manifest and the
 permutation. A model checkpoint without those roots is not an exact mid-epoch
 resume receipt.
 
+For indexed training, `pretrain_training_state.pt` is the exact local recovery
+object at an optimizer-step boundary: model, optimizer, scheduler, AMP scaler
+when present, Torch RNG, global step, sample cursor, manifest root, and
+permutation root. A new epoch must activate a new persisted epoch permutation;
+reusing the prior epoch's DataLoader is not a global-shuffle implementation.
+
 ## Deferred topology work
 
 Do not add a fourth column or raise vertical depth to three in this lane. The

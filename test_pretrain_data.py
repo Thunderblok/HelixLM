@@ -18,7 +18,7 @@ from helix_lm.pretrain_data import (
     create_pretrain_indexed_loader,
 )
 from helix_lm.dataset import ContinuousWindowDataset
-from helix_lm.trainer import PretrainTrainer
+from helix_lm.trainer import PretrainTrainer, get_cosine_schedule_with_warmup
 
 
 class IntegerTokenizer:
@@ -81,6 +81,35 @@ class PretrainDataTest(unittest.TestCase):
                 list(PretrainPermutationSampler(loaded, cursor=7)),
                 values[7:],
             )
+
+    def test_permutation_cursor_counts_only_non_holdout_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "epoch-0000.u32"
+            permutation = PretrainPermutation.create(path, 12, 42, epoch=0)
+            values = [int(value) for value in permutation.values()]
+            holdout = values[-3:]
+            admitted = [value for value in values if value not in holdout]
+
+            sampler = PretrainPermutationSampler(
+                permutation,
+                cursor=4,
+                excluded_sample_ids=holdout,
+            )
+
+            self.assertEqual(len(sampler), len(admitted) - 4)
+            self.assertEqual(list(sampler), admitted[4:])
+
+    def test_pretrain_permutation_load_refuses_metadata_path_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "epoch-0000.u32"
+            PretrainPermutation.create(path, 8, 42, epoch=0)
+            metadata_path = path.with_suffix(path.suffix + ".json")
+            metadata = __import__("json").loads(metadata_path.read_text())
+            metadata["file"] = "another-permutation.u32"
+            metadata_path.write_text(__import__("json").dumps(metadata))
+
+            with self.assertRaisesRegex(ValueError, "metadata path mismatch"):
+                PretrainPermutation.load(path)
 
     def test_disk_loader_replays_the_exact_persisted_batch_order(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -181,8 +210,416 @@ class PretrainDataTest(unittest.TestCase):
 
             self.assertEqual(state["sample_cursor"], 2)
             self.assertEqual(state["global_step"], 1)
-            self.assertEqual(state["dataset_manifest_sha256"], trainer._train_dataset.manifest.manifest_sha256)
-            self.assertEqual(state["permutation_sha256"], trainer._train_permutation.metadata["sha256"])
+            self.assertEqual(
+                state["dataset_manifest_sha256"],
+                trainer._train_dataset.manifest.manifest_sha256,
+            )
+            self.assertEqual(
+                state["permutation_sha256"],
+                trainer._train_permutation.metadata["sha256"],
+            )
+            self.assertTrue(
+                (
+                    temporary / "checkpoints" / "resume-court" /
+                    "pretrain_training_state.pt"
+                ).is_file()
+            )
+
+    def test_pretrain_trainer_restores_model_optimizer_rng_and_data_cursor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12", "13 14 15", "16 17 18"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            original = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False, total_optimizer_steps=20,
+            )
+            original.model.weight.data.fill_(3.0)
+            original.scheduler = get_cosine_schedule_with_warmup(
+                original.optimizer,
+                num_warmup_steps=original._scheduler_warmup,
+                num_training_steps=20,
+                num_cycles=original._scheduler_cycles,
+                min_lr_ratio=original._scheduler_min_lr,
+            )
+            original.optimizer.zero_grad()
+            original.model.weight.square().backward()
+            original.optimizer.step()
+            original.scheduler.step()
+            original.global_step = 1
+            original._train_cursor = 2
+            expected_weight = original.model.weight.detach().clone()
+            expected_next_id = int(original._train_permutation.values()[2])
+            expected_rng = torch.get_rng_state().clone()
+            expected_scheduler_step = original.scheduler.last_epoch
+            original.save_checkpoint(1, "resume-court")
+            torch.manual_seed(999)
+
+            restored = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "restored",
+                seed=42, num_workers=0, verbose=False,
+                total_optimizer_steps=20,
+                resume_training_state=(
+                    temporary / "checkpoints" / "resume-court" /
+                    "pretrain_training_state.pt"
+                ),
+            )
+
+            self.assertEqual(restored.global_step, 1)
+            self.assertEqual(restored._train_cursor, 2)
+            self.assertTrue(torch.equal(restored.model.weight, expected_weight))
+            self.assertTrue(torch.equal(torch.get_rng_state(), expected_rng))
+            first_batch = next(iter(restored.train_loader))
+            self.assertEqual(int(first_batch["sample_id"][0]), expected_next_id)
+            self.assertTrue(restored.optimizer.state_dict()["state"])
+            restored.train_epoch(1)
+            self.assertEqual(restored.global_step, 3)
+            self.assertEqual(restored.scheduler.last_epoch, expected_scheduler_step + 2)
+            self.assertIsNone(restored._resume_scheduler_state)
+
+            with self.assertRaisesRegex(ValueError, "scheduler configuration mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "mismatch",
+                    seed=42, num_workers=0, verbose=False,
+                    total_optimizer_steps=40,
+                    resume_training_state=(
+                        temporary / "checkpoints" / "resume-court" /
+                        "pretrain_training_state.pt"
+                    ),
+                )
+
+            changed_lr_cfg = SimpleNamespace(**vars(cfg))
+            changed_lr_cfg.lr = 0.02
+            with self.assertRaisesRegex(ValueError, "training configuration mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=changed_lr_cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "lr-mismatch",
+                    seed=42, num_workers=0, verbose=False,
+                    total_optimizer_steps=20,
+                    resume_training_state=(
+                        temporary / "checkpoints" / "resume-court" /
+                        "pretrain_training_state.pt"
+                    ),
+                )
+
+    def test_pretrain_trainer_refuses_incompatible_exact_runtime_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            self.compile_fixture(root)
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+            )
+            trainer.save_checkpoint(1, "resume-court")
+            state_path = (
+                temporary / "checkpoints" / "resume-court" /
+                "pretrain_training_state.pt"
+            )
+
+            state = torch.load(state_path, map_location="cpu", weights_only=True)
+            state["cuda_rng_state_all"] = [torch.get_rng_state()]
+            torch.save(state, state_path)
+            with self.assertRaisesRegex(ValueError, "CUDA RNG configuration mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "cuda-mismatch",
+                    seed=42, num_workers=0, verbose=False,
+                    resume_training_state=state_path,
+                )
+
+            state["cuda_rng_state_all"] = None
+            state["scaler"] = {"scale": torch.tensor(1.0)}
+            torch.save(state, state_path)
+            with self.assertRaisesRegex(ValueError, "AMP scaler configuration mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "scaler-mismatch",
+                    seed=42, num_workers=0, verbose=False,
+                    resume_training_state=state_path,
+                )
+
+    def test_resume_stage_plan_skips_completed_stage_without_duplicate_result(self):
+        partial = {
+            "permutation_epoch": 1,
+            "sample_cursor": 2,
+            "usable_sample_count": 4,
+        }
+        complete = {**partial, "sample_cursor": 4}
+
+        self.assertEqual(PretrainTrainer.resume_stage_plan(partial, 3), (1, True))
+        self.assertEqual(PretrainTrainer.resume_stage_plan(complete, 3), (2, False))
+        self.assertEqual(
+            PretrainTrainer.resume_stage_plan(
+                {**complete, "permutation_epoch": 2},
+                3,
+            ),
+            (3, False),
+        )
+
+    def test_pretrain_trainer_refuses_resume_from_another_sample_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+            )
+            trainer.save_checkpoint(1, "resume-court")
+            state_path = (
+                temporary / "checkpoints" / "resume-court" /
+                "pretrain_training_state.pt"
+            )
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+            state["dataset_manifest_sha256"] = "0" * 64
+            torch.save(state, state_path)
+
+            with self.assertRaisesRegex(ValueError, "dataset manifest mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "restored",
+                    seed=42, num_workers=0, verbose=False,
+                    resume_training_state=state_path,
+                )
+
+    def test_pretrain_trainer_refuses_resume_from_another_permutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+            )
+            trainer.save_checkpoint(1, "resume-court")
+            state_path = (
+                temporary / "checkpoints" / "resume-court" /
+                "pretrain_training_state.pt"
+            )
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+            state["permutation_sha256"] = "0" * 64
+            torch.save(state, state_path)
+
+            with self.assertRaisesRegex(ValueError, "permutation mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "restored",
+                    seed=42, num_workers=0, verbose=False,
+                    resume_training_state=state_path,
+                )
+
+    def test_pretrain_trainer_refuses_misfiled_epoch_permutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+            )
+            misfiled = root / "permutations" / "epoch-0001-seed-42.u32"
+            PretrainPermutation.create(misfiled, 4, 42, epoch=0)
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+
+            with self.assertRaisesRegex(ValueError, "permutation epoch mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "output",
+                    seed=42, num_workers=0, verbose=False,
+                    train_permutation_epoch=1,
+                )
+
+    def test_pretrain_train_runs_when_initial_permutation_epoch_is_nonzero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=1,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "output",
+                seed=42, num_workers=0, verbose=False,
+                train_permutation_epoch=1,
+            )
+
+            history = trainer.train(num_epochs=1)
+
+            self.assertEqual(len(history["train_loss"]), 1)
+            self.assertGreater(trainer.global_step, 0)
+            self.assertEqual(trainer._train_permutation_epoch, 1)
+
+    def test_pretrain_trainer_uses_a_distinct_persisted_order_per_epoch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12", "13 14 15", "16 17 18"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=2,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+            )
+
+            trainer.train_epoch(1)
+            first_root = trainer._train_permutation.metadata["sha256"]
+            trainer.train_epoch(2)
+            second_root = trainer._train_permutation.metadata["sha256"]
+
+            self.assertEqual(trainer._train_permutation_epoch, 1)
+            self.assertNotEqual(first_root, second_root)
+            self.assertEqual(trainer._train_cursor, len(trainer._train_dataset))
+            self.assertTrue((root / "permutations" / "epoch-0001-seed-42.u32").is_file())
+
+    def test_indexed_validation_ids_are_fixed_and_excluded_from_every_epoch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12", "13 14 15", "16 17 18"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=2,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            trainer = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+                validation_sample_count=2,
+            )
+
+            validation_ids = tuple(
+                int(sample_id)
+                for batch in trainer.val_loader
+                for sample_id in batch["sample_id"]
+            )
+            epoch_zero_train_ids = tuple(
+                int(sample_id)
+                for batch in trainer.train_loader
+                for sample_id in batch["sample_id"]
+            )
+            trainer._activate_indexed_epoch(1)
+            epoch_one_train_ids = tuple(
+                int(sample_id)
+                for batch in trainer.train_loader
+                for sample_id in batch["sample_id"]
+            )
+
+            self.assertEqual(validation_ids, trainer._validation_sample_ids)
+            self.assertEqual(len(validation_ids), 2)
+            self.assertTrue(set(validation_ids).isdisjoint(epoch_zero_train_ids))
+            self.assertTrue(set(validation_ids).isdisjoint(epoch_one_train_ids))
+            self.assertEqual(set(epoch_zero_train_ids), set(epoch_one_train_ids))
+
+            trainer.save_checkpoint(1, "validation-root")
+            state_path = (
+                temporary / "checkpoints" / "validation-root" /
+                "pretrain_training_state.pt"
+            )
+            state = torch.load(state_path, map_location="cpu", weights_only=True)
+            state["validation_sample_ids_sha256"] = "0" * 64
+            torch.save(state, state_path)
+            with self.assertRaisesRegex(ValueError, "validation identity mismatch"):
+                PretrainTrainer(
+                    model=TinyModel(), cfg=cfg, train_store_dir=root,
+                    tokenizer=IntegerTokenizer(), output_dir=temporary / "restored",
+                    seed=42, num_workers=0, verbose=False,
+                    validation_sample_count=2,
+                    resume_training_state=state_path,
+                )
+
+    def test_pretrain_trainer_resumes_completed_epoch_at_next_persisted_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            root = temporary / "samples"
+            PretrainSampleCompiler(IntegerTokenizer(), 4, root).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12", "13 14 15", "16 17 18"]
+            )
+            cfg = SimpleNamespace(
+                seq_len=4, batch_size=2, lr=0.01, weight_decay=0.0,
+                warmup_steps=1, grad_clip=1.0, device="cpu", epochs=2,
+                use_titans_memory=False, use_cca=False, max_new_tokens=1,
+                temperature=1.0, top_k=0, top_p=1.0,
+            )
+            original = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "checkpoints",
+                seed=42, num_workers=0, verbose=False,
+            )
+            original.train_epoch(1)
+            original.save_checkpoint(1, "epoch-one")
+
+            restored = PretrainTrainer(
+                model=TinyModel(), cfg=cfg, train_store_dir=root,
+                tokenizer=IntegerTokenizer(), output_dir=temporary / "restored",
+                seed=42, num_workers=0, verbose=False,
+                resume_training_state=(
+                    temporary / "checkpoints" / "epoch-one" /
+                    "pretrain_training_state.pt"
+                ),
+            )
+
+            self.assertEqual(restored._train_permutation_epoch, 1)
+            self.assertEqual(restored._train_cursor, 0)
+            restored.train(num_epochs=2)
+            self.assertEqual(restored._train_permutation_epoch, 1)
+            self.assertEqual(restored._train_cursor, len(restored._train_dataset))
 
 
 if __name__ == "__main__":

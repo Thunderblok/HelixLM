@@ -151,47 +151,53 @@ python smoke_test.py
 python quick_demo_cpu.py
 ```
 
-## HuggingFace Integration and a clean, configurable model training API with no monkey patching required.
+## HuggingFace integration
+
+This minimal example shows the document-aware SFT path. See
+`docs/training/BRANCH60_PRETRAIN_HANDOFF.md` for indexed pretraining and its
+exact sample-order and recovery contracts.
 
 ```python
-from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer
-
-cfg = HelixConfig.small_v2(vocab_size=50257)
+from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
 
 tokenizer = HelixTokenizer("gpt2")
+cfg = HelixConfig.small_v2(
+    vocab_size=tokenizer.vocab_size,
+    seq_len=64,
+    batch_size=2,
+    epochs=1,
+)
 
 cfg.pad_token_id = tokenizer.pad_token_id
 cfg.eos_token_id = tokenizer.eos_token_id
 cfg.bos_token_id = tokenizer.bos_token_id
 model = HelixForCausalLM(cfg)
 
-stage_output_dir = str(OUTPUT_DIR / f"stage{stage_num}")
 trainer = Trainer(
-        model=model,
-        cfg=cfg,
-        train_texts=train_texts, # List[str] - will be correctly chunked, batched, collated, padded, etc automatically.
-        val_texts=val_texts, # List[str] - will be correctly chunked, batched, collated, padded, etc automatically.
-        tokenizer=tokenizer,
-        output_dir=stage_output_dir,
-        grad_accum_steps=GRAD_ACCUM,
-        use_amp=USE_AMP,
-        amp_dtype=AMP_DTYPE,
-        min_tail_len=SEQ_LEN // 4,
-        verbose=True,
+    model=model,
+    cfg=cfg,
+    train_texts=["First training document.", "Second training document."],
+    val_texts=["Held-out validation document."],
+    tokenizer=tokenizer,
+    output_dir="./sft-checkpoints",
+    grad_accum_steps=1,
+    use_amp=False,
+    min_tail_len=16,
 )
-history = trainer.train(num_epochs=1) # Often grocks on 1 epoch.
+history = trainer.train(num_epochs=1)
 
 # Save/load in standard HF format
 model.save_pretrained("./my-helix-model")
-tokenizer._backend.save_pretrained("./my-helix-model")
+tokenizer.save_pretrained("./my-helix-model")
 
 # Load later with standard transformers Auto classes
 from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained("./my-helix-model")
 tokenizer = AutoTokenizer.from_pretrained("./my-helix-model")
 
-model_id = f"{your-hf-username}/your-repo-id"
-model.push_to_hub(model_id)
+# Optional publication: authenticate first, and push only after the local
+# save_pretrained output above exists and has been read back.
+# model.push_to_hub("your-hf-username/your-repo-id")
 ```
 
 ---

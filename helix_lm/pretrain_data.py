@@ -333,6 +333,14 @@ class PretrainPermutation:
         metadata = json.loads(path.with_suffix(path.suffix + ".json").read_text())
         if metadata.get("format_version") != PERMUTATION_VERSION:
             raise ValueError(f"Unsupported pretraining permutation: {metadata.get('format_version')!r}")
+        if metadata.get("algorithm") != "numpy.pcg64.seedsequence-v1":
+            raise ValueError("Unsupported pretraining permutation algorithm")
+        if metadata.get("file") != path.name:
+            raise ValueError("Pretraining permutation metadata path mismatch")
+        if metadata.get("dtype") != PERMUTATION_DTYPE.str:
+            raise ValueError("Pretraining permutation dtype mismatch")
+        if int(metadata.get("epoch", -1)) < 0:
+            raise ValueError("Pretraining permutation epoch must be non-negative")
         if path.stat().st_size != int(metadata["bytes"]):
             raise ValueError("Pretraining permutation size mismatch")
         expected_bytes = int(metadata["sample_count"]) * PERMUTATION_DTYPE.itemsize
@@ -351,21 +359,39 @@ class PretrainPermutation:
 
 
 class PretrainPermutationSampler(Sampler[int]):
-    """Replay an exact persisted sample order from an optional resume cursor."""
+    """Replay an exact persisted sample order with a fixed exclusion set."""
 
-    def __init__(self, permutation: PretrainPermutation, *, cursor: int = 0) -> None:
-        if cursor < 0 or cursor > permutation.sample_count:
+    def __init__(
+        self,
+        permutation: PretrainPermutation,
+        *,
+        cursor: int = 0,
+        excluded_sample_ids: Optional[Sequence[int]] = None,
+    ) -> None:
+        excluded = frozenset(int(sample_id) for sample_id in (excluded_sample_ids or ()))
+        if any(sample_id < 0 or sample_id >= permutation.sample_count for sample_id in excluded):
+            raise ValueError("excluded sample ID is outside the persisted permutation")
+        available_samples = permutation.sample_count - len(excluded)
+        if cursor < 0 or cursor > available_samples:
             raise ValueError("cursor is outside the persisted permutation")
         self.permutation = permutation
         self.cursor = int(cursor)
+        self.excluded_sample_ids = excluded
+        self.available_samples = available_samples
 
     def __iter__(self) -> Iterator[int]:
         values = self.permutation.values()
-        for position in range(self.cursor, len(values)):
-            yield int(values[position])
+        included_position = 0
+        for value in values:
+            sample_id = int(value)
+            if sample_id in self.excluded_sample_ids:
+                continue
+            if included_position >= self.cursor:
+                yield sample_id
+            included_position += 1
 
     def __len__(self) -> int:
-        return self.permutation.sample_count - self.cursor
+        return self.available_samples - self.cursor
 
 
 def collate_pretrain_samples(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -383,6 +409,7 @@ def create_pretrain_indexed_loader(
     batch_size: int,
     *,
     cursor: int = 0,
+    excluded_sample_ids: Optional[Sequence[int]] = None,
     num_workers: int = 0,
     drop_last: bool = True,
     pin_memory: bool = True,
@@ -393,7 +420,11 @@ def create_pretrain_indexed_loader(
     kwargs: Dict[str, Any] = {
         "dataset": dataset,
         "batch_size": int(batch_size),
-        "sampler": PretrainPermutationSampler(permutation, cursor=cursor),
+        "sampler": PretrainPermutationSampler(
+            permutation,
+            cursor=cursor,
+            excluded_sample_ids=excluded_sample_ids,
+        ),
         "shuffle": False,
         "drop_last": drop_last,
         "collate_fn": collate_pretrain_samples,

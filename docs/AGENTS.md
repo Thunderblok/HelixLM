@@ -27,7 +27,8 @@ a production claim.
 
 ## Current topology ceiling
 
-The Branch 60 indexed pretraining comparison freezes `d_model=1024`, three
-columns, `(3, 3, 3)` nodes, and vertical depth two. A fourth column and vertical
-depth three are deferred to a separately matched experiment. Do not describe
-them as part of the current run.
+The active external Branch 60 indexed comparison freezes `d_model=1024`, three
+columns, `(3, 3, 3)` nodes, and vertical depth two. The checked-in
+`113M_param_train.py` launcher remains at `d_model=768`; cite the exact launcher
+or run contract when stating width. A fourth column and vertical depth three
+are deferred to a separately matched experiment.

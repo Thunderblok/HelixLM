@@ -49,7 +49,8 @@ trainer = PretrainTrainer(
     cfg=cfg,
     train_store_dir="/path/to/sutra-gpt2-t1024",
     train_texts=None,
-    val_texts=validation_texts,
+    val_texts=None,
+    validation_sample_count=252,
     tokenizer=tokenizer,
     seed=42,
     train_permutation_epoch=0,
@@ -65,6 +66,51 @@ The trainer creates or reuses the epoch permutation under the sample store and
 writes `pretrain_data_state.json` beside each local model checkpoint. Publish a
 checkpoint to Hugging Face only after the local checkpoint and data-state file
 exist and have been read back.
+
+Indexed checkpoints also contain `pretrain_training_state.pt`, which binds and
+restores model, optimizer, scheduler, AMP scaler when present, Torch CPU/CUDA
+RNG, global step, sample cursor, dataset-manifest root, and permutation root.
+Pass that file through `resume_training_state` with the same sample store. The
+trainer refuses a manifest, permutation, or epoch-identity mismatch. Each later
+epoch activates a separately persisted permutation derived from the same seed
+plus its epoch number. Treat the object as an exact recovery point only when it
+was written at an optimizer-step boundary.
+
+The launcher also writes `ckpt_epochN` using `save_pretrained()`. That directory
+contains Hugging Face model/tokenizer files; it is not an exact indexed recovery
+object unless the two indexed state files are present and read back beside it.
+
+## Run the checked-in launcher
+
+```bash
+HELIX_PRETRAIN_STORE_DIR=/path/to/sutra-gpt2-t1024 \
+HELIX_DATASET=codelion/sutra-10B \
+HELIX_DATASET_REVISION=415549cff1a92b69df8b88c6108faa6097457068 \
+HELIX_VALIDATION_SAMPLES=252 \
+HELIX_PUSH_TO_HUB=0 \
+python 113M_param_train.py
+```
+
+Resume with the same sample store, dataset, and revision used for the original
+run:
+
+```bash
+HELIX_PRETRAIN_STORE_DIR=/path/to/sutra-gpt2-t1024 \
+HELIX_DATASET=codelion/sutra-10B \
+HELIX_DATASET_REVISION=415549cff1a92b69df8b88c6108faa6097457068 \
+HELIX_VALIDATION_SAMPLES=252 \
+HELIX_RESUME_TRAINING_STATE=/path/to/pretrain_training_state.pt \
+HELIX_PUSH_TO_HUB=0 \
+python 113M_param_train.py
+```
+
+For the indexed path, validation is the fixed tail of the epoch-zero persisted
+permutation. Those IDs are excluded from every training epoch even as later
+epochs activate new persisted orders. The checkpoint binds the validation ID
+root and count. The launcher resumes the checkpoint's LR stage, refuses
+incompatible scheduler, runtime, validation, or data roots, and then continues
+later stages. It does not create an MLflow run by itself. Bind MLflow externally,
+or add explicit launcher support before calling the resulting run comparable.
 
 ## Overnight admission run
 

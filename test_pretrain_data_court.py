@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from pretrain_data_court import CourtFailure, IntegerTokenizer, replay_store, run_fixture_equivalence
-from helix_lm.pretrain_data import PretrainPermutation, PretrainSampleCompiler
+from helix_lm.pretrain_data import (
+    PERMUTATION_DTYPE,
+    PretrainPermutation,
+    PretrainSampleCompiler,
+)
 
 
 class PretrainDataCourtTest(unittest.TestCase):
@@ -73,6 +81,35 @@ class PretrainDataCourtTest(unittest.TestCase):
                     num_workers=0,
                     maximum_samples=None,
                     minimum_samples_per_second=1e30,
+                )
+
+    def test_complete_store_replay_convicts_duplicate_and_omitted_sample_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary) / "samples"
+            manifest = PretrainSampleCompiler(IntegerTokenizer(), 4, store).compile(
+                ["1 2 3", "4 5 6", "7 8 9", "10 11 12"]
+            )
+            permutation = PretrainPermutation.create(
+                store / "permutations" / "epoch-0000-seed-42.u32",
+                manifest.sample_count,
+                42,
+            )
+            values = np.asarray(permutation.values()).copy()
+            values[-1] = values[0]
+            values.astype(PERMUTATION_DTYPE, copy=False).tofile(permutation.path)
+            metadata_path = permutation.path.with_suffix(permutation.path.suffix + ".json")
+            metadata = json.loads(metadata_path.read_text())
+            metadata["sha256"] = hashlib.sha256(permutation.path.read_bytes()).hexdigest()
+            metadata_path.write_text(json.dumps(metadata))
+
+            with self.assertRaisesRegex(CourtFailure, "duplicate sample ID"):
+                replay_store(
+                    store,
+                    permutation.path,
+                    batch_size=2,
+                    num_workers=0,
+                    maximum_samples=None,
+                    minimum_samples_per_second=0,
                 )
 
 

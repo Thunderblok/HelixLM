@@ -6,9 +6,11 @@
   change or rename it here; David owns the later `SFTTrainer` rename.
 - Continuous, globally ordered causal pretraining belongs to
   `PretrainTrainer`, `pretrain_data.py`, and `prepare_pretrain_dataset.py`.
-- Width is the current priority. The admitted Branch 60 run uses
-  `d_model=1024`, 16 heads, three columns, `(3, 3, 3)` nodes, four loops, FFN
-  expansion 3.0, and vertical depth two.
+- Width is the current priority. The active external Branch 60 experiment uses
+  `d_model=1024` and 16 heads; the checked-in `113M_param_train.py` launcher
+  remains at `d_model=768` and 12 heads. Both use three columns, `(3, 3, 3)`
+  nodes, four loops, FFN expansion 3.0, and vertical depth two. Bind claims to
+  the exact launcher or run contract.
 - Do not add a fourth column or raise vertical depth to three until the current
   data path and baseline are terminalized. That future topology change needs a
   matched source, data order, optimizer, tokenizer, and evaluator.
