@@ -103,3 +103,19 @@ learning_rate
 Required metrics include causal targets per second, raw input bytes per second,
 loss, perplexity, learning rate, gradient norm, skipped batches, GPU memory,
 GPU utilization, data wait time, step time, and checkpoint write time.
+
+## Independent data-path court
+
+`pretrain_data_court.py` keeps admission evidence outside the trainer. Its
+fixture phase independently builds live continuous windows and compiled
+windows, then proves exact token, label, mask, persisted-order, and causal
+target equivalence. Its optional complete-store phase replays every persisted
+sample ID, rejects duplicates and omissions, hashes the observed ordered IDs
+and tokens, and measures storage-only throughput.
+
+The default performance floor is 25 samples per second. That is deliberately a
+data-supply threshold rather than a model-speed promise: the admitted Branch 60
+configuration consumes approximately 6.1 samples per second at roughly 6,200
+causal targets per second, so the storage path must retain at least fourfold
+headroom. Record the measured terminal outside an active training window; a
+concurrent replay would contaminate both measurements.

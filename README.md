@@ -215,6 +215,30 @@ python prepare_pretrain_dataset.py \
 See `docs/training/BRANCH60_PRETRAIN_HANDOFF.md` for the exact sample-order,
 resume, checkpoint, and MLflow contracts.
 
+Run the independent fixture equivalence court with:
+
+```bash
+python pretrain_data_court.py
+```
+
+After training is idle, replay the complete compiled store and enforce the
+Branch 60 storage-throughput floor with:
+
+```bash
+python pretrain_data_court.py \
+  --sample-store /data/sutra-gpt2-t1024 \
+  --permutation /data/sutra-gpt2-t1024/permutations/epoch-0000-seed-42.u32 \
+  --batch-size 2 \
+  --num-workers 4 \
+  --output /path/to/pretrain-data-court-terminal.json
+```
+
+The full-store court compares every observed sample ID with the persisted
+permutation, rejects duplicates or omissions, verifies labels and masks, binds
+ordered token and sample-ID roots, and reports measured storage-only sample and
+causal-target throughput. Run it outside an active training window so the
+measurement does not perturb the model run it is meant to qualify.
+
 ### Document-Aware Chunking
 
 `DocumentAwareDataset` splits documents into non-overlapping chunks without crossing document boundaries. Only padding positions are masked in labels, giving 100% token utilization on real text.

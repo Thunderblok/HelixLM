@@ -42,3 +42,8 @@ multiple DataLoader workers, and perform at least one real optimizer step. A
 run is not comparable unless MLflow records source, model topology, data roots,
 batching, learning rate, FFN expansion, lateral/vertical probabilities, and
 vertical depth.
+
+`pretrain_data_court.py` is the independent sample-equivalence and storage
+throughput terminal. Run its fixture court during ordinary verification. Run
+its complete-store replay only while training is idle; otherwise the benchmark
+would perturb the GPU run whose input path it is qualifying.
