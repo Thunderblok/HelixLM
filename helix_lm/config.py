@@ -47,6 +47,7 @@ class HelixConfig(PretrainedConfig):
         # --- Core dimensions ---
         d_model: int = 256,
         n_columns: int = 3,
+        # Compute nodes per column; aggregation gate nodes are added separately.
         nodes_per_column: Tuple[int, ...] = (2, 3, 2),
 
         # --- Attention ---
@@ -315,14 +316,38 @@ class HelixConfig(PretrainedConfig):
             if self.compressed_dim is not None:
                 assert self.compressed_dim >= 1, "compressed_dim (Dc) must be >= 1"
 
-        # Ensure nodes_per_column matches n_columns
-        npc = self.nodes_per_column
+        # Normalize JSON-loaded lists and reject configurations that cannot
+        # describe a real compute topology. Gate nodes are aggregation plumbing
+        # and are not included in these per-column counts.
+        if (
+            not isinstance(self.n_columns, int)
+            or isinstance(self.n_columns, bool)
+            or self.n_columns < 1
+        ):
+            raise ValueError("n_columns must be a positive integer")
+
+        try:
+            npc = tuple(self.nodes_per_column)
+        except TypeError as error:
+            raise ValueError(
+                "nodes_per_column must contain positive integers"
+            ) from error
+        if not npc:
+            raise ValueError("nodes_per_column must contain at least one value")
+        if any(
+            not isinstance(count, int) or isinstance(count, bool) or count < 1
+            for count in npc
+        ):
+            raise ValueError("nodes_per_column values must be positive integers")
+
+        # Ensure nodes_per_column matches n_columns. Short tuples inherit their
+        # final declared count; long tuples are truncated deterministically.
         if len(npc) != self.n_columns:
             if len(npc) < self.n_columns:
                 npc = npc + (npc[-1],) * (self.n_columns - len(npc))
             else:
                 npc = npc[:self.n_columns]
-            self.nodes_per_column = npc
+        self.nodes_per_column = npc
 
         # --- HF compat: attributes required by GenerationMixin and utilities ---
         self.use_cache = kwargs.get("use_cache", True)
