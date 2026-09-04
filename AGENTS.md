@@ -42,4 +42,3 @@ multiple DataLoader workers, and perform at least one real optimizer step. A
 run is not comparable unless MLflow records source, model topology, data roots,
 batching, learning rate, FFN expansion, lateral/vertical probabilities, and
 vertical depth.
-

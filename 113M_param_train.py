@@ -369,7 +369,11 @@ def main():
         prev_ckpt_dir = canonical_ckpt
 
         # ── Push ─────────────────────────────────────────────────────
-        hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
+        if PUSH_TO_HUB:
+            hub_repo = push_checkpoint(model, tokenizer, stage_num, canonical_ckpt)
+        else:
+            hub_repo = ""
+            logger.info("Hub publication disabled; local checkpoint retained at %s", canonical_ckpt)
 
         # ── Track ────────────────────────────────────────────────────
         stage_result = {

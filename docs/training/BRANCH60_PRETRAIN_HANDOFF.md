@@ -103,4 +103,3 @@ learning_rate
 Required metrics include causal targets per second, raw input bytes per second,
 loss, perplexity, learning rate, gradient norm, skipped batches, GPU memory,
 GPU utilization, data wait time, step time, and checkpoint write time.
-

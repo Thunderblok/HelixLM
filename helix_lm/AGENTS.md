@@ -43,4 +43,3 @@ Do not add a fourth column or raise vertical depth to three in this lane. The
 current comparison freezes three columns, `(3, 3, 3)` nodes, and vertical depth
 two. Future topology work gets its own matched ablation after the pretraining
 pipeline is proven.
-
