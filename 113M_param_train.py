@@ -34,8 +34,10 @@ from helix_lm import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 # 3B token dataset with train/val splits — STREAMING MODE
-PUSH_TO_HUB = True
-DATASET = "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1"
+PUSH_TO_HUB = os.getenv("HELIX_PUSH_TO_HUB", "0") == "1"
+DATASET = os.getenv("HELIX_DATASET", "david-thrower/helixlm87M-3Btoken-pretrain-dataset-v1")
+DATASET_REVISION = os.getenv("HELIX_DATASET_REVISION")
+PRETRAIN_STORE_DIR = os.getenv("HELIX_PRETRAIN_STORE_DIR")
 HF_USERNAME = "david-thrower"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
@@ -106,7 +108,7 @@ PUSH_RETRY_DELAY = 90
 STREAMING = True
 PREPROCESS_BATCH_SIZE = 1000       # not used by PretrainTrainer, but kept for logging
 CLEANUP_SHARDS = True              # not used by PretrainTrainer
-NUM_WORKERS = 16
+NUM_WORKERS = int(os.getenv("HELIX_NUM_WORKERS", "4" if PRETRAIN_STORE_DIR else "0"))
 
 # Tokenizer
 TOKENIZER_NAME = "gpt2"
@@ -181,6 +183,7 @@ def main():
     logger.info("=" * 70)
     logger.info("Run:        %s", RUN_TS)
     logger.info("Dataset:    %s", DATASET)
+    logger.info("Revision:   %s", DATASET_REVISION or "provider default (not release-admissible)")
     logger.info("Config:     d=%d cols=%d heads=%d ffn=%.1f seq=%d loops=%d",
                 D_MODEL, N_COLUMNS, N_HEADS, FFN_EXPANSION, SEQ_LEN, N_LOOPS)
     logger.info("Topology:   lateral=%.1f vertical=%.1f depth=%d",
@@ -218,19 +221,25 @@ def main():
     # ── Dataset (STREAMING MODE) ───────────────────────────────────────
     logger.info("Loading dataset (streaming=%s): %s", STREAMING, DATASET)
     try:
-        hf_ds = load_dataset(DATASET, streaming=STREAMING)
+        load_kwargs = {"streaming": STREAMING}
+        if DATASET_REVISION:
+            load_kwargs["revision"] = DATASET_REVISION
+        hf_ds = load_dataset(DATASET, **load_kwargs)
     except Exception as e:
         logger.error("❌ Failed to load dataset: %s", e)
         sys.exit(1)
 
     # Extract text columns as iterables (do not materialize)
-    if NUM_SAMPLES:
+    if PRETRAIN_STORE_DIR:
+        train_iterable = None
+        logger.info("Train store: %s", PRETRAIN_STORE_DIR)
+    elif NUM_SAMPLES:
         train_iterable = hf_ds['train'].take(NUM_SAMPLES)['text']
     else:
         train_iterable = hf_ds['train']['text']
     val_iterable = hf_ds['validation']['text']
 
-    logger.info("Train:      IterableColumn (streaming)")
+    logger.info("Train:      %s", "indexed sample store" if PRETRAIN_STORE_DIR else "IterableColumn (streaming)")
     logger.info("Val:        IterableColumn (streaming)")
     logger.info("Note:       Using PretrainTrainer with continuous token windows")
 
@@ -323,7 +332,9 @@ def main():
         trainer = PretrainTrainer(
             model=model,
             cfg=cfg,
-            train_texts=train_iterable,        # IterableColumn — streaming mode
+            train_texts=train_iterable,
+            train_store_dir=PRETRAIN_STORE_DIR,
+            train_permutation_epoch=stage_idx,
             val_texts=val_iterable,            # IterableColumn — streaming mode
             tokenizer=tokenizer,
             output_dir=stage_output_dir,
@@ -414,6 +425,8 @@ def main():
             "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
             "lr_stages": LR_STAGES, "warmup_stages": WARMUP_STAGES,
             "streaming": STREAMING, "preprocess_batch_size": PREPROCESS_BATCH_SIZE,
+            "dataset": DATASET, "dataset_revision": DATASET_REVISION,
+            "pretrain_store_dir": PRETRAIN_STORE_DIR,
             "use_amp": USE_AMP, "amp_dtype": AMP_DTYPE,
             "data_mode": "continuous_windows",
         },
