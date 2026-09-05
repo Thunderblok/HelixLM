@@ -240,17 +240,9 @@ trainer = PretrainTrainer(
 )
 ```
 
-`prepare_pretrain_dataset.py` remains an optional operator command for compiling
-and inspecting a store before constructing a trainer; callers do not need it
-for the ordinary `IterableColumn` path.
-
-```bash
-python prepare_pretrain_dataset.py \
-  --dataset codelion/sutra-10B \
-  --revision 415549cff1a92b69df8b88c6108faa6097457068 \
-  --output-dir /data/sutra-gpt2-t1024 \
-  --seq-len 1024
-```
+The trainer owns compilation; callers do not need a separate preprocessing
+script. For long-lived full-corpus runs, pass an explicit
+`pretrain_store_dir` so the verified store can be reused and audited.
 
 See `docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for the canonical launcher,
 comparison profiles, exact resume boundary, and MLflow metric vocabulary.

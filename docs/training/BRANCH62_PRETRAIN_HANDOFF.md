@@ -42,10 +42,9 @@ manifest, persisted permutation, and fixed validation-ID root make sample order
 replayable and make optimizer-step checkpoints meaningful. They also allow the
 storage path to be tested independently from GPU training.
 
-`prepare_pretrain_dataset.py` remains available when an operator wants to build
-or inspect the store as a separate batch job. It is not required for normal
-trainer use; `PretrainTrainer` owns the same compilation boundary when passed an
-`IterableColumn`.
+There is no separate required preprocessing command. `PretrainTrainer` owns
+compilation when passed an `IterableColumn`; the caller selects a durable store
+path when the compiled corpus must survive beyond the process.
 
 ## Canonical launcher
 

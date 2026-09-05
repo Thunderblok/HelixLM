@@ -5,9 +5,9 @@
 - `helix_lm.trainer.Trainer` remains the legacy document-aware SFT path. Do not
   change or rename it here; David owns the later `SFTTrainer` rename.
 - Continuous, globally ordered causal pretraining belongs to
-  `PretrainTrainer` and `pretrain_data.py`. `prepare_pretrain_dataset.py` is an
-  optional operator entry point; it is not a prerequisite for passing an
-  `IterableColumn` to `PretrainTrainer`.
+  `PretrainTrainer` and `pretrain_data.py`. Passing an `IterableColumn` to
+  `PretrainTrainer` invokes the compiler automatically; do not reintroduce a
+  second preprocessing entry point without a distinct operator requirement.
 - For a single 16 GB consumer GPU, `113M_param_train.py` defaults to the
   `rtx5080-relative` profile: `d_model=768`, 12 heads, three columns,
   configured `(3, 3, 3)` nodes, four loops, FFN expansion 3.0, `seq_len=1024`,
