@@ -46,10 +46,34 @@ There is no separate required preprocessing command. `PretrainTrainer` owns
 compilation when passed an `IterableColumn`; the caller selects a durable store
 path when the compiled corpus must survive beyond the process.
 
-## Canonical launcher
+## Launcher roles and reviewed reference
 
-`113M_param_train.py` exposes two named comparison profiles. The filename is
-historical; the run contract records the actual parameter count.
+There are two related Branch 62 launchers, and neither should be described as a
+textual continuation of the other:
+
+| Launcher | Authority | Training lifecycle | Evidence/publication posture |
+|---|---|---|---|
+| David's upstream `113M_param_train.py` at `1c140ce35cd53363833c301b7e556f83620643c3` | Production-style three-epoch launcher | Three one-epoch stages with learning rates `2e-4`, `6.67e-5`, and `2.22e-5` | Saves a local checkpoint per stage, then optionally publishes each stage to Hugging Face |
+| Thunderblok's `113M_param_train.py` | RTX-5080 comparison and evidence launcher | One resolved profile, fixed learning rate, and a bounded optimizer-step contract | Requires MLflow by default, writes local JSONL evidence, and keeps rotating resumable local checkpoints before optional final publication |
+
+They share the continuous pretraining data contract and much of the model
+shape. Their control flow, checkpoint cadence, learning-rate lifecycle, and
+operator purpose are intentionally different. A matching topology does not
+make their results interchangeable; comparisons bind the exact source commit,
+run contract, sample manifest, permutation, seed, optimizer, and evaluator.
+
+In this repository, `113M_param_train.py` is the canonical executable only for
+the Thunderblok Branch 62 comparison campaign. It is not a replacement for
+David's upstream production launcher. The filename is historical; the emitted
+run contract records the actual parameter count.
+
+### Why the settings are resolved objects
+
+`TrainingProfile` describes the hardware/comparison shape. `RunSettings` is the
+immutable, fully resolved contract after environment overrides. Keeping those
+roles separate prevents an RTX-5080 microbatch adjustment from being mistaken
+for a change to the model or data law, and makes the exact executed values
+available to tests and MLflow.
 
 ### RTX 5080 relative profile (default)
 
@@ -137,3 +161,24 @@ expansion, sequence length, and epoch count.
 to alter graph construction on this branch. The run contract therefore records
 `nodes_per_column_graph_effective=false`. Wiring node counts into the graph is a
 separate model-topology change and needs a matched ablation.
+
+## Review checklist for upstream integration
+
+David's review is most useful on the boundary between the two launchers:
+
+1. Confirm which production lifecycle remains upstream authority: staged
+   epochs, learning-rate decay, and per-epoch Hugging Face checkpoints.
+2. Confirm which evidence mechanics should eventually move upstream: exact
+   source identity, sample/permutation roots, local resumable custody, JSONL
+   metrics, and MLflow projection.
+3. Keep hardware batch and accumulation choices profile-specific while holding
+   effective batch, sequence length, tokenizer, corpus order, and evaluator
+   fixed for matched comparisons.
+4. Decide separately whether topology randomness should receive its own seed.
+   The current `seed` influences more than data order, so changing it is not yet
+   a pure multi-seed replication.
+
+Dependency upgrades are a separate compatibility campaign. Updating PyTorch,
+CUDA-facing wheels, Transformers, Datasets, or evaluation libraries must not be
+smuggled into this launcher-documentation change or compared against an older
+run as though only the launcher wording changed.

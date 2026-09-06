@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""Canonical Branch 62 continuous-pretraining launcher.
+"""Branch 62 RTX-5080 experiment and evidence launcher.
 
-``Trainer`` remains the document-aware SFT path. This launcher uses only
-``PretrainTrainer``: exact persisted sample order, local resumable checkpoints,
-and a local JSONL metric record projected to MLflow.
+This file is canonical only for the Thunderblok Branch 62 comparison campaign;
+it does not replace David's upstream three-epoch production launcher.  The
+upstream launcher reviewed for this contract is
+``david-thrower/HelixLM@1c140ce35cd53363833c301b7e556f83620643c3``.
+
+Both launchers use ``PretrainTrainer`` and the continuous EOS-joined sample
+contract.  They deliberately differ in orchestration:
+
+* David's launcher is a three-stage production run with epoch-specific learning
+  rates, local epoch checkpoints, and optional Hugging Face publication.
+* This launcher resolves named hardware/comparison profiles, runs a bounded
+  fixed-learning-rate subject, requires an MLflow projection by default, and
+  binds local resumable checkpoints to exact sample-order evidence.
+
+Compare their emitted run contracts rather than line numbers or filenames.
+``Trainer`` remains the separate document-aware SFT path.
 """
 
 from __future__ import annotations
@@ -38,6 +51,8 @@ REFERENCE_VALIDATION_IDS = "0e4471ec0dd5a3dbab4a941d2d64ef646b01919d3594000a5805
 
 @dataclass(frozen=True)
 class TrainingProfile:
+    """Hardware/comparison shape, not a claim of production equivalence."""
+
     name: str
     d_model: int
     n_heads: int
@@ -84,6 +99,8 @@ PROFILES = {
 
 @dataclass(frozen=True)
 class RunSettings:
+    """Fully resolved run contract after profile defaults and env overrides."""
+
     profile: TrainingProfile
     dataset: str
     dataset_revision: str

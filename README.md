@@ -244,7 +244,7 @@ The trainer owns compilation; callers do not need a separate preprocessing
 script. For long-lived full-corpus runs, pass an explicit
 `pretrain_store_dir` so the verified store can be reused and audited.
 
-See `docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for the canonical launcher,
+See `docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for the comparison launcher,
 comparison profiles, exact resume boundary, and MLflow metric vocabulary.
 
 Run the independent fixture equivalence court with:
