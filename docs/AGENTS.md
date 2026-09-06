@@ -25,10 +25,11 @@ a production claim.
 - A local checkpoint is the custody authority. Hugging Face and MLflow are
   projections and must never be the only copy of model or run state.
 
-## Current topology ceiling
+## Topology claims
 
-The active external Branch 60 indexed comparison freezes `d_model=1024`, three
-columns, `(3, 3, 3)` nodes, and vertical depth two. The checked-in
-`113M_param_train.py` launcher remains at `d_model=768`; cite the exact launcher
-or run contract when stating width. A fourth column and vertical depth three
-are deferred to a separately matched experiment.
+The checked-in `113M_param_train.py` defaults to `d_model=768`, three columns,
+`(3, 3, 3)` compute nodes, and vertical depth two for a 16 GB GPU. Aggregation
+gates do not consume the declared node budget. The launcher refuses to train
+unless the instantiated graph reports the same per-column counts. Every
+override creates a different executable subject; cite the exact launcher and
+emitted run contract when stating width, topology, or comparison results.

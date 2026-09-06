@@ -49,3 +49,9 @@ Do not add a fourth column or raise vertical depth to three in this lane. The
 current comparison freezes three columns, `(3, 3, 3)` nodes, and vertical depth
 two. Future topology work gets its own matched ablation after the pretraining
 pipeline is proven.
+
+`nodes_per_column` counts compute nodes. `HelixGraph` adds aggregation gates
+outside that budget, exposes configured and observed per-column counts through
+`get_graph_info()`, and must change parameter count when the declared tuple
+changes. Any launcher claiming a node-count experiment must compare those
+observed counts with its requested run contract before training.

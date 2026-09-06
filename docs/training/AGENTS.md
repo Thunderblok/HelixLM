@@ -9,11 +9,11 @@
   `PretrainTrainer` invokes the compiler automatically; do not reintroduce a
   second preprocessing entry point without a distinct operator requirement.
 - For a single 16 GB consumer GPU, `113M_param_train.py` defaults to the
-  `rtx5080-relative` profile: `d_model=768`, 12 heads, three columns,
+  `single-gpu-16gb` profile: `d_model=768`, 12 heads, three columns,
   configured `(3, 3, 3)` nodes, four loops, FFN expansion 3.0, `seq_len=1024`,
-  and vertical depth two. Other launchers or external run
-  contracts may use different widths or topology; do not describe any of them
-  as the single active experiment.
+  and vertical depth two. Every executable setting is a visible module-level
+  default with a matching `HELIX_*` override. Other launchers or external run
+  contracts may use different widths or topology; cite the exact run contract.
 - Hardware scaling must be explicit in the launcher or run contract. Use the
   768-width baseline for constrained GPUs, and record any wider or deeper
   configuration as a separate matched run rather than silently changing the

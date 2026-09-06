@@ -54,6 +54,7 @@ jobs:
       timeout-minutes: 30
       run: |
         python -m unittest \
+          test_graph_topology.py \
           test_pretrain_data.py \
           test_pretrain_data_court.py \
           test_experiment_tracking.py \

@@ -289,9 +289,11 @@ seed
 strict NaN policy
 ~~~
 
-If nodes_per_column_graph_effective=false, the run may record the configured
-value but may not claim it tested that topology. Wiring the setting into graph
-construction is a prerequisite to a node-count ablation.
+`nodes_per_column` counts compute nodes; aggregation gates are outside that
+budget. The production launcher compares the requested tuple with both the
+configured and observed counts returned by the instantiated graph. A mismatch
+is `UNAVAILABLE`, never a training run. Only a subject that passes that check
+may report `nodes_per_column_graph_effective=true`.
 
 ## 7. Metric semantics
 
@@ -322,6 +324,7 @@ lateral_p
 vertical_p
 vertical_depth
 nodes_per_column
+observed_nodes_per_column
 nodes_per_column_graph_effective
 graph_nodes
 graph_edges
@@ -468,8 +471,10 @@ The current reference baseline family uses FFN expansion 3.0 and learning rate
 2e-4. FFN 2.5 versus 3.0 must be reopened only under a frozen evaluator and
 matched run contract.
 
-Historical nodes_per_column=(2,3,2) and experimental (3,3,3) settings are not
-scientific factors until graph construction demonstrably consumes them.
+Historical runs that recorded `nodes_per_column_graph_effective=false` remain
+non-evidence for node-count effects. New graph-effective runs are different
+checkpoint topologies and must not be compared without the full matched-run
+contract.
 
 Avoid extreme gradient accumulation merely to preserve an old effective batch.
 On a 16 GB RTX 5080, increase the microbatch as far as stable memory allows and
@@ -686,6 +691,7 @@ in this handbook.
 | 2026-09-04 | Porthos, Mo | ACTIVE | MLflow is telemetry projection; local append-only evidence and checkpoints retain custody. | Revisit only if a durable bidirectional custody protocol is admitted. |
 | 2026-09-04 | Porthos, Mo | ACTIVE | Helix research does not block or authorize Thunderline Beta 1 runtime or checkpoint promotion. | Revisit through an explicit HC admission packet. |
 | 2026-09-05 | Porthos, Mo | EXPERIMENTAL | Preserve the exact Branch 62 anchor for every example; permit Trident supplemental paths and fusion only for uncertain examples; use whole-node structured gating on the RTX 5080. | Revisit after a fixed-checkpoint CUDA benchmark establishes oracle gain, positive net repair, and real wall-clock behavior. |
+| 2026-09-06 | Porthos, Mo | CANDIDATE | `nodes_per_column` now controls compute-node construction; aggregation gates remain outside the budget and the launcher refuses requested/configured/observed mismatches. | Promote only after the topology court and exact-head CI pass. |
 
 ## 17. Run handoff template
 

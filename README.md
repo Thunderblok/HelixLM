@@ -154,8 +154,8 @@ python quick_demo_cpu.py
 ## HuggingFace integration
 
 This minimal example shows the document-aware SFT path. See
-`docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for indexed pretraining and its
-exact sample-order, recovery, checkpoint, and MLflow contracts.
+`docs/training/PRETRAINING.md` for indexed pretraining and its sample-order,
+recovery, checkpoint, and metric contracts.
 
 ```python
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
@@ -244,8 +244,8 @@ The trainer owns compilation; callers do not need a separate preprocessing
 script. For long-lived full-corpus runs, pass an explicit
 `pretrain_store_dir` so the verified store can be reused and audited.
 
-See `docs/training/BRANCH62_PRETRAIN_HANDOFF.md` for the canonical launcher,
-comparison profiles, exact resume boundary, and MLflow metric vocabulary.
+See `docs/training/PRETRAINING.md` for the supported continuous-pretraining API,
+single-GPU launcher, exact resume boundary, and metric vocabulary.
 
 Run the independent fixture equivalence court with:
 
@@ -253,8 +253,8 @@ Run the independent fixture equivalence court with:
 python pretrain_data_court.py
 ```
 
-After training is idle, replay the complete compiled store and enforce the
-Branch 60 storage-throughput floor with:
+After training is idle, replay the complete compiled store and measure its
+storage-only throughput floor with:
 
 ```bash
 python pretrain_data_court.py \
@@ -358,6 +358,7 @@ helix_lm/
 |-----------|--------|---------------|
 | `d_model` | Width of the model | 128 for smoke tests; 192–256 for small experiments; 512+ for production |
 | `n_columns` | Number of neural columns | 2 for fast experiments; 4–7 for large models |
+| `nodes_per_column` | Compute-node count in each column; aggregation gates are additional | Changing this tuple changes graph topology, parameter count, and checkpoint compatibility |
 | `n_loops` | Recurrent iterations | 1 for speed; 2–4 for iterative reasoning depth |
 | `n_heads` | Attention heads | Must divide `d_model`. 4–8 for small models; 16–32 for large |
 
