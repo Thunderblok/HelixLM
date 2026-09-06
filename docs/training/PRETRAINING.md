@@ -90,7 +90,7 @@ Run `113M_param_train.py` for the supported step-bounded single-GPU path. The
 filename is historical; the emitted run contract records the measured parameter
 count and resolved settings.
 
-The default `rtx5080-relative` profile uses:
+The checked-in `single-gpu-16gb` defaults use:
 
 ```text
 d_model=768
@@ -101,6 +101,9 @@ effective_batch=84
 sequence_length=1024
 learning_rate=2e-4
 FFN expansion=3.0
+lateral probability=0.8
+vertical probability=0.9
+vertical depth=2
 ```
 
 ```bash
@@ -108,10 +111,34 @@ HELIX_PRETRAIN_STORE_DIR=/data/pretrain-gpt2-t1024 \
 python 113M_param_train.py
 ```
 
-The launcher also exposes a wider comparison profile. Treat profiles as
-different executable subjects even when they share an effective batch size.
-Compare runs only when source, data order, tokenizer, optimizer, seed, and
-evaluator are all bound.
+The defaults are ordinary module-level constants near the top of the file.
+Every setting that changes the executable subject has a matching environment
+override. The most commonly changed groups are:
+
+| Group | Environment variables |
+|---|---|
+| Data | `HELIX_DATASET`, `HELIX_DATASET_REVISION`, `HELIX_DATASET_SPLIT`, `HELIX_TEXT_COLUMN`, `HELIX_TOKENIZER` |
+| Model | `HELIX_D_MODEL`, `HELIX_N_HEADS`, `HELIX_N_COLUMNS`, `HELIX_NODES_PER_COLUMN`, `HELIX_N_LOOPS`, `HELIX_SEQUENCE_LENGTH`, `HELIX_FFN_EXPANSION` |
+| Topology | `HELIX_LATERAL_P`, `HELIX_VERTICAL_P`, `HELIX_VERTICAL_DEPTH` |
+| Attention | `HELIX_ATTENTION_MODE`, `HELIX_LOCAL_WINDOW`, `HELIX_COARSE_WINDOW`, `HELIX_COMPRESSED_WINDOWS`, `HELIX_COMPRESSED_VIEWS` |
+| Optimization | `HELIX_BATCH_SIZE`, `HELIX_GRAD_ACCUM`, `HELIX_EPOCHS`, `HELIX_LEARNING_RATE`, `HELIX_WARMUP_MICROBATCHES`, `HELIX_MAX_OPTIMIZER_STEPS` |
+| Evidence | `HELIX_MLFLOW_URI`, `HELIX_MLFLOW_EXPERIMENT`, `HELIX_REQUIRE_MLFLOW`, `HELIX_CHECKPOINT_EVERY`, `HELIX_EVAL_EVERY` |
+
+Use `HELIX_PRINT_CONTRACT=1` to inspect the fully resolved configuration without
+loading data or allocating a model:
+
+```bash
+HELIX_D_MODEL=1024 \
+HELIX_N_HEADS=16 \
+HELIX_BATCH_SIZE=2 \
+HELIX_GRAD_ACCUM=42 \
+HELIX_PRINT_CONTRACT=1 \
+python 113M_param_train.py
+```
+
+Treat any override set as a different executable subject even when effective
+batch size is unchanged. Compare runs only when source, data order, tokenizer,
+optimizer, seed, and evaluator are all bound.
 
 ## Checkpoints and resume
 
@@ -139,7 +166,14 @@ JSONL record, not the only copy of run evidence.
 
 Hugging Face publication is disabled by default. When enabled, the final model
 and tokenizer are saved locally first and then published under a bounded,
-configuration-bearing name.
+configuration-bearing name. Publication requires only `HF_USER` and `HF_TOKEN`:
+
+```bash
+HF_USER=your-account \
+HF_TOKEN=... \
+HELIX_PUSH_TO_HUB=1 \
+python 113M_param_train.py
+```
 
 ## Current limitation
 

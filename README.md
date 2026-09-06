@@ -253,8 +253,8 @@ Run the independent fixture equivalence court with:
 python pretrain_data_court.py
 ```
 
-After training is idle, replay the complete compiled store and enforce the
-Branch 60 storage-throughput floor with:
+After training is idle, replay the complete compiled store and measure its
+storage-only throughput floor with:
 
 ```bash
 python pretrain_data_court.py \
