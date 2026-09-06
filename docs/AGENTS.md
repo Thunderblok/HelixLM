@@ -28,6 +28,8 @@ a production claim.
 ## Topology claims
 
 The checked-in `113M_param_train.py` defaults to `d_model=768`, three columns,
-configured `(3, 3, 3)` nodes, and vertical depth two for a 16 GB GPU. Every
-override creates a different executable subject. Cite the exact launcher and
+`(3, 3, 3)` compute nodes, and vertical depth two for a 16 GB GPU. Aggregation
+gates do not consume the declared node budget. The launcher refuses to train
+unless the instantiated graph reports the same per-column counts. Every
+override creates a different executable subject; cite the exact launcher and
 emitted run contract when stating width, topology, or comparison results.

@@ -453,6 +453,21 @@ def build_config(settings: RunSettings, tokenizer: HelixTokenizer) -> HelixConfi
     return cfg
 
 
+def admit_graph_topology(
+    settings: RunSettings, graph_info: Mapping[str, Any]
+) -> tuple[int, ...]:
+    """Refuse training unless the instantiated graph matches the run contract."""
+    declared = tuple(settings.nodes_per_column)
+    configured = tuple(graph_info.get("configured_nodes_per_column", ()))
+    observed = tuple(graph_info.get("compute_nodes_per_column", ()))
+    if configured != declared or observed != declared:
+        raise RuntimeError(
+            "UNAVAILABLE: instantiated graph does not match nodes_per_column "
+            f"(declared={declared}, configured={configured}, observed={observed})"
+        )
+    return observed
+
+
 def model_name(settings: RunSettings, timestamp: str) -> str:
     nodes = "".join(str(value) for value in settings.nodes_per_column)
     ffn = f"{settings.ffn_expansion:.1f}".replace(".", "")
@@ -517,6 +532,7 @@ def main() -> None:
     model = HelixForCausalLM(cfg)
     counts = model.count_parameters()
     graph_info = model.model.recurrent.graph.get_graph_info()
+    observed_nodes_per_column = admit_graph_topology(settings, graph_info)
     run_name = model_name(settings, timestamp)
     pretrain_source = {
         "dataset": settings.dataset, "revision": settings.dataset_revision,
@@ -532,7 +548,10 @@ def main() -> None:
         "n_heads": cfg.n_heads,
         "n_columns": cfg.n_columns,
         "nodes_per_column": ",".join(map(str, settings.nodes_per_column)),
-        "nodes_per_column_graph_effective": False,
+        "observed_nodes_per_column": ",".join(
+            map(str, observed_nodes_per_column)
+        ),
+        "nodes_per_column_graph_effective": True,
         "n_loops": cfg.n_loops,
         "ffn_expansion": cfg.ffn_expansion,
         "dropout": cfg.dropout,

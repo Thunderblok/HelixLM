@@ -358,6 +358,7 @@ helix_lm/
 |-----------|--------|---------------|
 | `d_model` | Width of the model | 128 for smoke tests; 192–256 for small experiments; 512+ for production |
 | `n_columns` | Number of neural columns | 2 for fast experiments; 4–7 for large models |
+| `nodes_per_column` | Compute-node count in each column; aggregation gates are additional | Changing this tuple changes graph topology, parameter count, and checkpoint compatibility |
 | `n_loops` | Recurrent iterations | 1 for speed; 2–4 for iterative reasoning depth |
 | `n_heads` | Attention heads | Must divide `d_model`. 4–8 for small models; 16–32 for large |
 

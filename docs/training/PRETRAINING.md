@@ -175,10 +175,16 @@ HELIX_PUSH_TO_HUB=1 \
 python 113M_param_train.py
 ```
 
-## Current limitation
+## Executable topology contract
 
-The launcher records `nodes_per_column=(3, 3, 3)` as configured, but the graph
-builder on this code line does not consume that tuple. The run contract reports
-`nodes_per_column_graph_effective=false`. Do not describe a run as a node-count
-ablation until graph construction uses the field and the instantiated topology
-is verified.
+`nodes_per_column` controls the number of compute nodes instantiated in each
+column. Aggregation gate nodes are added separately and do not consume that
+budget. The launcher reads the configured and observed counts back from the
+constructed graph and refuses to train when either differs from the requested
+tuple. Admitted runs therefore report both `nodes_per_column` and
+`observed_nodes_per_column`, with `nodes_per_column_graph_effective=true` only
+after that equality check passes.
+
+Changing the tuple changes graph topology, parameter count, and checkpoint
+compatibility. A node-count comparison must still freeze source, data order,
+tokenizer, optimizer, seed, evaluator, and token or compute budget.

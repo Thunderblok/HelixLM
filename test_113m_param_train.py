@@ -149,6 +149,39 @@ class ProductionPretrainLauncherTest(unittest.TestCase):
             with self.subTest(environ=environ), self.assertRaises(ValueError):
                 LAUNCHER.resolve_settings(environ)
 
+    def test_instantiated_graph_must_match_the_declared_node_counts(self):
+        settings = LAUNCHER.resolve_settings({})
+        graph_info = {
+            "configured_nodes_per_column": [3, 3, 3],
+            "compute_nodes_per_column": [3, 3, 3],
+        }
+
+        self.assertEqual(
+            LAUNCHER.admit_graph_topology(settings, graph_info),
+            (3, 3, 3),
+        )
+
+        for observed in ([2, 2, 2], [3, 3], [3, 3, 4]):
+            with self.subTest(observed=observed), self.assertRaisesRegex(
+                RuntimeError, "instantiated graph"
+            ):
+                LAUNCHER.admit_graph_topology(
+                    settings,
+                    {
+                        "configured_nodes_per_column": [3, 3, 3],
+                        "compute_nodes_per_column": observed,
+                    },
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "instantiated graph"):
+            LAUNCHER.admit_graph_topology(
+                settings,
+                {
+                    "configured_nodes_per_column": [2, 3, 2],
+                    "compute_nodes_per_column": [3, 3, 3],
+                },
+            )
+
     def test_existing_store_disables_the_default_compile_target(self):
         settings = LAUNCHER.resolve_settings(
             {"HELIX_PRETRAIN_STORE_DIR": "/data/sutra-store"}

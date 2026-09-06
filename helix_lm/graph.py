@@ -7,6 +7,11 @@ REMEDIATION (2026-08-22):
   - Issue 6: stopped passing output_ffn_dim to ErrorCorrectingMultiScaleAttnNode.
   - Passes new compressed-branch params (compressed_views, compressed_dim,
     compressed_heads, strict_nan_check) to the multi-scale node.
+
+TOPOLOGY CONTRACT (2026-09-06):
+  - nodes_per_column controls compute-node cardinality.
+  - Gate nodes remain aggregation plumbing and do not consume that budget.
+  - Changing nodes_per_column changes checkpoint topology and parameter count.
 """
 import math
 import random
@@ -54,20 +59,20 @@ class HelixGraph(nn.Module):
             rng = np.random.RandomState()
 
         self.node_spec = self._build_node_spec()
-        self.nodes = nn.ModuleDict()
         self.node_meta: Dict[str, Tuple[int, int, str]] = {}
+        node_configs: Dict[str, dict] = {}
 
         nid = 0
         for ci, column in enumerate(self.node_spec):
             for ni, (ntype, ncfg) in enumerate(column):
                 name = f"n{nid}"
                 self.node_meta[name] = (ci, ni, ntype)
-                self.nodes[name] = self._create_node(ntype, ncfg)
+                node_configs[name] = ncfg
                 nid += 1
 
         # Build random wiring
         self.graph: Dict[str, List[str]] = {}
-        names = list(self.nodes.keys())
+        names = list(self.node_meta.keys())
 
         for name in names:
             ci, idx, ntype = self.node_meta[name]
@@ -95,6 +100,19 @@ class HelixGraph(nn.Module):
                     preds.append(rng.choice(above))
 
             self.graph[name] = preds
+
+        # Instantiate gates only after wiring so each learned weight maps to one
+        # real predecessor. The former pre-wiring size silently truncated extra
+        # vertical predecessors in GateNode.forward's zip operation.
+        self.nodes = nn.ModuleDict()
+        for name in names:
+            _, _, ntype = self.node_meta[name]
+            if ntype == "gate":
+                # A root gate receives the raw graph input as its implicit
+                # predecessor in forward(); all other gates use wired inputs.
+                node_configs[name]["n_preds"] = max(1, len(self.graph[name]))
+            ncfg = dict(node_configs[name])
+            self.nodes[name] = self._create_node(ntype, ncfg)
 
         # Merge layers for multi-predecessor non-gate nodes
         self.merges = nn.ModuleDict()
@@ -131,7 +149,7 @@ class HelixGraph(nn.Module):
         cfg = self.cfg
         spec = []
         for ci in range(cfg.n_columns):
-            column = []
+            target_count = cfg.nodes_per_column[ci]
             use_full_attn = False
             use_multi_scale = False
             if cfg.attention_mode == "full":
@@ -143,7 +161,7 @@ class HelixGraph(nn.Module):
 
             attn_drop = getattr(cfg, 'attn_dropout', cfg.dropout)
             if use_multi_scale:
-                column.append(("error_correcting_multi_scale_attn", {
+                attention_node = ("error_correcting_multi_scale_attn", {
                     "d_model": cfg.d_model,
                     "n_heads": cfg.n_heads,
                     "local_window": getattr(cfg, "local_window", 64),
@@ -159,27 +177,36 @@ class HelixGraph(nn.Module):
                     "attn_dropout": attn_drop,
                     "strict_nan_check": getattr(cfg, "strict_nan_check", False),
                     # Issue 6: output_ffn_dim intentionally NOT passed.
-                }))
+                })
             elif use_full_attn:
-                column.append(("full_attn", {
+                attention_node = ("full_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "dropout": cfg.dropout, "use_rope": cfg.use_rope,
                     "attn_dropout": attn_drop,
-                }))
+                })
             else:
-                column.append(("linear_attn", {
+                attention_node = ("linear_attn", {
                     "d_model": cfg.d_model, "n_heads": cfg.n_heads,
                     "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout,
                     "attn_dropout": attn_drop,
-                }))
+                })
 
-            column.append(("swiglu", {
+            swiglu_node = ("swiglu", {
                 "d_model": cfg.d_model, "expansion": cfg.ffn_expansion, "dropout": cfg.dropout,
-            }))
+            })
 
-            if cfg.use_ssm:
+            # nodes_per_column counts compute nodes. Start from the established
+            # attention/FFN pair, truncated for a one-node column. Optional
+            # stateful nodes consume free slots before the base pair repeats.
+            base_pattern = [attention_node, swiglu_node]
+            compute_nodes = [
+                (node_type, dict(node_config))
+                for node_type, node_config in base_pattern[:target_count]
+            ]
+
+            if cfg.use_ssm and len(compute_nodes) < target_count:
                 if hasattr(cfg, 'ssm_d_state') and cfg.ssm_d_state >= 64:
-                    column.append(("mamba2", {
+                    compute_nodes.append(("mamba2", {
                         "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand,
                         "dt_rank": cfg.ssm_dt_rank if hasattr(cfg, 'ssm_dt_rank') else "auto",
@@ -188,24 +215,37 @@ class HelixGraph(nn.Module):
                         "dropout": cfg.dropout,
                     }))
                 else:
-                    column.append(("ssm", {
+                    compute_nodes.append(("ssm", {
                         "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand, "dropout": cfg.dropout,
                     }))
 
-            if cfg.use_titans_memory:
-                if cfg.titans_always_select and ci == 0:
-                    column.append(("titans", {
-                        "d_model": cfg.d_model,
-                        "feature_dim": cfg.titans_feature_dim,
-                        "eta_init": cfg.titans_eta_init,
-                        "n_heads": cfg.titans_n_heads,
-                        "dropout": cfg.titans_dropout,
-                    }))
+            if (
+                cfg.use_titans_memory
+                and cfg.titans_always_select
+                and ci == 0
+                and len(compute_nodes) < target_count
+            ):
+                compute_nodes.append(("titans", {
+                    "d_model": cfg.d_model,
+                    "feature_dim": cfg.titans_feature_dim,
+                    "eta_init": cfg.titans_eta_init,
+                    "n_heads": cfg.titans_n_heads,
+                    "dropout": cfg.titans_dropout,
+                }))
 
-            if len(column) > 1 or ci > 0:
+            pattern_index = 0
+            while len(compute_nodes) < target_count:
+                node_type, node_config = base_pattern[pattern_index % len(base_pattern)]
+                compute_nodes.append((node_type, dict(node_config)))
+                pattern_index += 1
+
+            column = list(compute_nodes)
+            if len(compute_nodes) > 1 or ci > 0:
                 column.append(("gate", {
-                    "d_model": cfg.d_model, "n_preds": len(column), "dropout": cfg.dropout,
+                    "d_model": cfg.d_model,
+                    "n_preds": len(compute_nodes),
+                    "dropout": cfg.dropout,
                 }))
 
             spec.append(column)
@@ -319,14 +359,22 @@ class HelixGraph(nn.Module):
         return out + x, new_states
 
     def get_graph_info(self) -> Dict[str, Any]:
+        compute_nodes_per_column = [0] * self.cfg.n_columns
+        node_types: Dict[str, int] = {}
+        for name in self.nodes:
+            ci, _, ntype = self.node_meta[name]
+            node_types[ntype] = node_types.get(ntype, 0) + 1
+            if ntype != "gate":
+                compute_nodes_per_column[ci] += 1
+
         info = {
             "n_nodes": len(self.nodes),
             "n_columns": self.cfg.n_columns,
-            "node_types": {},
+            "configured_nodes_per_column": list(self.cfg.nodes_per_column),
+            "compute_nodes_per_column": compute_nodes_per_column,
+            "node_types": node_types,
             "n_edges": sum(len(p) for p in self.graph.values()),
             "roots": self.root_nodes,
             "sinks": self.sink_nodes,
         }
-        for name, (ci, idx, ntype) in self.node_meta.items():
-            info["node_types"][ntype] = info["node_types"].get(ntype, 0) + 1
         return info
