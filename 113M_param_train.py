@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Branch 62 RTX-5080 experiment and evidence launcher.
+"""Continuous causal-pretraining launcher for a single 16 GB GPU.
 
-This file is canonical only for the Thunderblok Branch 62 comparison campaign;
-it does not replace David's upstream three-epoch production launcher.  The
-upstream launcher reviewed for this contract is
-``david-thrower/HelixLM@1c140ce35cd53363833c301b7e556f83620643c3``.
+The default profile uses a 768-wide model and resolves every environment
+override into one immutable run contract before constructing the model. The
+launcher compiles or verifies an indexed continuous-token store, preserves its
+sample order across restart, saves resumable checkpoints locally, and projects
+the local metric record to MLflow. Optional Hugging Face publication happens
+only after the final model is saved locally.
 
-Both launchers use ``PretrainTrainer`` and the continuous EOS-joined sample
-contract.  They deliberately differ in orchestration:
-
-* David's launcher is a three-stage production run with epoch-specific learning
-  rates, local epoch checkpoints, and optional Hugging Face publication.
-* This launcher resolves named hardware/comparison profiles, runs a bounded
-  fixed-learning-rate subject, requires an MLflow projection by default, and
-  binds local resumable checkpoints to exact sample-order evidence.
-
-Compare their emitted run contracts rather than line numbers or filenames.
-``Trainer`` remains the separate document-aware SFT path.
+This is a fixed-learning-rate, step-bounded launcher. Multi-stage learning-rate
+schedules are a different training lifecycle and should be expressed explicitly
+rather than inferred from this filename. ``Trainer`` remains the separate
+document-aware SFT path; this file uses only ``PretrainTrainer``.
 """
 
 from __future__ import annotations
