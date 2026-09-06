@@ -37,6 +37,9 @@ jobs:
     # - name: Test with pytest
     #   run: |
     #     pytest
+    - name: Graph topology contract
+      run: |
+        python3 -m unittest -v test_graph_topology.py
     - name: Smoke Test
       run: |
         python3 helix_lm/smoke_test.py
